@@ -226,8 +226,11 @@ async function detail(reqIn) {
   const playFrom = [];
   const playUrls = [];
   if (videoUrl) {
-    playFrom.push('八卦');
-    playUrls.push('正片$' + absUrl(videoUrl, BASE_URL));
+    // V2 双集: 中转组只包 .m3u8, 直连组全直链。
+    const direct = absUrl(videoUrl, BASE_URL);
+    const relay = /\.m3u8/i.test(direct) ? RELAY_M3U8 + encodeURIComponent(direct) : direct;
+    playFrom.push('八卦·中转', '八卦·直连');
+    playUrls.push('正片$' + relay, '正片$' + direct);
   }
   return {
     list: [{
@@ -241,6 +244,12 @@ async function detail(reqIn) {
   };
 }
 
+// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
+// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
@@ -248,6 +257,7 @@ async function play(reqIn) {
   // id 可能是 "正片$url" 格式
   if (id.indexOf('$') >= 0) id = id.split('$').pop();
   const url = absUrl(id, BASE_URL);
+  // V2 双线: 中转集/直连集地址原样返回 (不再包壳)。
   return {
     parse: 0,
     url,
