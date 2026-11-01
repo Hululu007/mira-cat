@@ -205,7 +205,9 @@ async function detail(reqIn) {
   }
   epItems.sort((a, b) => a.n - b.n);
   if (epItems.length) {
-    playUrls.push(epItems.map(e => e.title + '$' + JSON.stringify({ videoId: id, episodeId: e.eid, ep: String(e.n) })).join('#'));
+    // V2 双集: 中转组 payload 带 via:'relay', 直连组带 via:'direct' (play 靠它分流, 不靠 flag)。
+    playUrls.push(epItems.map(e => e.title + '$' + JSON.stringify({ videoId: id, episodeId: e.eid, ep: String(e.n), via: 'relay' })).join('#'));
+    playUrls.push(epItems.map(e => e.title + '$' + JSON.stringify({ videoId: id, episodeId: e.eid, ep: String(e.n), via: 'direct' })).join('#'));
   }
   return {
     list: [{
@@ -213,11 +215,17 @@ async function detail(reqIn) {
       vod_name: title,
       vod_pic: cover,
       vod_content: t(info.description || info.intro || ''),
-      vod_play_from: epItems.length ? '野果' : '',
+      vod_play_from: epItems.length ? '野果·中转$$$野果·直连' : '',
       vod_play_url: playUrls.join('$$$'),
     }],
   };
 }
+
+// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
+// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
@@ -234,9 +242,10 @@ async function play(reqIn) {
   if (info.video_url == null && info.data) info = info.data;
   const url = t(info.video_url || info.video_url_h265 || '');
   if (!url) return { parse: 0, url: '' };
+  // V2 双线: 中转集 (via=relay) 才包中转地址; 直连集 (含无 via 的旧详情) 原样返回, 不再包壳。
   return {
     parse: 0,
-    url,
+    url: (payload.via === 'relay' && /\.m3u8/i.test(url)) ? RELAY_M3U8 + encodeURIComponent(url) : url,
     header: { 'User-Agent': UA, 'Referer': SITE + '/', 'Origin': SITE },
   };
 }
