@@ -105,11 +105,20 @@ function parseDetail(html, rawId) {
       }
     } catch {}
   }
+  // V2 双集: 中转组只包 .m3u8, 直连组全直链; 假线路 (无视频) 保持单源原样。
   let playUrl = '';
-  if (eps.length === 1) playUrl = '播放$' + eps[0].url;
-  else if (eps.length > 1) playUrl = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
-  else playUrl = '未找到视频源$' + rawId;
-  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_play_from: '91大赛', vod_play_url: playUrl };
+  let playFrom = '91大赛';
+  const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
+  if (eps.length === 1) {
+    playUrl = ('播放$' + wrapEp(eps[0].url)) + '$$$' + ('播放$' + eps[0].url);
+    playFrom = '91大赛·中转$$$91大赛·直连';
+  } else if (eps.length > 1) {
+    const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
+    const direct = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
+    playUrl = relay + '$$$' + direct;
+    playFrom = '91大赛·中转$$$91大赛·直连';
+  } else playUrl = '未找到视频源$' + rawId;
+  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_play_from: playFrom, vod_play_url: playUrl };
 }
 
 async function init() { return {}; }
@@ -160,10 +169,17 @@ async function detail(reqIn) {
   return { list };
 }
 
+// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
+// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
+
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
   const isVideo = /\.(m3u8|mp4)/i.test(id);
+  // V2 双线: 中转集/直连集地址原样返回 (不再包壳); 假线路 parse:1 原样。
   return { parse: isVideo ? 0 : 1, url: id, header: H(HOST) };
 }
 
