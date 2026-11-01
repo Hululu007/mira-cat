@@ -42,7 +42,6 @@ import javmobile from './spider/video/javmobile.js';
 import javmost from './spider/video/javmost.js';
 import javhdtoday from './spider/video/javhdtoday.js';
 import cableav from './spider/video/cableav.js';
-import avhub from './spider/video/avhub.js';
 import sextb from './spider/video/sextb.js';
 import porncgw from './spider/video/porncgw.js';
 import youzidj from './spider/video/youzidj.js';
@@ -121,7 +120,6 @@ const spiders = [
     javmost,
     javhdtoday,
     cableav,
-    avhub,
     sextb,
     porncgw,
     youzidj,
