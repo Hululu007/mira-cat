@@ -109,6 +109,54 @@ function parseCards(html) {
   return out;
 }
 
+// 2026-11-01 女优重做：/actresses/ 是女优索引页（article.jdb-card 女优卡），
+// 不是视频列表页；旧 parseCards 只认 article.loop-post，故女优分类永远为空。
+// 解析女优卡：头像 + h3.jdb-name（英文名原文，不翻译）+ /star/<slug>/ 链接。
+function parseActressCards(html) {
+  const out = [];
+  const seen = new Set();
+  const re = /<article\s[^>]*class="[^"]*jdb-card[^"]*"[^>]*>([\s\S]*?)<\/article>/g;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const card = m[1];
+    const am = card.match(/<a\s[^>]*href="https?:\/\/javmobile\.net\/star\/([a-z0-9\-]+)\/"/i);
+    if (!am) continue;
+    const slug = am[1].toLowerCase();
+    if (seen.has(slug)) continue;
+    seen.add(slug);
+    let name = '';
+    const nm = card.match(/<h3[^>]*class="[^"]*jdb-name[^"]*"[^>]*>([\s\S]*?)<\/h3>/i);
+    if (nm) name = clean(nm[1]);
+    if (!name) continue;
+    out.push({ name, slug });
+  }
+  return out;
+}
+
+// 热门前一百：站方只有 ?jdb_sort=count（Most movies，默认）与 ?jdb_sort=name 两种排序，
+// 没有播放量排行，故“热门”诚实地定义为默认 Most movies 顺序的前 100 人，不宣称按热度排。
+// 每页 24 人，顺序拉第 1~5 页；p1 首张 Updating 是聚合占位卡、不是女优，必须跳过。
+// jdb-count 数字明显虚高，不展示。模块级缓存，首次构建后不再重复拉取。
+let top100Cache = null;
+async function getTop100() {
+  if (top100Cache) return top100Cache;
+  const out = [];
+  for (let p = 1; p <= 5 && out.length < 100; p++) {
+    const url = SITE + '/actresses/' + (p > 1 ? 'page/' + p + '/' : '');
+    let html = '';
+    try { html = await getHtml(url); } catch {}
+    if (!html) continue;
+    for (const a of parseActressCards(html)) {
+      if (/^updating$/i.test(a.name)) continue; // 占位卡，不是女优
+      out.push(a);
+      if (out.length >= 100) break;
+    }
+  }
+  const top = out.slice(0, 100);
+  if (top.length) top100Cache = top; // 空结果不缓存，允许下次重试
+  return top;
+}
+
 function parsePagecount(html) {
   // 取最大的 /page/N/ 数字
   let max = 1;
@@ -313,13 +361,35 @@ async function init(reqIn) {
 
 async function home(reqIn) {
   const cls = CATS.map(c => ({ type_id: c.type_id, type_name: c.type_name }));
-  return { class: cls, list: [] };
+  // 女优已是顶级分类（CATS 第 8 项），缺的是下面一行选人：filters 筛选卡片机制
+  // （格式仿 juheduanju.js：{ key, name, value: [{ n, v }] }）；仅 actresses 一项。
+  let filters = {};
+  try {
+    const top = await getTop100();
+    if (top.length) {
+      filters = { actresses: [{ key: 'star', name: '女优', value: top.map(a => ({ n: a.name, v: a.slug })) }] };
+    }
+  } catch {}
+  return { class: cls, filters, list: [] };
 }
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const tid = t(body.tid || body.id) || 'latest';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
+  if (tid === 'actresses') {
+    // 筛选值在分类请求中的字段名无仓库内先例，防御性多读几个位置；最终以真机点选为准。
+    const ext = body.filter || body.filters || body.extend || body.ext || {};
+    const rawStar = t(
+      (ext && ext.star) || body.star || (body.ext && body.ext.star) || (body.filter && body.filter.star) || ''
+    );
+    const slug = /^[a-z0-9\-]+$/i.test(rawStar) ? rawStar.toLowerCase() : '';
+    if (!slug) return { page, pagecount: page, limit: 30, total: 0, list: [] };
+    // 选人后的列表直接复用现有 parseCards（/star/<slug>/ 页是 loop-post 视频卡）。
+    // 未选人不默认塞第一位女优的视频，避免用户误以为“女优”分类就是该女优。
+    const url = SITE + '/star/' + slug + '/' + (page > 1 ? 'page/' + page + '/' : '');
+    return buildList(url, page, 30, 'actresses');
+  }
   return buildList(catUrl(tid, page), page, 30, tid);
 }
 
