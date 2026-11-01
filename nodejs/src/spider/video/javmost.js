@@ -27,6 +27,19 @@ const SITE = 'https://www.javmost.ws';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
 
+// 2026-11-01 Worker 腿：App 原生栈发不出 Sec-Fetch-Dest: iframe，embed 页必回 204；
+// 直连解不出时走用户自有 Worker 代取（服务端带头取 embed 页 + 调 stream API）。
+// 部署后把真实域名替换掉下面占位符再推；占位符推上去是跑不通的，特意如此。
+const EMBED_WORKER = 'https://javmost.li768435813.workers.dev/embed?u=';
+async function resolveViaWorker(embedUrl) {
+  try {
+    const { data, status } = await req.get(EMBED_WORKER + encodeURIComponent(embedUrl), { timeout: 25000 });
+    const json = typeof data === 'string' ? JSON.parse(data) : data;
+    if (status === 200 && json && json.ok && json.url && /^https?:\/\//.test(json.url)) return json.url;
+  } catch (e) { /* ignore */ }
+  return '';
+}
+
 // 33 个真实分类 (2026-10-20 从站点导航、/allcategory、/allcode 实测)
 // 注意: latest(最新) 与 all(全部) 是站点本身的同一页面，内容一致
 // 无码流出: search:REDUCING 走搜索路径 (与 /tag/REDUCING/ 第1页内容一致，支持翻页;
@@ -307,7 +320,7 @@ async function resolveEmbedDirect(embedUrl, referer) {
       if (r.ok) html = await r.text();
     } catch (e) { /* ignore */ }
   }
-  if (!html || html.length < 200) return '';
+  if (!html || html.length < 200) return resolveViaWorker(embedUrl);
   const meta = (n) => {
     const m = html.match(new RegExp(`<meta[^>]+name=["']?${n}["']?[^>]*content=["']?([^"'>\\s]+)`, 'i'))
       || html.match(new RegExp(`<meta[^>]+content=["']?([^"'>\\s]+)["']?[^>]*name=["']?${n}["']?`, 'i'));
@@ -317,7 +330,7 @@ async function resolveEmbedDirect(embedUrl, referer) {
   const api = meta('x-embed-api');
   const et = meta('x-embed-et');
   const sig = meta('x-embed-sig');
-  if (!token || !api || !et || !sig) return '';
+  if (!token || !api || !et || !sig) return resolveViaWorker(embedUrl);
   const apiUrl = api.replace(/\/?$/, '') + '/' + token;
   const apiHeaders = {
     'User-Agent': UA,
@@ -342,7 +355,7 @@ async function resolveEmbedDirect(embedUrl, referer) {
   if (json && json.ok && json.url && /^https?:\/\//.test(json.url)) {
     return json.url;
   }
-  return '';
+  return resolveViaWorker(embedUrl);
 }
 
 async function home(reqIn) {
