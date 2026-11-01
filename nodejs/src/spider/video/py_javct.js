@@ -177,17 +177,48 @@ async function home() {
   return { class: CATS, filters: {}, list: parseCards(html) };
 }
 
+// 分页真相（2026-11-02 设备反馈 + jina 实测）：站方忽略 ?page=N（恒回第 1 页，
+// 故旧逻辑全部分类无限重复）；真实分页是分类 token 路径 + /pg-N
+// （如 /uncensored-c8lkazew/pg-2；token 各分类不同、跨请求稳定，须从第 1 页
+// 分页链接现取；取不到则 page>1 如实返回空，绝不回第 1 页内容充数）。
+function pagePrefix(html) {
+  const m = String(html || '').match(/href=["']([^"']*?)\/pg-\d+["']/i);
+  if (!m) return null;
+  let p = m[1];
+  if (!/^https?:\/\//i.test(p)) p = HOST + (p.startsWith('/') ? p : '/' + p);
+  return p.replace(/\/+$/, '');
+}
+function lastPageNum(html) {
+  let max = 0;
+  const re = /\/pg-(\d+)/gi;
+  let m;
+  while ((m = re.exec(String(html || ''))) !== null) {
+    const n = parseInt(m[1], 10);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
 async function category(reqIn) {
   const body = reqIn?.body || {};
   let tid = String(body.id || '');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!tid) tid = '/amateur';
   const base = (/^https?:\/\//i.test(tid) ? tid : HOST + '/' + tid.replace(/^\/+/, '')).replace(/\/+$/, '');
-  const url = page === 1 ? base : base + (base.indexOf('?') >= 0 ? '&' : '?') + 'page=' + page;
   await warmSession();
-  const html = await getText(url, HOST + '/');
+  if (page === 1) {
+    const html = await getText(base, HOST + '/');
+    const list = parseCards(html);
+    const last = lastPageNum(html);
+    return { page, pagecount: last || 9999, limit: 90, total: list.length ? 999999 : 0, list };
+  }
+  const firstHtml = await getText(base, HOST + '/');
+  const prefix = pagePrefix(firstHtml);
+  if (!prefix) return { page, pagecount: page, limit: 90, total: 0, list: [] };
+  const html = await getText(prefix + '/pg-' + page, HOST + '/');
   const list = parseCards(html);
-  return { page, pagecount: 9999, limit: 90, total: list.length ? 999999 : 0, list };
+  const last = lastPageNum(html);
+  return { page, pagecount: list.length ? (last || 9999) : page, limit: 90, total: list.length ? 999999 : 0, list };
 }
 
 async function detail(reqIn) {
