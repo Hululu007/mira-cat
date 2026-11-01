@@ -43,6 +43,11 @@ const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
 const TIMEOUT = 12000;
 
+// 2026-11-01 Worker 腿：手机浏览器能出 room-list JSON（坐实是 App 侧 req 被拦，不是设备网络问题），
+// 且 fetch/jina 腿在 App 内不存在；直连失败时走用户自有 Worker 代取（只放行 /api/ 路径）。
+// 部署后把真实域名替换掉下面占位符再推；占位符推上去是跑不通的，特意如此。
+const LIST_WORKER = 'https://chaturbate.li768435813.workers.dev/?u=';
+
 // 分类: type_id 编码 —— all | g:{gender} | r:{region} | gr:{gender}:{region} |
 //       new | gaming | exhib | age:{from}:{to} | tag:{hashtag}
 // 标签计数为 2026-10-21 实测 total_count (见文件头)
@@ -131,7 +136,11 @@ async function fetchJson(url) {
       timeout: TIMEOUT,
     });
     if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
-  } catch (e) { /* 换通道2 */ }
+  } catch (e) { /* 换 Worker 腿 */ }
+  try {
+    const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), { timeout: TIMEOUT });
+    if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
+  } catch (e) { /* 换通道3 */ }
   const raw = await fetchText(url);
   if (raw) { try { return JSON.parse(raw); } catch (e) { /* ignore */ } }
   return null;
