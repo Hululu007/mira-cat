@@ -363,9 +363,9 @@ async function fetchManual(url, headers) {
 }
 
 // GET /proxy/m3u8?u={b64url 目标}&r={b64url referer}
-// 跟随跳转直接取最终清单（今日 /media 12/12 均为 302 到 jw-hls 直链，
-// fangzhou 抽奖模型已过时）；拉取后只改 Content-Type 返回。分片/密钥
-// 一律保持公开直连, 不经代理。拿不到清单才 302 降级回原目标。
+// 手动跟随 Location 链取最终清单（今日 /media 12/12 均为 302 到 jw-hls 直链）；
+// 拉取后只改 Content-Type 返回。分片/密钥一律保持公开直连, 不经代理。
+// 拿不到清单时降级到已解析的最终地址，绝不再降级回 /media。
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
   if (!q.u) { reply.code(400).send('missing u'); return; }
@@ -383,13 +383,29 @@ async function m3u8Proxy(request, reply) {
     reply.send(rewriteM3u8(raw, base));
   };
 
-  // 不再手动处理 302：req 跟随跳转直接拿到最终清单（今日 /media 均为
-  // 302 到 jw-hls 直链）。拿到 #EXTM3U 即以标准 Content-Type 返回；
-  // 拿不到才 302 降级回原目标。
-  for (let i = 0; i < 3; i++) {
-    const raw = await fetchText(target, headers);
-    if (raw && raw.includes('#EXTM3U')) { sendList(raw, target); return; }
+  // 2026-11-01：代理曾假设 App 内 req 跟随 302；若 App req 不跟随，fetchText 拿到的
+  // 302 空体导致 3 次取空后 302 降级回 /media，播放器拿到 text/plain 清单被 iOS 拒播。
+  // 改用现成的 fetchManual 手动跟 Location 链（最多 4 跳，每跳 20 秒封顶），解析出最终
+  // jw-hls 清单地址后直取清单并以标准 Content-Type 返回。
+  let current = target;
+  let resolved = '';
+  for (let hop = 0; hop < 4; hop++) {
+    const step = await fetchManual(current, headers);
+    if (step.status === 200 && step.body && step.body.includes('#EXTM3U')) { sendList(step.body, current); return; }
+    const isRedirect = step.status === 301 || step.status === 302 || step.status === 303
+      || step.status === 307 || step.status === 308;
+    if (isRedirect && step.location) {
+      try {
+        current = /^https?:\/\//i.test(step.location) ? step.location : new URL(step.location, current).href;
+      } catch { break; }
+      resolved = current;
+      continue;
+    }
+    break;
   }
+  // 拿不到清单时：已解析出最终地址就降级到该地址，绝不再降级回 /media（避免 text/plain 链）；
+  // 连最终地址都没解析出时，才降级回原目标（旧行为兜底）。
+  if (resolved) { reply.redirect(resolved); return; }
   reply.redirect(target);
 }
 
