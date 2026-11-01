@@ -13,6 +13,7 @@ import req from '../../util/req.js';
 const KEY = 'py_hlbdy';
 const NAME = '黑料不打烊';
 const HOSTS = [
+  'https://hl365.com/',
   'https://attend.oqzbuzeo.cc/',
   'https://assault.oqzbuzeo.cc/',
   'https://carrier.oqzbuzeo.cc/',
@@ -41,11 +42,20 @@ function H(host) {
   };
 }
 
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// 2026-11-01：站方有抖动/限流（同一 URL 短时多次请求后出现 404/000，停 45 秒后恢复），
+// 空结果加一次重试（间隔约 2 秒），不要多轮轰炸。
 async function getText(url, host) {
-  try {
-    const { data } = await req.get(url, { headers: H(host), timeout: 15000 });
-    return String(data || '');
-  } catch { return ''; }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const { data } = await req.get(url, { headers: H(host), timeout: 15000 });
+      const text = String(data || '');
+      if (text) return text;
+    } catch {}
+    if (attempt === 0) await sleep(2000);
+  }
+  return '';
 }
 
 // 首个能出文章的镜像域即为当前域；会话内缓存，失败则回落线路一。
