@@ -5,6 +5,9 @@ import req from '../../util/req.js';
 const KEY = 'py_818hl';
 const NAME = '818黑料网';
 const HOST = 'https://818hlw1.com/';
+// 2026-11-01 中转腿：App 内 req 到 818hlw1.com 被拦（首页拿不到、回落 4 写死分类），
+// 直取为空时走 javsb-relay 的 /hl 代取（白名单仅 818hlw1.com，只转文字页）。
+const RELAY_HL = 'https://javsb-relay-production.up.railway.app/hl?url=';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 // 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
 // 2026-10-28 四轮：cell 域每次 301 到随机 jvtshrap.cc 子域，设备端加载不出内容；
@@ -42,6 +45,10 @@ function H() {
 async function getText(url) {
   try {
     const { data } = await req.get(url, { headers: H(), timeout: 15000 });
+    if (data) return String(data);
+  } catch { /* 换中转腿 */ }
+  try {
+    const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
     return String(data || '');
   } catch { return ''; }
 }
