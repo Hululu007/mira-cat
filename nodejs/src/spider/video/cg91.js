@@ -72,9 +72,7 @@ function parseList(html) {
   return items;
 }
 
-function parseDetail(html, rawId) {
-  const hm = html.match(/<h1[^>]*>([\s\S]{0,400}?)<\/h1>/i);
-  const title = hm ? stripTags(hm[1]) : '91吃瓜';
+function extractEps(html) {
   const eps = [];
   const divs = [...html.matchAll(/<div class="dplayer"([^>]*)>/gi)];
   for (const d of divs) {
@@ -97,16 +95,60 @@ function parseDetail(html, rawId) {
     const tm = attrs.match(/data-video_title="([^"]*)"/i);
     eps.push({ name: tm ? stripTags(tm[1]) : '', url });
   }
+  return eps;
+}
+
+// V2 双集 (中转组只包 .m3u8, 直连组全直链; 假线路无视频时保持单源原样)。
+function buildPlayUrl(eps, rawId) {
+  const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
+  if (eps.length === 1) {
+    return { playUrl: ('播放$' + wrapEp(eps[0].url)) + '$$$' + ('播放$' + eps[0].url), playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
+  } else if (eps.length > 1) {
+    const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
+    const direct = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
+    return { playUrl: relay + '$$$' + direct, playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
+  }
+  return { playUrl: '未找到视频源$' + rawId, playFrom: '91吃瓜' };
+}
+
+// 91吃瓜断点 1 探针 (合并自 cg91_fix.js, 只改 detail 侧; play 与其他函数不动):
+// 首段清单会间歇性回 200 空体 (0 字节), 播放器拿到空清单只能转圈。
+// 做法: 建双集前先探直链清单体长; 体长为 0 时重拉一次详情拿新 token 再探一次;
+// 两次都空仍按主干形态交出 (不断线、不改成无线路)。
+// 注意: 只探 m3u8 清单, 绝不探 mp4 (getText 会把整段视频读进内存);
+// 假线路 (无视频) 不探, 原样交出。
+async function probeEps(eps, articleUrl) {
+  const idxs = eps.map((e, i) => (/\.m3u8/i.test(e.url) ? i : -1)).filter((i) => i >= 0);
+  if (!idxs.length) return eps;
+  const lens = [];
+  for (const i of idxs) lens.push((await getText(eps[i].url, HOST)).length);
+  if (!lens.some((n) => n === 0)) return eps;
+  const html2 = await getText(articleUrl, HOST);
+  if (!html2) return eps;
+  const eps2 = extractEps(html2);
+  const out = eps.slice();
+  for (let k = 0; k < idxs.length; k++) {
+    if (lens[k] !== 0) continue;
+    const i = idxs[k];
+    if (eps2[i] && /\.m3u8/i.test(eps2[i].url)) {
+      await getText(eps2[i].url, HOST); // 再取一次新 token 清单; 无论结果都用最新 token 交出
+      out[i] = { name: out[i].name, url: eps2[i].url };
+    }
+  }
+  return out;
+}
+
+function parseDetail(html, rawId) {
+  const hm = html.match(/<h1[^>]*>([\s\S]{0,400}?)<\/h1>/i);
+  const title = hm ? stripTags(hm[1]) : '91吃瓜';
+  const eps = extractEps(html);
   let pic = '';
   // 详情封面在 <meta itemprop="image" content="https://pic.hdhwqx.cn/...">（与列表卡封面同一张）
   const pm = html.match(/<meta itemprop="image" content="([^"]+)"/i)
     || html.match(/loadBannerDirect\('([^']+)'/i);
   if (pm) pic = proxyPic(pm[1]);
-  let playUrl = '';
-  if (eps.length === 1) playUrl = '播放$' + eps[0].url;
-  else if (eps.length > 1) playUrl = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
-  else playUrl = '未找到视频源$' + rawId;
-  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_play_from: '91吃瓜', vod_play_url: playUrl };
+  const { playUrl, playFrom } = buildPlayUrl(eps, rawId);
+  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_play_from: playFrom, vod_play_url: playUrl };
 }
 
 async function init() { return {}; }
@@ -159,15 +201,31 @@ async function detail(reqIn) {
   for (const raw of ids.filter(Boolean)) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST + String(raw).replace(/^\/+/, '');
     const html = await getText(url, HOST);
-    list.push(parseDetail(html, raw));
+    const base = parseDetail(html, raw);
+    // 探针在直链清单上跑, 双集按探后结果重建 (假线路无 m3u8, probeEps 原样返回)。
+    const eps = extractEps(html);
+    const probed = await probeEps(eps, url);
+    if (probed !== eps) {
+      const { playUrl, playFrom } = buildPlayUrl(probed, raw);
+      base.vod_play_url = playUrl;
+      base.vod_play_from = playFrom;
+    }
+    list.push(base);
   }
   return { list };
 }
+
+// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
+// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
 
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
   const isVideo = /\.(m3u8|mp4)/i.test(id);
+  // V2 双线: 中转集/直连集地址原样返回 (不再包壳); 假线路 parse:1 原样。
   return { parse: isVideo ? 0 : 1, url: id, header: H(HOST) };
 }
 
