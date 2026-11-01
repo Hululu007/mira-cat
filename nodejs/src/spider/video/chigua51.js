@@ -28,6 +28,7 @@ const KEY = 'py_51chigua';
 const NAME = '51吃瓜';
 const HOSTS = [
   'https://51cg1.com',
+  'https://bus.hfztgcakf.cc',
   'https://bus.hszhzwngt.cc',
   'https://bus.egyjtzsa.cc',
   'https://bus.okzdnjeu.cc',
@@ -117,14 +118,23 @@ async function fetchFrom(base, path) {
   return '';
 }
 
+/** 2026-11-01 内容校验：非空不等于成功——设备侧若拿到 200 的验证墙/占位页
+ *（非空、无 post-card），旧代码会直接当成功、判空且不再试其他腿。
+ * 列表/搜索/首页必须含 post-card，详情页必须含 <h1，否则视为失败、继续试下一腿。 */
+function isRealPage(path, html) {
+  if (!html) return false;
+  if (path.indexOf('/archives/') === 0) return html.indexOf('<h1') >= 0;
+  return html.indexOf('post-card') >= 0;
+}
+
 /** 按路径取页面：先用当前主机，取不到内容时依次切换后备主机并记住可用主机 */
 async function getHtml(path) {
   let html = await fetchFrom(ACTIVE_HOST, path);
-  if (html) return html;
+  if (isRealPage(path, html)) return html;
   for (const h of HOSTS) {
     if (h === ACTIVE_HOST) continue;
     html = await fetchFrom(h, path);
-    if (html) {
+    if (isRealPage(path, html)) {
       ACTIVE_HOST = h;
       return html;
     }
