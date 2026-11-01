@@ -19,13 +19,13 @@ const LK_BASE = 'https://lk1.supremejav.com/supjav.php';
 const CATS = [
   ['__home', '最新'],
   ['__popular', '热门'],
-  ['__trending', '趋势'],
   ['censored-jav', '有码 Censored'],
   ['uncensored-jav', '无码 Uncensored'],
   ['amateur', '素人 Amateur'],
   ['chinese-subtitles', '中文字幕 Chn Sub'],
   ['reducing-mosaic', '破解 Reducing Mosaic'],
   ['english-subtitles', '英文字幕 Eng Sub'],
+  ['tag:big-tits', '巨乳'],
 ];
 
 const SORTS = [
@@ -154,7 +154,8 @@ async function home() {
   const classes = CATS.map(([id, name]) => ({ type_id: id, type_name: name }));
   const filters = {};
   for (const [cid] of CATS) {
-    if (!cid.startsWith('__')) filters[cid] = SORTS;
+    // 标签分类不挂 SORTS：标签页是否接受 ?sort= 未实测，避免把未验证的筛选拼上去
+    if (!cid.startsWith('__') && !cid.startsWith('tag:')) filters[cid] = SORTS;
   }
   return { class: classes, filters };
 }
@@ -175,8 +176,10 @@ async function category(reqIn) {
     url = page === 1 ? HOST + '/' : `${HOST}/page/${page}/`;
   } else if (tid === '__popular') {
     url = page === 1 ? HOST + '/popular/' : `${HOST}/popular/page/${page}/`;
-  } else if (tid === '__trending') {
-    url = page === 1 ? HOST + '/trending/' : `${HOST}/trending/page/${page}/`;
+  } else if (tid.startsWith('tag:')) {
+    // 2026-11-01 新增：站方原生标签页（实测 /tag/big-tits/ p1/p2 各 24 条，翻页 /tag/<slug>/page/N/）
+    const base = HOST + '/tag/' + tid.slice(4);
+    url = page === 1 ? base + '/' : `${base}/page/${page}/`;
   } else {
     const base = HOST + '/category/' + tid;
     url = page === 1 ? base + '/' : `${base}/page/${page}/`;
