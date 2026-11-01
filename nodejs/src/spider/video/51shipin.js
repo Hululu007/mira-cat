@@ -235,14 +235,22 @@ async function detail(reqIn) {
       vod_id: raw,
       vod_name: hm ? stripTags(hm[1]) : '51视频',
       vod_pic: proxyCover(pic),
-      vod_play_from: '51视频',
+      // V2 双集: 中转组只包 .m3u8, 直连组全直链; 假线路 (无视频) 保持单源原样。
+      vod_play_from: urls.length ? '51视频·中转$$$51视频·直连' : '51视频',
       vod_play_url: urls.length
-        ? urls.map((u, i) => `第${i + 1}段$${u}`).join('#')
+        ? [urls.map((u, i) => `第${i + 1}段$${/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u}`).join('#'),
+           urls.map((u, i) => `第${i + 1}段$${u}`).join('#')].join('$$$')
         : ('未找到视频源$' + url),
     });
   }
   return { list };
 }
+
+// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
+// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
 
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
@@ -250,6 +258,7 @@ async function play(reqIn) {
   const isVideo = /\.(m3u8|mp4)/i.test(id);
   return {
     parse: isVideo ? 0 : 1,
+    // V2 双线: 中转集/直连集地址原样返回 (不再包壳); 假线路 parse:1 原样。
     url: id,
     header: H(ACTIVE_HOST || HOSTS[0]),
   };
