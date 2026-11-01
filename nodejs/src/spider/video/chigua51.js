@@ -72,6 +72,9 @@ const CLASSES = [
 
 // 封面解密 Worker（用户已部署）
 const IMG_PROXY = 'https://51chigua.li768435813.workers.dev/img?url=';
+// 2026-11-01 中转腿：用户自有 Worker（服务端代试多域 + 跟随 301，轮换后零改动）。
+// 只在直连全灭时启用，平时不走它，不增加延迟。
+const RELAY = 'https://51cgzz.li768435813.workers.dev/?u=';
 
 /** 所有站点 CDN 图片（pic.*.cn）走 Worker 解密代理 */
 function proxyImgUrl(imgUrl) {
@@ -127,7 +130,8 @@ function isRealPage(path, html) {
   return html.indexOf('post-card') >= 0;
 }
 
-/** 按路径取页面：先用当前主机，取不到内容时依次切换后备主机并记住可用主机 */
+/** 按路径取页面：先用当前主机，取不到内容时依次切换后备主机并记住可用主机；
+ * 直连全灭时走自有 Worker 中转腿（服务端代试多域 + 跟随 301），同样内容校验 */
 async function getHtml(path) {
   let html = await fetchFrom(ACTIVE_HOST, path);
   if (isRealPage(path, html)) return html;
@@ -139,6 +143,11 @@ async function getHtml(path) {
       return html;
     }
   }
+  try {
+    const r = await req.get(RELAY + encodeURIComponent(ACTIVE_HOST + path), { headers: headers(), timeout: 20000 });
+    const relayHtml = String((r && r.data) || '');
+    if (isRealPage(path, relayHtml)) return relayHtml;
+  } catch (e) { /* 中转失败即判空，不抛错 */ }
   return '';
 }
 
