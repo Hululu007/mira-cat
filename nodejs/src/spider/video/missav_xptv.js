@@ -10,10 +10,10 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/6
 
 // 源文件 appConfig.tabs 映射 (31 个分类)
 const CLASSES = [
-  { type_id: 'dm265/cn/chinese-subtitle', type_name: '中文字幕' },
-  { type_id: 'dm513/cn/new', type_name: '最近更新' },
   { type_id: 'dm509/cn/release', type_name: '新作上市' },
+  { type_id: 'dm513/cn/new', type_name: '最近更新' },
   { type_id: 'dm561/cn/uncensored-leak', type_name: '无码流出' },
+  { type_id: 'dm265/cn/chinese-subtitle', type_name: '中文字幕' },
   { type_id: 'cn/genres/%E5%B7%A8%E4%B9%B3', type_name: '巨乳' },
   { type_id: 'cn/genres/%E5%A4%A7%E5%B1%81%E8%82%A1', type_name: '大屁股' },
   { type_id: 'dm2091/cn/genres/VR', type_name: 'VR' },
@@ -678,7 +678,7 @@ async function subSlotOracle(keys, src, tier, ctx, match, ocache, bag) {
   const finalItems = items.filter((it) => subRelevant(it, ctx, match));
   for (const it of finalItems) {
     const lang = subLangOf(it.name, it.langs);
-    bag.push({ src, tier, name: subDispName(it.name, ctx.code), url: it.url, fmt: it.fmt, lang: lang.tag, langRank: lang.rank, score: subScoreItem(it.norm, ctx, match) });
+    bag.push({ src, tier, name: subDispName(it.name, ctx.code), url: it.url, fmt: it.fmt, lang: lang.tag, langRank: lang.rank, score: subScoreItem(it.norm, ctx, match), dur: it.norm.duration });
   }
 }
 
@@ -714,6 +714,19 @@ async function subFromSubtitleCat(ctx, match, bag) {
 
 // 合并: 档位 -> 语言 -> 分数; 按 URL 去重 (同条归先到高档位);
 // 全局上限 10、单槽软上限 8 (给 SubtitleCat 留位)。
+// 时长后缀（2026-11-02）：oracle 给毫秒（>100000 视为毫秒除 1000），
+// 秒级原值直接用；无时长不显示、不编造。
+function subDurStr(v) {
+  let s = Number(v) || 0;
+  if (s > 100000) s = Math.floor(s / 1000);
+  if (s <= 0) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+}
 function subMerge(items) {
   const sorted = items.slice().sort((a, b) =>
     (a.tier - b.tier) || (a.langRank - b.langRank) || (b.score - a.score) || String(a.name).localeCompare(String(b.name)));
@@ -727,7 +740,8 @@ function subMerge(items) {
     seenUrl.add(it.url);
     perTier[it.tier] = (perTier[it.tier] || 0) + 1;
     const cleanName = it.name.replace(/\.(srt|vtt|ass|ssa)$/i, '').slice(0, 60);
-    out.push({ name: it.src + '·' + (it.lang ? it.lang + '·' : '') + cleanName, url: it.url, format: it.fmt });
+    const dur = subDurStr(it.dur);
+    out.push({ name: it.src + '·' + (it.lang ? it.lang + '·' : '') + cleanName + (dur ? '·' + dur : ''), url: it.url, format: it.fmt });
   }
   return out;
 }
