@@ -42,15 +42,25 @@ function H() {
   };
 }
 
+// 2026-11-01 晚二次修复：直取若返回非空拦截页（WAF 挑战页，无站内标记），
+// 旧逻辑会直接认下、永不走中转，首页回落 4 写死分类且全空。改为内容校验：
+// 只有含站名 + 站内链接（/category/ 或 /archives/）才算真页，否则换中转腿；
+// 两腿都拿不到真页才返回空（回落分支如实为空）。
+function isRealPage(html) {
+  const s = String(html || '');
+  return s.indexOf('818黑料网') >= 0 && (s.indexOf('/category/') >= 0 || s.indexOf('/archives/') >= 0);
+}
+
 async function getText(url) {
   try {
     const { data } = await req.get(url, { headers: H(), timeout: 15000 });
-    if (data) return String(data);
+    if (isRealPage(data)) return String(data);
   } catch { /* 换中转腿 */ }
   try {
     const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
-    return String(data || '');
-  } catch { return ''; }
+    if (isRealPage(data)) return String(data);
+  } catch { /* 两腿都失败 */ }
+  return '';
 }
 
 function imgOf(html) {
