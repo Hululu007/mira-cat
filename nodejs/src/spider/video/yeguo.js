@@ -86,7 +86,9 @@ function proxiedCover(url) {
   // 2026-10-29 诊断坐实：封面主力域名已迁到 pic.nihmcl.cn（分类 24/24），
   // 直连同样是加密密文（非 JPEG 魔数）；且现行 bagua 代理对该域回 400，
   // 只有 51chigua 代理实测出真 JPEG，故 nihmcl 单独走 51chigua 代理。
-  if (/pic\.nihmcl\.cn/i.test(url)) {
+  // 2026-11-01 诊断：主力域名又迁到 pic.hdhwqx.cn（分类 24/24），直连同样是密文，
+  // 51chigua 代理已实测能解密 hdhwqx 出真图；nihmcl 保留（防回迁）。
+  if (/pic\.nihmcl\.cn|pic\.hdhwqx\.cn/i.test(url)) {
     return IMG_WORKER_51 + '/img?url=' + encodeURIComponent(url);
   }
   // 其余主机（如 imgpublic.ycomesc.live）是明文图，直连即可；
