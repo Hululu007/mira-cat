@@ -20,6 +20,15 @@ const CATS = [
   { type_id: 'jav-hd-uncen', type_name: '无码' },
   { type_id: 'jav-hd-engsub', type_name: '英字' },
   { type_id: 'jav-hd-uncensored-leaked', type_name: '无码流出' },
+  // 2026-11-01 新增：slug 为站方详情页原文（混淆后写法），不可“美化”成干净英文——
+  // 干净 slug（big-tits/big-ass/mature-woman 等）实测全部 301；以下 6 项均 200 且有内容。
+  // tag: 前缀 = /video_tag/，cat: 前缀 = /categories/（仿 javfeed 的 c:/t: 前缀约定）。
+  { type_id: 'tag:big-titssss', type_name: '巨乳' },
+  { type_id: 'tag:huge-butt', type_name: '大屁股' },
+  { type_id: 'tag:creampie-xxxxxx', type_name: '中出' },
+  { type_id: 'tag:xxxxxxx-mature-woman', type_name: '熟女' },
+  { type_id: 'cat:mw-xxx', type_name: '人妻' },
+  { type_id: 'tag:solowork-xxxxx', type_name: '单体作品' },
 ];
 
 function t(v) {
@@ -143,6 +152,8 @@ async function buildList(url, page, limit) {
 function catUrl(tid, page) {
   let base;
   if (tid === 'latest') base = SITE + '/';
+  else if (tid.indexOf('tag:') === 0) base = SITE + '/video_tag/' + tid.slice(4) + '/';
+  else if (tid.indexOf('cat:') === 0) base = SITE + '/categories/' + tid.slice(4) + '/';
   else base = SITE + '/categories/' + encodeURIComponent(tid) + '/';
   if (page > 1) return base + 'page/' + page + '/';
   return base;
