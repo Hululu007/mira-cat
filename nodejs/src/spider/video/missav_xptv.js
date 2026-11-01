@@ -11,7 +11,6 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/6
 // 源文件 appConfig.tabs 映射 (31 个分类)
 const CLASSES = [
   { type_id: 'dm509/cn/release', type_name: '新作上市' },
-  { type_id: 'dm513/cn/new', type_name: '最近更新' },
   { type_id: 'dm561/cn/uncensored-leak', type_name: '无码流出' },
   { type_id: 'dm265/cn/chinese-subtitle', type_name: '中文字幕' },
   { type_id: 'cn/genres/%E5%B7%A8%E4%B9%B3', type_name: '巨乳' },
@@ -290,8 +289,8 @@ async function home() {
 }
 
 async function homeVod() {
-  // XPTV 源文件无首页推荐,用"最近更新"第一页做首页推荐
-  const { list } = await getCards(JSON.stringify({ id: 'dm513/cn/new', page: 1 }));
+  // 首页推荐改用"新作上市"第一页（2026-11-02 查实：新作上市与最近更新第 1、2 页内容连顺序全同，最近更新分类已删）
+  const { list } = await getCards(JSON.stringify({ id: 'dm509/cn/release', page: 1 }));
   return { list: (list || []).slice(0, 20) };
 }
 
