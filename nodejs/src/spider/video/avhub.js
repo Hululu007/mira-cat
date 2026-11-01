@@ -254,8 +254,9 @@ async function detail(reqIn) {
       vod_pic: picProxy(fixUrl(pic), reqIn),
       vod_remarks: code.toUpperCase(),
       vod_content: name,
-      vod_play_from: 'AvHub',
-      vod_play_url: '正片$' + SITE + '/media/' + code,
+      // V2 双集: 中转组 episode id 带 relay: 前缀 (play 靠它分流), 直连组为原 /media 地址。
+      vod_play_from: 'AvHub·中转$$$AvHub·直连',
+      vod_play_url: ('正片$relay:' + SITE + '/media/' + code) + '$$$' + ('正片$' + SITE + '/media/' + code),
     }],
   };
 }
@@ -409,18 +410,26 @@ async function m3u8Proxy(request, reply) {
   reply.redirect(target);
 }
 
+// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
+// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
+  let rawId = t(body.id);
+  if (rawId.includes('$')) rawId = rawId.split('$').pop().trim();
+  const viaRelay = rawId.startsWith('relay:');
   const code = codeFromId(body.id);
   if (!code) return { parse: 0, url: '' };
   const mediaUrl = SITE + '/media/' + code;
-  const referer = SITE + '/videos/' + code;
-  // 只返回本地代理地址, 由 /proxy/m3u8 在播放时实时解析 /media (含 fangzhou 抽奖重抽逻辑)。
-  // play 本身不再发上游请求, 返回更快; 代理地址构造失败才降级直连 /media。
-  const purl = proxyUrl(reqIn, '/proxy/m3u8', mediaUrl, referer);
+  // V2 双线: 中转集走中转跟随 /media 302 (分片/密钥按 host 分流); 直连集原样返回 /media 地址
+  // (播放器自行跟随; 注意 tsnew 在用户手机上被拦, 直连集对 Avhub 只是保底, 主线仍是中转集)。
+  // 本地 /proxy/m3u8 路由保留但 play 不再使用; 若日后中转下线, 改回 purl 即可恢复。
   return {
     parse: 0,
-    url: purl || mediaUrl,
+    url: viaRelay ? RELAY_M3U8 + encodeURIComponent(mediaUrl) : mediaUrl,
     header: { 'User-Agent': UA, 'Referer': REFERER },
   };
 }
