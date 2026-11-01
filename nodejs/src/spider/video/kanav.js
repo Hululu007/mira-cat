@@ -544,6 +544,13 @@ async function subFromSubtitleCat(ctx, match, bag) {
 // 全局上限 10、单槽软上限 8 (给 SubtitleCat 留位)。
 // 时长后缀（2026-11-02）：oracle 给毫秒（>100000 视为毫秒除 1000），
 // 秒级原值直接用；无时长不显示、不编造。
+// 去重键用秒（2026-11-02 名字+时长口径）：毫秒值 >100000 除 1000；
+// 无时长记 nodur（沿用名字去重）；同名同时长才算重复。
+function subDurSec(v) {
+  let s = Number(v) || 0;
+  if (s > 100000) s = Math.floor(s / 1000);
+  return s > 0 ? s : 0;
+}
 function subDurStr(v) {
   let s = Number(v) || 0;
   if (s > 100000) s = Math.floor(s / 1000);
@@ -559,13 +566,17 @@ function subMerge(items) {
   const sorted = items.slice().sort((a, b) =>
     (a.tier - b.tier) || (a.langRank - b.langRank) || (b.score - a.score) || String(a.name).localeCompare(String(b.name)));
   const seenUrl = new Set();
+  const seenName = new Set();
   const perTier = {};
   const out = [];
   for (const it of sorted) {
     if (out.length >= 10) break;
     if (seenUrl.has(it.url)) continue;
+    const nameKey = (it.lang || '') + '|' + it.name.toLowerCase().replace(/\.(srt|vtt|ass|ssa)$/i, '') + '|' + (subDurSec(it.dur) || 'nodur');
+    if (seenName.has(nameKey)) continue;
     if ((perTier[it.tier] || 0) >= 8) continue;
     seenUrl.add(it.url);
+    seenName.add(nameKey);
     perTier[it.tier] = (perTier[it.tier] || 0) + 1;
     const cleanName = it.name.replace(/\.(srt|vtt|ass|ssa)$/i, '').slice(0, 60);
     const dur = subDurStr(it.dur);
