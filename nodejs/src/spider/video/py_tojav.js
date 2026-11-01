@@ -114,43 +114,13 @@ const KW_CATS = [
 const CATS = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'genre:uncensored-leaked', type_name: '无码流出' },
-  { type_id: 'genre:big-tits', type_name: '巨乳' },
-  { type_id: 'genre:big-asses', type_name: '大屁股' },
-  { type_id: 'genre:married-woman', type_name: '人妻' },
-  { type_id: 'genre:uniform', type_name: '制服' },
   { type_id: 'genre:4k', type_name: '4K' },
   { type_id: 'genre:reducing-mosaic', type_name: '减码' },
-  { type_id: 'genre:nurse', type_name: '护士' },
-  { type_id: 'genre:maid', type_name: '女仆' },
   { type_id: 'censored', type_name: '有码' },
-  { type_id: 'genre:beautiful-girl', type_name: 'Beautiful Girl' },
-  { type_id: 'genre:featured-actress', type_name: 'Featured Actress' },
-  { type_id: 'genre:nymphomaniac', type_name: 'Nymphomaniac' },
-  { type_id: 'genre:kiss-kiss', type_name: 'Kiss Kiss' },
-  { type_id: 'genre:idol-celebrity', type_name: 'Idol & Celebrity' },
-  { type_id: 'genre:squirting', type_name: 'Squirting' },
-  { type_id: 'genre:digital-mosaic', type_name: 'Digital Mosaic' },
-  { type_id: 'genre:hi-def', type_name: 'Hi-Def' },
-  { type_id: 'genre:humiliation', type_name: 'Humiliation' },
-  { type_id: 'genre:pov', type_name: 'POV' },
-  { type_id: 'genre:slut', type_name: 'Slut' },
-  { type_id: 'genre:glasses', type_name: 'Glasses' },
-  { type_id: 'genre:urination', type_name: 'Urination' },
-  { type_id: 'genre:schoolgirl', type_name: 'Schoolgirl' },
-  { type_id: 'genre:reluctant', type_name: 'Reluctant' },
-  { type_id: 'genre:drama', type_name: 'Drama' },
-  { type_id: 'genre:threesome--foursome', type_name: 'Threesome / Foursome' },
-  { type_id: 'genre:gang-bang', type_name: 'Gang Bang' },
-  { type_id: 'genre:female-teacher', type_name: 'Female Teacher' },
-  { type_id: 'genre:titty-fuck', type_name: 'Titty Fuck' },
-  { type_id: 'genre:cheating-wife', type_name: 'Cheating Wife' },
-  { type_id: 'genre:creampie', type_name: 'Creampie' },
-  { type_id: 'genre:orgy', type_name: 'Orgy' },
-  { type_id: 'genre:cowgirl', type_name: 'Cowgirl' },
-  { type_id: 'genre:slender', type_name: 'Slender' },
-  { type_id: 'genre:dirty-talk', type_name: 'Dirty Talk' },
-  { type_id: 'genre:bukkake', type_name: 'BUKKAKE' },
 ];
+// 2026-11-02 用户令删：其余 genre 分类站方只有索引、无在线片源
+// （详情页 episode-list 为空、默认集接口回空 player，实测护士/女仆/巨乳等
+// 30 条全无片源），留着只会点进详情报“视频信息获取失败”，故只留 5 类。
 // 关键词分类：走站方搜索接口（POST /api/v1/search {term}，
 // 站方返回 30 条；标题盲扫 240 条曾 0 命中，搜索接口是唯一可靠途径）。
 // 搜索接口不支持翻页（page/offset 参数实测均被忽略、回同样 30 条），
