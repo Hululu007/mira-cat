@@ -35,6 +35,8 @@
 //   只留单线备份、不拆档位。
 // - 2026-10-29 晚 v5.1：EVS 在 VAS 出线时也尽量拆档（拆不开回落单线）；新加
 //   tag-huge-butt（大屁股，实测 5 页各 24 条不重复）→ 14 分类。
+// - 2026-11-01 提速（v5.1 的 EVS 拆档 revert）：EVS master 常 403 白跑一次 master GET
+//   （约 1–3 秒），VAS 已出线时不再拆 EVS 档、只留单线备份；仅 VAS 失败时才展开 EVS。
 import req from '../../util/req.js';
 
 const KEY = 'py_javneon';
@@ -114,26 +116,51 @@ const CAT_PATHS = {
   'tag-beautiful-girl': 'tag/beautiful-girl', 'maker-s1-no-1-style': 'maker/s1-no-1-style',
   'tag-huge-butt': 'tag/huge-butt',
 };
+// 2026-11-01 提速：lookup.json 与分类 JSON 会话内内存缓存 + TTL 10 分钟
+// （镜像本身 6 小时一刷，10 分钟不影响新鲜度；首详情后每次详情省约 4 秒，
+// 且彻底避开 ghfast 抖动）。失败结果不缓存，允许下次重试。
+const MIRROR_CACHE_TTL = 10 * 60 * 1000;
+const mirrorCache = new Map();
+function mirrorCacheGet(key) {
+  const e = mirrorCache.get(key);
+  if (!e) return undefined;
+  if (Date.now() - e.at > MIRROR_CACHE_TTL) { mirrorCache.delete(key); return undefined; }
+  return e.value;
+}
+function mirrorCacheSet(key, value) { mirrorCache.set(key, { at: Date.now(), value }); }
+
 // 2026-10-29 v5：路径索引 lookup.json（path -> {s: 分类 key, t: 标题, p: 封面}），
 // 详情/搜索先查索引再只取一个分类文件，不再 13 个文件全拉（详情慢的主因之一）。
 async function fetchMirrorLookup() {
+  const cached = mirrorCacheGet('lookup');
+  if (cached) return cached;
   for (const base of MIRROR_BASES) {
     try {
-      const res = await req.get(base + 'lookup.json', { headers: { 'User-Agent': UA, 'Accept': 'application/json,*/*' }, timeout: 20000, maxRedirects: 10 });
+      // ghfast 腿超时 20 秒改 8 秒（顺序不变，仍优先 ghfast；抖动时 8 秒即回落 raw，
+      // 最坏单腿浪费从 20 秒降到 8 秒）。
+      const res = await req.get(base + 'lookup.json', { headers: { 'User-Agent': UA, 'Accept': 'application/json,*/*' }, timeout: base.indexOf('ghfast') >= 0 ? 8000 : 20000, maxRedirects: 10 });
       const data = (res && res.data !== undefined) ? res.data : res;
       const j = (typeof data === 'string') ? JSON.parse(data) : data;
-      if (j && j.items && typeof j.items === 'object' && !Array.isArray(j.items) && Object.keys(j.items).length) return j.items;
+      if (j && j.items && typeof j.items === 'object' && !Array.isArray(j.items) && Object.keys(j.items).length) {
+        mirrorCacheSet('lookup', j.items);
+        return j.items;
+      }
     } catch {}
   }
   return null;
 }
 async function fetchMirrorJson(slug) {
+  const cached = mirrorCacheGet('cat:' + slug);
+  if (cached) return cached;
   for (const base of MIRROR_BASES) {
     try {
-      const res = await req.get(base + slug + '.json', { headers: { 'User-Agent': UA, 'Accept': 'application/json,*/*' }, timeout: 20000, maxRedirects: 10 });
+      const res = await req.get(base + slug + '.json', { headers: { 'User-Agent': UA, 'Accept': 'application/json,*/*' }, timeout: base.indexOf('ghfast') >= 0 ? 8000 : 20000, maxRedirects: 10 });
       const data = (res && res.data !== undefined) ? res.data : res;
       const j = (typeof data === 'string') ? JSON.parse(data) : data;
-      if (j && Array.isArray(j.items) && j.items.length) return j;
+      if (j && Array.isArray(j.items) && j.items.length) {
+        mirrorCacheSet('cat:' + slug, j);
+        return j;
+      }
     } catch {}
   }
   return null;
@@ -381,15 +408,11 @@ async function resolvePlayLinesFromButtons(btns, detailUrl) {
     }
   }
   if (vasOk) {
-    // VAS 已出线：EVS 也尽量拆档（与 VAS 失败分支同款）；拆不开（master 403 等）
-    // 时回落单线备份，不影响 VAS 线。
+    // 2026-11-01 提速：VAS 已出线时不再拆 EVS 档（EVS master 常 403，白跑一次
+    // master GET 约 1–3 秒）；EVS 只留单线备份。仅 VAS 失败时才展开 EVS（见下分支）。
     if (evs) {
       const packed = extractM3u8(evs.embedHtml);
-      if (packed) {
-        const expanded = await expandMaster(packed, evs.target, 'EVS');
-        if (expanded.length) expanded.forEach(l => push(l.name, l.url));
-        else push('EVS', packed);
-      }
+      if (packed) push('EVS', packed);
     }
     return lines;
   }
