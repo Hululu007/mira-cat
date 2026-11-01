@@ -187,13 +187,21 @@ async function detail(reqIn) {
     const sources = await fetchPlayback(durl, html);
     if (sources) {
       const lines = [];
+      const abs = (u) => {
+        // 2026-11-01 站方 sources 改相对地址 MP4（如 /media/video/115295/720p?…，无 .mp4 后缀）：
+        // 相对地址对播放器无意义，必须补成绝对地址（旧格式是绝对地址，无需处理）。
+        u = String(u || '');
+        if (!u) return u;
+        if (/^https?:\/\//i.test(u)) return u;
+        return HOST + (u.startsWith('/') ? u : '/' + u);
+      };
       for (const s of sources) {
         if (!s.src) continue;
         const label = s.label || (s.size ? s.size + 'p' : '播放');
-        lines.push(label + '$' + s.src);
+        lines.push(label + '$' + abs(s.src));
       }
       const fb = sources.find(s => s.fallbackSrc);
-      if (fb) lines.push('MP4$' + fb.fallbackSrc);
+      if (fb) lines.push('MP4$' + abs(fb.fallbackSrc));
       if (lines.length) playUrl = lines.join('#');
     }
     if (!playUrl) playUrl = '网页播放$' + (embedUrl || durl);
@@ -205,7 +213,9 @@ async function detail(reqIn) {
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
-  const isVideo = /\.(m3u8|mp4)/i.test(id);
+  // 2026-11-01：站方新 MP4 无 .mp4 后缀，旧判定（只认 .m3u8/.mp4）会误判 parse:1；
+  // 含 /media/video/ 的即为站方直链视频，判 parse:0。
+  const isVideo = /\.(m3u8|mp4)/i.test(id) || /\/media\/video\//i.test(id);
   return {
     parse: isVideo ? 0 : 1,
     url: id,
