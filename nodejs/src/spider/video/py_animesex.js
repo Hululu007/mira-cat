@@ -39,6 +39,7 @@ function hdr() {
 async function getHtml(url) {
   try {
     const r = await req.get(url, { headers: hdr(), timeout: 20000 });
+    if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
   } catch (e) { return ''; }
 }
@@ -52,14 +53,20 @@ function clean(s) {
   return t;
 }
 
+function mainScope(html) {
+  const m = String(html || '').match(/<main[^>]*>([\s\S]*?)<\/main>/);
+  return m ? m[1] : String(html || '');
+}
+
 function parseList(html) {
+  const scope = mainScope(html);
   const items = [];
   const seen = new Set();
   const re = /<article\b[^>]*>/g;
   let m;
-  while ((m = re.exec(html)) !== null) {
+  while ((m = re.exec(scope)) !== null) {
     const head = m[0];
-    const seg = html.slice(m.index, m.index + 3000);
+    const seg = scope.slice(m.index, m.index + 3000);
     const lm = seg.match(/href="((?:https:\/\/animesex\.club)?\/video\/[^"]+)"/);
     if (!lm) continue;
     let link = lm[1];
@@ -87,14 +94,16 @@ function parseList(html) {
 }
 
 function pagecount(html, pg, count) {
-  const m = html.match(/Page\s+\d+\s+of\s+(\d+)/);
-  if (m) return parseInt(m[1], 10);
+  // 标题 "Page N of M" 是本站归档自己的总页数；/page/ 链接只取 <main> 主循环里的，站外挂件的分页链接会虚增页数
+  const tm = String(html || '').match(/Page\s+\d+\s+of\s+(\d+)/);
+  if (tm) return parseInt(tm[1], 10);
+  const scope = mainScope(html);
   const nums = [];
   const re = /\/page\/(\d+)\//g;
   let x;
-  while ((x = re.exec(html)) !== null) nums.push(parseInt(x[1], 10));
+  while ((x = re.exec(scope)) !== null) nums.push(parseInt(x[1], 10));
   if (nums.length) return Math.max(...nums);
-  return count >= 20 ? pg + 1 : pg;
+  return pg;
 }
 
 async function catPage(tid, pg) {
