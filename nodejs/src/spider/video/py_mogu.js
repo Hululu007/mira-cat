@@ -52,6 +52,24 @@ function absUrl(u, host) {
   return u;
 }
 
+// 站方 data-original 常写成 https:/dfdf...（单斜杠）且图与播单在 dfdf 与 cloudfront 两线内容逐字节相同；
+// 统一修成标准 https:// 并走 cloudfront 线，避开 dfdf 单域名故障面
+function normUrl(u) {
+  let s = String(u || '').trim();
+  if (!s) return '';
+  s = s.replace(/^(https?:)\/([^/])/, '$1//$2');
+  if (s.startsWith('dfdf.tjacq.com/')) s = 'https://' + s;
+  s = s.replace('dfdf.tjacq.com', 'd1uy7itup9paqh.cloudfront.net');
+  return s;
+}
+
+function pickPlayBase(bases) {
+  const list = Array.isArray(bases) ? bases : [];
+  const cf = list.find((b) => b.includes('cloudfront'));
+  if (cf) return cf;
+  return list[0] || ALT_CDN;
+}
+
 async function getHtml(path) {
   let url = String(path || '');
   if (url.startsWith('//')) url = 'https:' + url;
@@ -61,6 +79,7 @@ async function getHtml(path) {
       headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
       timeout: 20000,
     });
+    if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
   } catch (e) { return ''; }
 }
@@ -71,7 +90,7 @@ function extractPic(inner) {
     if (m) {
       const cand = m[1].trim();
       if (cand && !['loading.jpg', 'loading.png', 'placeholder', 'default'].some((b) => cand.toLowerCase().includes(b))) {
-        if (cand.startsWith('/')) return CDN + cand;
+        if (cand.startsWith('/')) return ALT_CDN + cand;
         return cand;
       }
     }
@@ -102,7 +121,7 @@ function parseCards(html, host) {
       items.push({
         vod_id: vUrl,
         vod_name: title || '蘑菇精彩视频',
-        vod_pic: pic ? (pic.startsWith('http') ? pic : absUrl(pic, host)) : '',
+        vod_pic: pic ? normUrl(pic.startsWith('http') ? pic : absUrl(pic, host)) : '',
         vod_remarks: durM ? durM[1] : '',
       });
     }
@@ -156,7 +175,7 @@ function extractPlayStream(html) {
   if (m) {
     let cand = m[1].trim().replace(/\\u002F/g, '/').replace(/\\\//g, '/');
     if (cand.startsWith('//')) cand = 'https:' + cand;
-    else if (cand.startsWith('/')) cand = CDN + cand;
+    else if (cand.startsWith('/')) cand = ALT_CDN + cand;
     else if (!cand.startsWith('http')) cand = CDN + '/' + cand;
     return { url: cand, viaDataUrl: true };
   }
@@ -245,15 +264,15 @@ async function detail(reqIn) {
     if (dm) {
       const bases = parseCdnLines(html);
       const pth = dm[1].trim().replace(/\\u002F/g, '/').replace(/\\\//g, '/');
-      playUrl = bases[0].replace(/\/+$/, '') + (pth.startsWith('/') ? pth : '/' + pth);
+      playUrl = pickPlayBase(bases).replace(/\/+$/, '') + (pth.startsWith('/') ? pth : '/' + pth);
     }
   }
   let posterPic = '';
   const dfdf = String(html || '').match(/dfdf\.tjacq\.com\/image\/[^\s"']+/g);
-  if (dfdf && dfdf.length) posterPic = 'https://' + dfdf[0];
+  if (dfdf && dfdf.length) posterPic = normUrl('https://' + dfdf[0]);
   if (!posterPic) {
     const ogM = html.match(/property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
-    if (ogM) posterPic = ogM[1].trim();
+    if (ogM) posterPic = normUrl(ogM[1].trim());
   }
   if (!posterPic) {
     const selfCard = parseCards(html, HOST).find((c) => c.id === rawId);
