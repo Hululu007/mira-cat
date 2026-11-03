@@ -238,7 +238,10 @@ async function detail(reqIn) {
       while ((m = lre.exec(html)) !== null) {
         i++;
         let href = m[1].trim();
-        if (/\/tag\//i.test(href) || /\/category\//i.test(href)) continue;
+        // 2026-11-03 跟进修：站内文章页（/archives/ 相关推荐、/tag/、/category/）标题含“视频”二字
+        // 也会误命中，一律排除，只认站外链接或站内直链媒体
+        const hp = '/' + href.replace(/^https?:\/\/[^\/]+/i, '').replace(/^\/+/, '');
+        if (/^\/(archives|tag|category)\//i.test(hp)) continue;
         let name = m[2].replace(/点击观看[：:]/, '').replace(/点击观看/, '').trim() || ('视频' + i);
         if (!/^https?:\/\//i.test(href)) {
           href = HOST.replace(/\/$/, '') + (href.startsWith('/') ? href : '/' + href);
