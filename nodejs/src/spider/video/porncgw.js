@@ -13,7 +13,8 @@ const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 const TIMEOUT = 15000;
 
 // 站内导航 21 个分类 (路径已逐个复核); /archives/ 为图文文章不收。
-// 最新更新 = 首页: 站点根路径无服务端分页 (/2/、/page/2/、?page=2 均 404), 只出第一页。
+// 最新更新 = 首页: 站点根路径无服务端分页 (/2/、/page/2/、?page=2 均 404)，
+// 但站方无限滚动走 JSON API /api/videos/category/home?page=N&size=20（2026-11-03 实测第 2 页 20 条正常）。
 const CATS = [
   { type_id: 'latest', type_name: '最新更新', path: '/' },
   { type_id: 'list', type_name: '短视频', path: '/list/' },
@@ -230,11 +231,53 @@ async function home() {
   };
 }
 
+// 最新更新走站方 JSON API 分页（SSR 根路径无分页，之前写死单页导致无法加载更多）
+async function fetchApi(url) {
+  try {
+    const res = await req.get(url, { headers: headers(HOST + '/'), timeout: TIMEOUT });
+    let d = res?.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return null; } }
+    return d || null;
+  } catch (e) { /* ignore */ }
+  try {
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), TIMEOUT);
+    try {
+      const r = await fetch(url, { headers: headers(HOST + '/'), signal: ctl.signal });
+      if (r.ok) return await r.json();
+    } finally { clearTimeout(to); }
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+async function buildApiLatest(page) {
+  const d = await fetchApi(HOST + '/api/videos/category/home?page=' + page + '&size=20');
+  const items = d?.data?.items || d?.items || [];
+  const pg = d?.data?.pagination || d?.pagination || {};
+  const list = [];
+  const seen = new Set();
+  for (const it of items) {
+    const path = t(it.url);
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
+    list.push({
+      vod_id: path,
+      vod_name: t(it.title) || path,
+      vod_pic: proxyCover(it.cover || ''),
+      vod_remarks: t(it.episode_badge) || '',
+    });
+  }
+  const pagecount = parseInt(pg.pages, 10) || (list.length >= 20 ? page + 1 : page);
+  const total = parseInt(pg.total, 10) || list.length;
+  return { page, pagecount, limit: list.length || 20, total, list };
+}
+
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const cat = catOf(t(body.id || body.tid) || 'latest');
-  return buildList(catUrl(cat, page), page, cat.type_id === 'latest');
+  if (cat.type_id === 'latest') return buildApiLatest(page);
+  return buildList(catUrl(cat, page), page, false);
 }
 
 async function detail(reqIn) {
@@ -294,7 +337,13 @@ async function play(reqIn) {
   if (!path || path.charAt(0) !== '/') return { parse: 0, url: '' };
   const pageUrl = HOST + path;
   const html = await getHtml(pageUrl, HOST + '/');
-  const src = jsonStr(html, 'videoSrc') || jsonStr(html, 'videoSrcHevc');
+  // 2026-11-03 修：cshort 路 videoSrc 源站 502 已死，同页 videoSrcHevc 可用时改用后者；
+  // 其他路保持原有 videoSrc 优先，videoSrc 为空时仍回落 Hevc
+  const src0 = jsonStr(html, 'videoSrc');
+  const hevc = jsonStr(html, 'videoSrcHevc');
+  let src = src0;
+  if (src0 && /\/cshort\//i.test(src0) && hevc) src = hevc;
+  if (!src) src = hevc;
   if (src && /^https?:\/\//i.test(src)) {
     return { parse: 0, url: src, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   }
