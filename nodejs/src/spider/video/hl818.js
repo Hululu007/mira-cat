@@ -269,6 +269,12 @@ async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
   const isVideo = /\.(m3u8|mp4|ts)/i.test(id);
+  // 2026-11-04 代理修：m3u8 播单与分片/密钥必带 auth_key，播放器丢签即 403，
+  // 改走蜘蛛本地 /proxy/m3u8，播放器不再直触带签第三方地址
+  if (isVideo && /\.m3u8(\?|#|$)/i.test(id)) {
+    const proxy = proxyUrl(reqIn, '/proxy/m3u8', id, HOST);
+    if (proxy) return { parse: 0, url: proxy, header: H() };
+  }
   return {
     parse: isVideo ? 0 : 1,
     url: id,
@@ -289,6 +295,117 @@ async function search(reqIn) {
   return { page, pagecount: 9999, limit: 90, total: list.length, list };
 }
 
+// ---------- 播单改写代理（2026-11-04：分片/密钥必带 auth_key，播放器丢签即 403；
+// 播单与分片/密钥一律走蜘蛛本地代理，播放器不再直触带签第三方地址。仿 ero 先例的
+// /proxy/m3u8 路由，但分片/密钥改为字节透传而非 302（302 回到带签地址等于没修））
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 ero 先例）
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+async function fetchText(url, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': referer || HOST },
+      timeout: 20000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+    });
+    const text = typeof r.data === 'string' ? r.data : '';
+    if (r.status >= 200 && r.status < 300 && text) return text;
+  } catch (e) { /* 落空走 302 降级 */ }
+  return '';
+}
+async function fetchBytes(url, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': referer || HOST },
+      timeout: 30000,
+      responseType: 'arraybuffer',
+      validateStatus: () => true,
+    });
+    if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+  } catch (e) { /* 落空走 302 降级 */ }
+  return null;
+}
+function contentTypeFor(url) {
+  const u = String(url).split('?')[0].toLowerCase();
+  if (u.endsWith('.ts')) return 'video/mp2t';
+  if (u.endsWith('.m4s')) return 'video/iso.segment';
+  if (u.endsWith('.mp4')) return 'video/mp4';
+  return 'application/octet-stream';
+}
+function rewriteProxy(raw, playlistUrl, selfBase, referer) {
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try {
+            const abs = new URL(uri, playlistUrl).toString();
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}"`;
+          } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    try {
+      const abs = new URL(s, playlistUrl).toString();
+      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
+}
+// GET /proxy/m3u8?u={b64url 地址}&r={b64url referer}：m3u8 走改写，分片/密钥/初始化段走字节透传
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST;
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  try {
+    if (/\.m3u8(\?|#|$)/i.test(target)) {
+      const raw = await fetchText(target, referer);
+      if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
+      const host = request.headers && request.headers.host;
+      const selfBase = host
+        ? `http://${host}/spider/${KEY}/3`
+        : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+      reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(rewriteProxy(raw, target, selfBase, referer));
+    } else {
+      const buf = await fetchBytes(target, referer);
+      if (!buf || !buf.length) { reply.redirect(target); return; }
+      reply.header('Content-Type', contentTypeFor(target));
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(buf);
+    }
+  } catch (e) {
+    try { reply.redirect(target); } catch (e2) { /* 已发送则忽略 */ }
+  }
+}
+
 export default function createSpider() {
   return {
     meta: { key: KEY, name: NAME, type: 3 },
@@ -298,6 +415,7 @@ export default function createSpider() {
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
       fastify.post('/search', search);
     },
   };
