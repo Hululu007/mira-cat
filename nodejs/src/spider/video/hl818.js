@@ -230,13 +230,15 @@ async function detail(reqIn) {
         if (vu) plist.push('视频' + c + '$' + vu);
       } catch {}
     }
-    // 2) 观看链接兜底
+    // 2) 观看链接兜底（2026-11-03 修：排除 /tag/ 与 /category/ 列表页链接，
+    // 之前这类链接文字含“视频”二字会被当成播单，导致播放去嗅探列表页而播不出）
     if (!plist.length) {
       const lre = /<a[^>]*href="([^"]+)"[^>]*>([^<]*(?:点击观看|观看|播放|视频|第一弹|第二弹|第三弹)[^<]*)<\/a>/gi;
       let i = 0;
       while ((m = lre.exec(html)) !== null) {
         i++;
         let href = m[1].trim();
+        if (/\/tag\//i.test(href) || /\/category\//i.test(href)) continue;
         let name = m[2].replace(/点击观看[：:]/, '').replace(/点击观看/, '').trim() || ('视频' + i);
         if (!/^https?:\/\//i.test(href)) {
           href = HOST.replace(/\/$/, '') + (href.startsWith('/') ? href : '/' + href);
