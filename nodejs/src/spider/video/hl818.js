@@ -29,6 +29,14 @@ const IMG_PROXY_BAGUA = 'https://bagua-img-proxy.li768435813.workers.dev/img?url
 // App 缓存旧详情时必死。改法：代理地址全部改走路径段（无查询串）、改写基址沿用
 // 播单自身的 js2p 基址、分集地址改为“详情页||序号”使 play() 现取新鲜播单、
 // 播单代理在上游失败时用详情页自愈重取。home/category/search 与封面逻辑未动。
+// 2026-11-04 round2（用户真机反馈：仅 196322 能播、其余全灭）：
+// 排查结论：196322 是唯一 mp4 直出项（今日吃瓜 p1 30 项中唯一 mp4，其余 29 项全为
+// videos5 m3u8；另 9 项他类样本全为 m3u8；config 结构完全相同，只差视频 URL 本身）。
+// play() 分支上 mp4 直出能播、m3u8 经 js2p 代理全灭，而同一 m3u8 链路在 VM 桩测里
+// 全通（播单/分片/密钥均 200），故失败在设备侧代理执行环节，不在蜘蛛逻辑。
+// 改法：m3u8 一律直出（parse:0 + 直链），与 mp4 走同一条设备已证实的路径；
+// 代理路由与函数保留，已缓存的 fix6 版 js2p 播放地址仍可解析。
+// 直出若仍播不了，则只剩设备网络到 hls.ohjzmm.cn/分片域被拦一种可能，下一步走中转。
 
 function proxyCover(url) {
   url = String(url || '').trim();
@@ -310,9 +318,10 @@ async function play(reqIn) {
     const isVideo = /\.(m3u8|mp4|ts)/i.test(id);
     return { parse: isVideo ? 0 : 1, url: id, header: H() };
   }
+  // round2：m3u8 直出，不再走 js2p 代理（见文件头 round2 说明）。
+  // 代理路由与 proxyPlaylistUrl 保留：缓存的 fix6 版 js2p 地址仍走路由层解析。
   if (/\.m3u8(\?|#|$)/i.test(playlistUrl)) {
-    const proxy = proxyPlaylistUrl(playlistUrl, detailUrl, epIndex);
-    if (proxy) return { parse: 0, url: proxy, header: H() };
+    return { parse: 0, url: playlistUrl, header: H() };
   }
   const isVideo2 = /\.(m3u8|mp4|ts)/i.test(playlistUrl);
   return { parse: isVideo2 ? 0 : 1, url: playlistUrl, header: H() };
