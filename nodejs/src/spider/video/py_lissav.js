@@ -4,6 +4,9 @@ import req from '../../util/req.js';
 // domestic 区走 /video/vid/ 另一套，播放未验，本蜘蛛不做
 // 列表：固定榜单 + 两个 tag + 题材（100 个 genre 作筛选卡片）；翻页走 /page/N（站方忽略 ?page=）
 // 2026-11-04 修：站方网络不稳定（VM 实测偶发 http 000 空回），getHtml 改为多 host 轮询 + 重试：lissav.vip → lissav.net（实测首页可出 48 条）；lissav.cc/.pro 只是 301 跳回 .vip，不作 fallback
+// 2026-11-04 round2 提速：VM 实测 vip 13 次里 4 次死（30s 挂起/中途截断），.net 13/13 全通且最慢 2.7s；旧版 vip 优先顺序执行时，一次 vip 挂起就要等满 20s 超时才轮到 .net，单次列表/详情经常 20s+，两腿都挂时理论最坏 80s。
+// 本轮改为双 host 并行竞速（先回有效数据者胜）+ 单次超时 20s → 8s + 仍保留 2 轮：健康时约 2s（哪边快用哪边，设备侧网络哪边快不可预知，竞速自适应），vip 挂起时 .net 约 2s 胜出不再等 20s，
+// 最坏 2 轮 × 8s + 0.6s ≈ 16.6s（原 80s）；尝试总次数不变（4 次），可靠性不降反升（fetchStream 由 2 次增至 4 次）。竞速不用 Promise.any（老 JS 引擎未必支持），手写 firstValid。
 // 2026-11-04 增：顶级分类新增 巨乳/大屁股/好屁股/美乳/巨乳偏好/屁股偏好（均为 /videos/genre/ 路径，VM 实测各 12 条，翻页 /page/N 同规律）
 // 详情：/asian/{lang}/video/cid/<番号>；播放走站方自家播放器接口 /asian/{lang}/api/video/stream?video_uid=<uid>
 // 播单：接口 playlist 两条（高清主源 + 480p），分集列出供手动选；480p 线 VM 实测 200 可播，主源 VM 侧 403（设备侧可能不同）
@@ -47,19 +50,39 @@ function clean(s) {
     .replace(/\s+/g, ' ').trim();
 }
 
-async function fetchHtmlOnce(url, referer) {
+async function fetchHtmlOnce(url, referer, timeoutMs) {
   try {
     const r = await req.get(url, {
       headers: { 'User-Agent': UA, 'Referer': referer, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
-      timeout: 20000,
+      timeout: timeoutMs || 8000,
     });
     if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
   } catch (e) { return ''; }
 }
 
-// 列表/详情抓取：站方偶发网络层失败（VM 实测 http 000），单次失败不直接回空；
-// 按 host 轮询（.vip → .net），两轮之间停 600ms；全部失败才回空。
+// 并行竞速：取第一个通过 isValid 的结果；全部失败/空时回 fallback。
+// 不用 Promise.any（老 JS 引擎未必支持）；落败请求在后台跑到超时为止，不阻塞返回。
+function firstValid(promises, isValid, fallback) {
+  return new Promise((resolve) => {
+    let pending = promises.length;
+    let done = false;
+    if (!pending) { resolve(fallback); return; }
+    promises.forEach((p) => {
+      Promise.resolve(p).then((v) => {
+        if (done) return;
+        if (isValid(v)) { done = true; resolve(v); }
+        else if (--pending === 0) resolve(fallback);
+      }, () => {
+        if (done) return;
+        if (--pending === 0) resolve(fallback);
+      });
+    });
+  });
+}
+
+// 列表/详情抓取：站方偶发网络层失败（VM 实测 http 000）与 vip 挂起（VM 实测 13 次里 4 次 30s 死）；
+// 双 host 并行竞速（.vip 与 .net 同时发，先回有效数据者胜），单次超时 8s；两轮之间停 600ms；全部失败才回空。
 async function getHtml(path) {
   let url = String(path || '');
   if (url.startsWith('//')) url = 'https:' + url;
@@ -73,12 +96,12 @@ async function getHtml(path) {
     }
   }
   for (let round = 0; round < 2; round++) {
-    for (const u of cands) {
+    const d = await firstValid(cands.map((u) => {
       const m = u.match(/^(https?:\/\/[^/]+)/);
       const referer = (m ? m[1] : HOST) + '/';
-      const d = await fetchHtmlOnce(u, referer);
-      if (d) return d;
-    }
+      return fetchHtmlOnce(u, referer, 8000);
+    }), (x) => !!x, '');
+    if (d) return d;
     if (round === 0) await new Promise((r) => setTimeout(r, 600));
   }
   return '';
@@ -474,18 +497,25 @@ async function search(reqIn) {
   return { list: [] };
 }
 
+async function fetchStreamOnce(host, lang, uid) {
+  try {
+    const r = await reqRaw(host + '/asian/' + lang + '/api/video/stream?video_uid=' + encodeURIComponent(uid),
+      { 'User-Agent': UA, 'Referer': host + '/asian/' + lang + '/', 'Accept': 'application/json' }, 8000);
+    if (r.status !== 200 || !r.body) return [];
+    const j = JSON.parse(r.body);
+    if (!j || !Array.isArray(j.playlist)) return [];
+    const pl = j.playlist.filter((e) => e && e.url);
+    return pl.length ? pl : [];
+  } catch (e) { return []; }
+}
+
+// round2：双 host 并行竞速 + 2 轮（旧版顺序 vip → net 各 1 次；新版共 4 次尝试、单次 8s，最坏约 16.6s，原 20s）
 async function fetchStream(lang, uid) {
   if (!uid) return [];
-  for (const h of HOSTS) {
-    try {
-      const r = await reqRaw(h + '/asian/' + lang + '/api/video/stream?video_uid=' + encodeURIComponent(uid),
-        { 'User-Agent': UA, 'Referer': h + '/asian/' + lang + '/', 'Accept': 'application/json' }, 10000);
-      if (r.status !== 200 || !r.body) continue;
-      const j = JSON.parse(r.body);
-      if (!j || !Array.isArray(j.playlist)) continue;
-      const pl = j.playlist.filter((e) => e && e.url);
-      if (pl.length) return pl;
-    } catch (e) { /* 下一个 host */ }
+  for (let round = 0; round < 2; round++) {
+    const pl = await firstValid(HOSTS.map((h) => fetchStreamOnce(h, lang, uid)), (x) => x && x.length > 0, []);
+    if (pl.length) return pl;
+    if (round === 0) await new Promise((r) => setTimeout(r, 600));
   }
   return [];
 }
