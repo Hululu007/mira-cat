@@ -45,12 +45,30 @@ import req from '../../util/req.js';
 // 列表只留 current_show=public 的房（private/hidden/away 播不了）；地区按国家码
 // 映到 AS/NA/SA/ER/O（无国家码的房不进地区分类）；游戏/展示两类该 feed 无字段，
 // 已从分类里去掉（空分类不如没有）；搜索只匹配用户名 + 房间标题。
-// 详情/播放不动：仍走 ctx API（Worker 优先 + 直连兜底）取 hls_source + 本地裁档代理。
+// 详情不动：仍走 ctx API（Worker 优先 + 直连兜底）取 hls_source。播放见 batch9（2026-11-05）。
 // 注意：wm=ezKE2 是用户自己的 affiliate 跟踪码（用户 23:23 确认使用），会出现在公开仓库蜘蛛文件里。
+
+// batch9（2026-11-05，照 REX v2 默认线改播放）：用户实测 REX 在 LA 上 1080p 一点不卡、
+// 但 REX 换其他节点同样播不了——两点分开看：① 卡的问题有解：REX 默认线是 chaturbate-hls
+// Worker /m 直出（单条纯视频轨、无主清单、无音频轨、LL 降格成普通 HLS、分片由 Worker 抢存，
+// mmcdn 分片约 10s 即 410 过期）；而 mira-cat batch8 是 js2p 主清单 + LLHLS 变体 + 音频轨 +
+// mmcdn 直连分片，正是 REX v1.0.1 已证实的“出画即冻”形态。故 play 改走 /m，选单保留：
+// __h 指定哪档就把哪档变体地址交给 /m（/m 不挑档、传哪个出哪个），未选时最高档；
+// 变体挑不到时退回直返主列表（播放器自选，至少能播）。② 任意节点详情仍无解：REX 的详情
+// 同样走设备侧 ctx，换节点一样被拦，/m 只治播放卡、不治详情拦；详情仍只在 LA 这类能通
+// 的节点上成立，不要把 /m 说成“任意节点都能播”。/m 是纯视频轨、无音频轨（与 REX 默认线
+// 一致）；/proxy/master 路由与 filterMaster 保留未删（不再被 play 调用，万一 /m 真机
+// 不行可一行回滚）。播放流量走 Cloudflare Worker，不走 Railway，符合用户 03:32 划线。
+// batch9+av（2026-11-05，用户确认 REX /m 有画无声后补）：detail 多列“直播·音画”入口，
+// play(__av) 走 Worker /master 音画线（REX 线路2 同形：最高档视频 + 音频）；/m 线不动，
+// 两线同场对比、由真机判别音频因素（v1 的冻到底是 v3 tfdt 漂移还是音频轨本身）。
 const KEY = 'py_chaturbate';
 const NAME = 'Chaturbate';
 const HOST = 'https://chaturbate.com';
 const CTX_API = HOST + '/api/chatvideocontext/';
+// batch9 用：用户已部署的 chaturbate-hls Worker（Cloudflare，非 Railway，不动免费额度）。
+// REX v2 默认线即此 Worker 的 /m；REX 在 LA 上 1080p 实测不卡，mira-cat 改走同一条线。
+const CB_WORKER = 'https://chaturbate-hls.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
@@ -407,11 +425,16 @@ async function detail(reqIn) {
     remarks = '房间已下线或不存在';
   }
   // 清晰度选单：直播房从主列表里枚举真实档位（有几档列几档，不编假档位）；
-  // 枚举失败时退回单个“直播”入口（原行为：走代理裁到最高档）。
+  // 枚举失败时退回单个“直播”入口（play 走 /m 最高档）。
+  // batch9+av：主列表含音频轨时多列一个“直播·音画”入口（走 Worker /master 音画线，
+  // 与 REX 线路2 同形，供真机同场对比：若 /master 有声且不卡，说明 v1 的冻是 Worker
+  // v3 tfdt 漂移的锅、现已修好；若又冻了，则坐实音频轨本身拖播放器）。
   let playUrl = '直播$' + username;
   if (d && d.room_status === 'public' && t(d.hls_source)) {
-    const heights = masterHeights(await fetchPlaylist(t(d.hls_source)));
+    const masterText = await fetchPlaylist(t(d.hls_source));
+    const heights = masterHeights(masterText);
     if (heights.length) playUrl = heights.map(h => h + 'p$' + username + '__h' + h).join('#');
+    if (masterText.includes('TYPE=AUDIO')) playUrl += '#直播·音画$' + username + '__av';
   }
   const vod = {
     vod_id: username,
@@ -556,20 +579,132 @@ async function masterProxy(request, reply) {
   reply.send(filtered);
 }
 
+// 从主列表文本里按档位挑一条变体的绝对地址：无 targetH 时取最高档（高度优先，
+// 其次码率）；有 targetH 时取不高于它的最高档，全高于它时取最低档。挑不到返回 ''。
+// 与 filterMaster 的挑档口径一致（同一次解析口径，避免 detail 列出的档位 play 找不到）。
+function pickVariantUrl(raw, baseUrl, targetH) {
+  const lines = String(raw || '').split(/\r?\n/);
+  const variants = [];
+  let pendingInf = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXT-X-STREAM-INF:')) { pendingInf = line; continue; }
+    if (line.startsWith('#')) continue;
+    if (pendingInf) {
+      const res = /RESOLUTION=(\d+)x(\d+)/.exec(pendingInf);
+      const bw = /BANDWIDTH=(\d+)/.exec(pendingInf);
+      variants.push({
+        uri: line,
+        h: res ? parseInt(res[2], 10) : 0,
+        bw: bw ? parseInt(bw[1], 10) : 0,
+      });
+      pendingInf = null;
+    }
+  }
+  if (!variants.length) return '';
+  variants.sort((a, b) => (b.h - a.h) || (b.bw - a.bw));
+  let top = variants[0];
+  if (targetH) {
+    const cand = variants.filter(v => v.h <= targetH);
+    top = cand.length ? cand[0] : variants[variants.length - 1];
+  }
+  return absUrl(top.uri, baseUrl);
+}
+
+// 从主列表里挑最高档变体 + 它引用的音频组默认音频（与 REX parseMaster 同口径），
+// 返回 { vAbs, aAbs, inf }；无变体时返回 null，无音频时 aAbs 为 ''（调用方据此决定
+// 是否出音画线）。inf 为最高档变体的 STREAM-INF 属性，音频组统一改写为 AUDIO="aac"
+//（与 REX /master 一致）。
+function pickAvInfo(raw, baseUrl) {
+  const lines = String(raw || '').split(/\r?\n/);
+  const audios = [];
+  const variants = [];
+  let pendingInf = null;
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXT-X-MEDIA:') && /TYPE=AUDIO/.test(line)) {
+      const g = /GROUP-ID="([^"]+)"/.exec(line);
+      const mu = /URI="([^"]+)"/.exec(line);
+      if (g && mu) audios.push({ group: g[1], uri: mu[1], def: /DEFAULT=YES/.test(line) });
+      continue;
+    }
+    if (line.startsWith('#EXT-X-STREAM-INF:')) { pendingInf = line; continue; }
+    if (line.startsWith('#')) continue;
+    if (pendingInf) {
+      const res = /RESOLUTION=(\d+)x(\d+)/.exec(pendingInf);
+      const bw = /BANDWIDTH=(\d+)/.exec(pendingInf);
+      variants.push({
+        attrs: pendingInf.slice('#EXT-X-STREAM-INF:'.length),
+        uri: line,
+        h: res ? parseInt(res[2], 10) : 0,
+        bw: bw ? parseInt(bw[1], 10) : 0,
+      });
+      pendingInf = null;
+    }
+  }
+  if (!variants.length) return null;
+  variants.sort((a, b) => (b.h - a.h) || (b.bw - a.bw));
+  const top = variants[0];
+  let outAttrs = top.attrs;
+  let aAbs = '';
+  const ag = /AUDIO="([^"]+)"/.exec(outAttrs);
+  if (ag) {
+    let pick = null;
+    for (const au of audios) {
+      if (au.group !== ag[1]) continue;
+      if (au.def) { pick = au; break; }
+      if (!pick) pick = au;
+    }
+    if (pick) aAbs = absUrl(pick.uri, baseUrl);
+  }
+  if (aAbs) {
+    outAttrs = /AUDIO="[^"]*"/.test(outAttrs)
+      ? outAttrs.replace(/AUDIO="[^"]*"/, 'AUDIO="aac"')
+      : outAttrs + ',AUDIO="aac"';
+  } else {
+    outAttrs = outAttrs.replace(/,?AUDIO="[^"]*"/, '').replace(/^,/, '').replace(/,,+/g, ',');
+  }
+  return { vAbs: absUrl(top.uri, baseUrl), aAbs, inf: outAttrs };
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const rawId = cleanId(body.id);
   const vm = /^(.*)__h(\d+)$/.exec(rawId);
-  const username = vm ? vm[1] : rawId;
-  const targetH = vm ? parseInt(vm[2], 10) : 0;
+  let username = rawId, targetH = 0, avMode = false;
+  if (vm) { username = vm[1]; targetH = parseInt(vm[2], 10); }
+  else if (rawId.endsWith('__av')) { username = rawId.slice(0, -4); avMode = true; }
   if (!username) return { parse: 0, url: '' };
   const d = await getDossier(username);
   // 只有公开房才有游客流; hidden/private/away 等状态 hls_source 为空, 如实空返
   if (!d || d.room_status !== 'public' || !t(d.hls_source)) return { parse: 0, url: '' };
   const master = t(d.hls_source);
-  // 直返主列表会让播放器从低档起播; 改走本地代理裁档：选了档位时裁到该档，
-  // 未选时裁到最高档。代理地址构造失败时退回直返。
-  const url = proxyUrl(reqIn, '/proxy/master', master, targetH) || master;
+  // batch9：不再走本地 /proxy/master（js2p 主清单 + LLHLS 变体 + 音频轨 + mmcdn
+  // 直连分片 = REX v1.0.1 已证实的“出画即冻”形态）；改走 chaturbate-hls Worker /m
+  //（用户已部署、REX v2 默认线、LA 上 1080p 实测不卡）：Worker 回单条纯视频轨、
+  // 降格后的普通 HLS 媒体清单，分片由 Worker 抢存（mmcdn 分片约 10s 即 410 过期）。
+  // 选单保留：__h 指定哪档就把哪档变体地址交给 /m（/m 不挑档、传哪个出哪个）；
+  // 未选时走最高档。变体挑不到时退回直返主列表（播放器自选，至少能播）。
+  // batch9+av：__av 入口走 Worker /master 音画线（最高档视频 + 音频，REX 线路2 同形）；
+  // 音频挑不到时退回 /m 最高档（有画无声、至少能播，不转圈）。
+  let url = master;
+  const rawMaster = await fetchPlaylist(master);
+  if (avMode) {
+    const av = pickAvInfo(rawMaster, master);
+    if (av && av.aAbs) {
+      url = CB_WORKER + '/master?v=' + encodeURIComponent(av.vAbs)
+        + '&a=' + encodeURIComponent(av.aAbs)
+        + '&inf=' + encodeURIComponent(av.inf);
+    } else {
+      const variant = pickVariantUrl(rawMaster, master, 0);
+      if (variant) url = CB_WORKER + '/m?u=' + encodeURIComponent(variant);
+    }
+  } else {
+    const variant = pickVariantUrl(rawMaster, master, targetH);
+    if (variant) url = CB_WORKER + '/m?u=' + encodeURIComponent(variant);
+  }
   return {
     parse: 0,
     url,
@@ -604,4 +739,4 @@ export default function createSpider() {
 }
 
 // 仅供桩测用 (App 只用 default, 具名导出不影响打包)。
-export { parseDossier, filterMaster };
+export { parseDossier, filterMaster, pickVariantUrl, pickAvInfo };
