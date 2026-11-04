@@ -31,6 +31,9 @@ import req from '../../util/req.js';
 //       明文无加密、无需 Worker 代办。主列表 token 75s 后复拉仍 200 (实测), 代理内缓存 60s。
 // 抓取策略（2026-11-04 重构，见文件头“列表取数”一节）：列表/上下文只走 req 两腿——
 //       Worker 优先、直连兜底；App 内没有全局 fetch，fetch/jina 腿是死代码，已删。
+// 抓取策略（2026-11-04 round2 补丁，见 fetchJson）：Worker 腿补浏览器 UA + Referer
+//       （消除 axios 指纹变量）；响应体形状校验，200 但非列表/上下文结构时视为该腿
+//       失败、继续走下一腿（原先会静默回空且不再试直连）。超时维持 8s/8s 不变。
 // 搜索: 站方 roomlist 的 keywords 参数即站内搜索 (实测部分匹配用户名, total 上限 500), 直接复用。
 
 const KEY = 'py_chaturbate';
@@ -127,21 +130,43 @@ async function fetchText(url, timeout = TIMEOUT) {
   return '';
 }
 
+// 响应体形状校验（round2）：只有房间列表（含 rooms 数组）或房间上下文
+// （含 room_status/hls_source）才算有效回包。Worker/直连若回 200 但 body 是
+// 错误 JSON（如上游失败时的 {"error": ...}），原先会被当结果返回、列表静默
+// 为空且不再试下一腿；现在视为该腿失败。空 rooms 数组是合法回包（该分类
+// 确无在线房），不视为失败。
+function validJsonBody(d) {
+  if (!d || typeof d !== 'object') return false;
+  if (Array.isArray(d.rooms)) return true;
+  if ('room_status' in d || 'hls_source' in d) return true;
+  return false;
+}
+
 // 列表/上下文 JSON 取数：Worker 优先（8s），直连兜底（8s）；两腿均为 req。
+// round2：Worker 腿补浏览器 UA + Referer（原先只发 Accept，axios 默认带 axios/x
+//   UA；而站方边缘对浏览器/axios 指纹区别对待已在直连腿上证实；VM 实测浏览器 UA
+//   走 Worker 亦 200 + 真 JSON，无回归风险）；两腿均做形状校验，形状不对即换腿。
+//   超时不缩短：无 App 外层时限证据，缩短 Worker 超时会丢慢网下本可成功的回包。
 async function fetchJson(url) {
   try {
     const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
-      headers: { 'Accept': 'application/json' },
+      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
       timeout: TIMEOUT,
     });
-    if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
+    if (status === 200 && data) {
+      const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+      if (validJsonBody(parsed)) return parsed;
+    }
   } catch (e) { /* 换直连腿 */ }
   try {
     const { data, status } = await req.get(url, {
       headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
       timeout: TIMEOUT,
     });
-    if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
+    if (status === 200 && data) {
+      const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+      if (validJsonBody(parsed)) return parsed;
+    }
   } catch (e) { /* 两腿皆败 */ }
   return null;
 }
