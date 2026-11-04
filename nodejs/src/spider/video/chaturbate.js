@@ -55,7 +55,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
 const TIMEOUT = 8000;
-const CTX_TIMEOUT = 20000; // 2026-11-05: 手机到 Worker 再到 CB 的往返慢于 VM，详情腿 8s 易超时，提到 20s（与 affiliate 腿一致）；直连腿仍 8s（已知被墙，不必久等）。
+const CTX_TIMEOUT = 30000; // 2026-11-05 round2: 照搬 porncgw 能通的 30s（手机慢网下详情往返常超 20s）；直连腿与房间页腿同步用此值，列表路径仍用 TIMEOUT 不动。
 
 // 列表取数（2026-11-04 重构，根因见下）：
 //   第 1 腿：用户自有 list Worker（chaturbate.li768435813.workers.dev，只放行 /api/ 路径；
@@ -151,26 +151,30 @@ function validJsonBody(d) {
   return false;
 }
 
-// 列表/上下文 JSON 取数：Worker 优先（8s），直连兜底（8s）；两腿均为 req。
-// round2：Worker 腿补浏览器 UA + Referer（原先只发 Accept，axios 默认带 axios/x
-//   UA；而站方边缘对浏览器/axios 指纹区别对待已在直连腿上证实；VM 实测浏览器 UA
-//   走 Worker 亦 200 + 真 JSON，无回归风险）；两腿均做形状校验，形状不对即换腿。
-//   超时不缩短：无 App 外层时限证据，缩短 Worker 超时会丢慢网下本可成功的回包。
+// 2026-11-05 round2（照搬 porncgw 能通的韧性）：Worker 腿 3 次重试、单次超时 30s；
+//   直连腿单次、超时同步 30s（此前直连 8s 在手机慢网下易误杀）；房间页腿同步 30s。
+//   列表路径（affiliate 直连）不动。两腿均做形状校验，形状不对即换腿/重试。
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
 async function fetchJson(url) {
-  try {
-    const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
-      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
-      timeout: CTX_TIMEOUT,
-    });
-    if (status === 200 && data) {
-      const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-      if (validJsonBody(parsed)) return parsed;
-    }
-  } catch (e) { /* 换直连腿 */ }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
+        headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
+        timeout: CTX_TIMEOUT,
+      });
+      if (status === 200 && data) {
+        const parsed = typeof data === 'string' ? JSON.parse(data) : data;
+        if (validJsonBody(parsed)) return parsed;
+      }
+    } catch (e) { /* retry */ }
+    if (attempt < 2) await sleep(600);
+  }
   try {
     const { data, status } = await req.get(url, {
       headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
-      timeout: TIMEOUT,
+      timeout: CTX_TIMEOUT,
     });
     if (status === 200 && data) {
       const parsed = typeof data === 'string' ? JSON.parse(data) : data;
@@ -335,7 +339,7 @@ async function getDossier(username) {
       hls_source: t(j.hls_source),
     };
   }
-  const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, TIMEOUT);
+  const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, CTX_TIMEOUT);
   if (!html) return null;
   const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
   if (!m) return null;

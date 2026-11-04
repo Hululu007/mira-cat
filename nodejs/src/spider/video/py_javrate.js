@@ -26,6 +26,15 @@ function b64url(str) {
 }
 function viaWorker(url) { return RELAY + '/f/' + b64url(url); }
 
+// 2026-11-05 round2（照搬 porncgw 能通的取数韧性）：CF 挑战页特征识别 + sleep。
+function isChallengeHtml(html) {
+  if (!html) return false;
+  return /Just a moment|Attention Required|challenges\.cloudflare\.com|cf-ray|cf-challenge/i.test(html);
+}
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 function unescapeHtml(s) {
   return String(s || '')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -66,16 +75,26 @@ async function getHtml(path) {
   if (url.startsWith('//')) url = 'https:' + url;
   else if (url.startsWith('/')) url = HOST + url;
   const headers = { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
-  // Worker 优先（手机直连被拦时走 Worker）；Worker 腿失败时回落直连（VM 与未部署时行为不变）。
-  try {
-    const r = await req.get(viaWorker(url), { headers, timeout: 20000 });
-    if (r.status === 200 && typeof r.data === 'string' && r.data) return r.data;
-  } catch (e) { /* fall through to direct */ }
-  try {
-    const r = await req.get(url, { headers, timeout: 20000 });
-    if (r.status && r.status !== 200) return '';
-    return typeof r.data === 'string' ? r.data : '';
-  } catch (e) { return ''; }
+  // Worker 优先（手机直连被拦时走 Worker）；round2：单次超时提到 30s、Worker 腿 3 次重试、
+  //   回包强制 String 化、挑战页视为失败（此前单次 20s、无重试、严格 string 校验，
+  //   手机慢网下易超时丢包或把挑战页当成功回空；直连兜底保留，Worker 未部署时行为不变）。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await req.get(viaWorker(url), { headers, timeout: 30000 });
+      const body = (r && r.data != null) ? String(r.data) : '';
+      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
+    } catch (e) { /* retry */ }
+    if (attempt < 2) await sleep(600);
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await req.get(url, { headers, timeout: 30000 });
+      const body = (r && r.data != null) ? String(r.data) : '';
+      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
+    } catch (e) { /* retry */ }
+    if (attempt < 1) await sleep(600);
+  }
+  return '';
 }
 
 // 字幕芯取数原语（与 py_mogu 一致）：统一回 {status, body}
