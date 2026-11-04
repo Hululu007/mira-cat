@@ -22,6 +22,13 @@ const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (
 // 故 pic.*.cn 域固定走 51chigua，其余域沿用 bagua——两代理各擅长域不同，写死单一代理迟早再坏。
 const IMG_PROXY_51 = 'https://51chigua.li768435813.workers.dev/img?url=';
 const IMG_PROXY_BAGUA = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
+// 2026-11-04 换思路重修（用户报：分类/内容/封面都好，点开直接“视频加载失败”）：
+// VM 实测播单/分片/密钥全通、无需 Referer；旧代理在播放器侧有三处脆弱点，
+// 任一命中即直接失败：(1) 分片代理地址带 ?u=&r= 查询串；(2) 改写后的分片地址
+// 用 http://Host 硬拼，与播单的 js2p scheme 不一致；(3) 详情直链签名有过期窗口，
+// App 缓存旧详情时必死。改法：代理地址全部改走路径段（无查询串）、改写基址沿用
+// 播单自身的 js2p 基址、分集地址改为“详情页||序号”使 play() 现取新鲜播单、
+// 播单代理在上游失败时用详情页自愈重取。home/category/search 与封面逻辑未动。
 
 function proxyCover(url) {
   url = String(url || '').trim();
@@ -218,23 +225,21 @@ async function detail(reqIn) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST.replace(/\/$/, '') + (String(raw).startsWith('/') ? raw : '/' + raw);
     const html = await getText(url);
     const plist = [];
-    // 1) dplayer data-config
-    const dre = /class="dplayer"[^>]*data-config='([^']+)'/gi;
-    let m;
-    let c = 0;
-    while ((m = dre.exec(html)) !== null) {
-      c++;
-      try {
-        const cfg = JSON.parse(m[1]);
-        const vu = cfg?.video?.url || '';
-        if (vu) plist.push('视频' + c + '$' + vu);
-      } catch {}
-    }
+    // 1) dplayer data-config（2026-11-04 修：现行格式为 class 含 dplayer +
+    // 双引号 data-config 且内含 &quot; 转义，旧正则 class="dplayer" + 单引号已匹配不到；
+    // 改走 extractConfigs 全量解析，一页多 config 时全部列为分集，config 0 为主视频。
+    // 分集地址用“详情页||序号”，使 play() 在播放时现取详情拿新鲜播单，
+    // 不再复用详情时的旧签名，杀 App 缓存旧详情与签名过期两条分支。）
+    const cfgs = extractConfigs(html);
+    cfgs.forEach((vu, i) => {
+      plist.push('视频' + (i + 1) + '$' + url + '||' + i);
+    });
     // 2) 观看链接兜底（2026-11-03 修：排除 /tag/ 与 /category/ 列表页链接，
     // 之前这类链接文字含“视频”二字会被当成播单，导致播放去嗅探列表页而播不出）
     if (!plist.length) {
       const lre = /<a[^>]*href="([^"]+)"[^>]*>([^<]*(?:点击观看|观看|播放|视频|第一弹|第二弹|第三弹)[^<]*)<\/a>/gi;
       let i = 0;
+      let m;
       while ((m = lre.exec(html)) !== null) {
         i++;
         let href = m[1].trim();
@@ -268,18 +273,49 @@ async function detail(reqIn) {
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
-  const isVideo = /\.(m3u8|mp4|ts)/i.test(id);
-  // 2026-11-04 代理修：m3u8 播单与分片/密钥必带 auth_key，播放器丢签即 403，
-  // 改走蜘蛛本地 /proxy/m3u8，播放器不再直触带签第三方地址
-  if (isVideo && /\.m3u8(\?|#|$)/i.test(id)) {
-    const proxy = proxyUrl(reqIn, '/proxy/m3u8', id, HOST);
+  // %7C 容错：个别传输层会把 | 编码
+  if (/%7C/i.test(id)) id = id.replace(/%7C/gi, '|');
+  let playlistUrl = '';
+  let detailUrl = '';
+  let epIndex = 0;
+  if (id.includes('||')) {
+    // 新契约：分集地址 = 详情页地址||序号。播放时现取详情拿新鲜播单，
+    // 不再复用详情时的旧签名（杀 App 缓存旧详情与签名过期两条分支）；
+    // 现取失败则回落嗅探详情页。
+    const parts = id.split('||');
+    detailUrl = parts[0];
+    epIndex = parseInt(parts[1], 10);
+    if (!Number.isFinite(epIndex) || epIndex < 0) epIndex = 0;
+    const html = await getText(detailUrl);
+    const cfgs = extractConfigs(html);
+    if (cfgs.length) {
+      if (epIndex >= cfgs.length) epIndex = 0;
+      playlistUrl = cfgs[epIndex];
+    }
+    if (!playlistUrl) {
+      return { parse: 1, url: detailUrl, header: H() };
+    }
+  } else if (/\.m3u8(\?|#|$)/i.test(id)) {
+    // 旧数据兼容：直接就是播单地址（无详情页可供自愈）
+    playlistUrl = id;
+  } else if (id.indexOf('/archives/') >= 0) {
+    // 无序号的详情地址：现取详情取主视频
+    detailUrl = id;
+    const html = await getText(detailUrl);
+    const cfgs = extractConfigs(html);
+    if (cfgs.length) playlistUrl = cfgs[0];
+    if (!playlistUrl) return { parse: 1, url: detailUrl, header: H() };
+  } else {
+    // 旧行为：mp4 直出、其余嗅探
+    const isVideo = /\.(m3u8|mp4|ts)/i.test(id);
+    return { parse: isVideo ? 0 : 1, url: id, header: H() };
+  }
+  if (/\.m3u8(\?|#|$)/i.test(playlistUrl)) {
+    const proxy = proxyPlaylistUrl(playlistUrl, detailUrl, epIndex);
     if (proxy) return { parse: 0, url: proxy, header: H() };
   }
-  return {
-    parse: isVideo ? 0 : 1,
-    url: id,
-    header: H(),
-  };
+  const isVideo2 = /\.(m3u8|mp4|ts)/i.test(playlistUrl);
+  return { parse: isVideo2 ? 0 : 1, url: playlistUrl, header: H() };
 }
 
 async function search(reqIn) {
@@ -295,9 +331,9 @@ async function search(reqIn) {
   return { page, pagecount: 9999, limit: 90, total: list.length, list };
 }
 
-// ---------- 播单改写代理（2026-11-04：分片/密钥必带 auth_key，播放器丢签即 403；
-// 播单与分片/密钥一律走蜘蛛本地代理，播放器不再直触带签第三方地址。仿 ero 先例的
-// /proxy/m3u8 路由，但分片/密钥改为字节透传而非 302（302 回到带签地址等于没修））
+// ---------- 播单改写代理（2026-11-04 重修：播单/分片/密钥全部走蜘蛛本地代理，
+// 代理地址全部用路径段、无查询串，auth 藏在路径的 base64 段里；改写基址沿用
+// 播单自身的 js2p 基址，不再用 http://Host 硬拼。旧 ?u=&r= 格式仍兼容接收。）
 function b64url(s) {
   try {
     return Buffer.from(String(s), 'utf8').toString('base64')
@@ -307,14 +343,35 @@ function b64url(s) {
 function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
-// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 ero 先例）
-function proxyUrl(reqIn, path, targetUrl, referer) {
+// App 动态地址 scheme（同 ero 先例）：播单与分片一律用此基址，播放器侧 scheme 一致
+const PROXY_BASE = 'js2p://_WEB_/spider/' + KEY + '/3';
+// 播单代理地址：/proxy/<播单b64>/<详情页b64或->/<基址b64>/<分集序号>
+// （详情页段供播单上游失败时自愈重取；无详情页时用 - 占位）
+function proxyPlaylistUrl(playlistUrl, detailUrl, idx) {
   try {
-    const server = reqIn?.server;
-    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
-    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+    const d = detailUrl ? b64url(detailUrl) : '-';
+    return `${PROXY_BASE}/proxy/${b64url(playlistUrl)}/${d}/${b64url(PROXY_BASE)}/${idx || 0}`;
   } catch (e) { return ''; }
+}
+// 全量解析 dplayer data-config（现行双引号 + &quot; 转义；旧单引号兜底），
+// 返回播单地址数组（去重保序），config 0 为主视频
+function extractConfigs(html) {
+  const out = [];
+  const seen = new Set();
+  const clean = String(html || '');
+  const pushCfg = (text) => {
+    try {
+      const cfg = JSON.parse(text.replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+      const vu = cfg?.video?.url || '';
+      if (vu && !seen.has(vu)) { seen.add(vu); out.push(vu); }
+    } catch {}
+  };
+  let m;
+  const re2 = /data-config="([^"]+)"/gi;
+  while ((m = re2.exec(clean)) !== null) pushCfg(m[1]);
+  const re1 = /data-config='([^']+)'/gi;
+  while ((m = re1.exec(clean)) !== null) pushCfg(m[1]);
+  return out;
 }
 async function fetchText(url, referer) {
   try {
@@ -349,7 +406,7 @@ function contentTypeFor(url) {
   if (u.endsWith('.mp4')) return 'video/mp4';
   return 'application/octet-stream';
 }
-function rewriteProxy(raw, playlistUrl, selfBase, referer) {
+function rewriteProxy(raw, playlistUrl, selfBase) {
   const lines = String(raw).split(/\r?\n/);
   const out = lines.map((line) => {
     const s = line.trim();
@@ -359,7 +416,7 @@ function rewriteProxy(raw, playlistUrl, selfBase, referer) {
         return line.replace(/URI="([^"]+)"/g, (all, uri) => {
           try {
             const abs = new URL(uri, playlistUrl).toString();
-            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}"`;
+            return `URI="${selfBase}/proxy/${b64url(abs)}"`;
           } catch (e) { return all; }
         });
       }
@@ -367,35 +424,64 @@ function rewriteProxy(raw, playlistUrl, selfBase, referer) {
     }
     try {
       const abs = new URL(s, playlistUrl).toString();
-      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+      return `${selfBase}/proxy/${b64url(abs)}`;
     } catch (e) { return line; }
   });
   return out.join('\n');
 }
-// GET /proxy/m3u8?u={b64url 地址}&r={b64url referer}：m3u8 走改写，分片/密钥/初始化段走字节透传
+// 代理路由（新格式全部走路径段、无查询串；旧 ?u=&r= 格式仍兼容）：
+// 播单：/proxy/<播单b64>/<详情页b64或->/<基址b64>/<分集序号>
+// 分片/密钥：/proxy/<目标b64>（字节透传）
+// 播单上游失败且带详情页时，用详情页现取新鲜播单自愈一次；仍失败则 302 回落直连
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
+  const rawPath = (request?.params && request.params['*']) || '';
+  const segs = String(rawPath).split('/').filter(Boolean);
   let target = '';
-  let referer = HOST;
+  let detailUrl = '';
+  let base = '';
+  let idx = 0;
   try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
+    if (q.u) {
+      // 旧格式兼容：/proxy/m3u8?u=&r=
+      target = unb64url(q.u);
+    } else if (segs.length) {
+      target = unb64url(segs[0]);
+      if (segs.length >= 4) {
+        detailUrl = segs[1] === '-' ? '' : unb64url(segs[1]);
+        base = unb64url(segs[2]) || '';
+        idx = parseInt(segs[3], 10);
+        if (!Number.isFinite(idx) || idx < 0) idx = 0;
+      }
+    }
   } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  if (!target || !/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  if (!base) {
+    const host = request.headers && request.headers.host;
+    const proto = request.protocol || 'http';
+    base = host ? `${proto}://${host}/spider/${KEY}/3` : `/spider/${KEY}/3`;
+  }
   try {
     if (/\.m3u8(\?|#|$)/i.test(target)) {
-      const raw = await fetchText(target, referer);
+      let raw = await fetchText(target, HOST);
+      if ((!raw || !raw.includes('#EXTM3U')) && detailUrl && detailUrl.indexOf('/archives/') >= 0) {
+        // 自愈：播单签名过期时，用详情页现取新鲜播单
+        try {
+          const html = await getText(detailUrl);
+          const cfgs = extractConfigs(html);
+          const fresh = cfgs.length ? (cfgs[idx] || cfgs[0]) : '';
+          if (fresh && fresh !== target) {
+            target = fresh;
+            raw = await fetchText(target, HOST);
+          }
+        } catch (e) { /* 自愈失败则走 302 降级 */ }
+      }
       if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
-      const host = request.headers && request.headers.host;
-      const selfBase = host
-        ? `http://${host}/spider/${KEY}/3`
-        : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
       reply.header('Content-Type', 'application/vnd.apple.mpegurl');
       reply.header('Cache-Control', 'no-cache');
-      reply.send(rewriteProxy(raw, target, selfBase, referer));
+      reply.send(rewriteProxy(raw, target, base));
     } else {
-      const buf = await fetchBytes(target, referer);
+      const buf = await fetchBytes(target, HOST);
       if (!buf || !buf.length) { reply.redirect(target); return; }
       reply.header('Content-Type', contentTypeFor(target));
       reply.header('Cache-Control', 'no-cache');
@@ -415,6 +501,7 @@ export default function createSpider() {
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
+      fastify.get('/proxy/*', m3u8Proxy);
       fastify.get('/proxy/m3u8', m3u8Proxy);
       fastify.post('/search', search);
     },
