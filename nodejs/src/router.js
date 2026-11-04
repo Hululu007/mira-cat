@@ -79,6 +79,13 @@ import animesex from './spider/video/py_animesex.js';
 import mogu from './spider/video/py_mogu.js';
 import lissav from './spider/video/py_lissav.js';
 import siguaspw from './spider/video/py_siguaspw.js';
+import javportals from './spider/video/py_javportals.js';
+import javmit from './spider/video/py_javmit.js';
+import ipornbase from './spider/video/py_ipornbase.js';
+import jasex from './spider/video/py_jasex.js';
+import javhey from './spider/video/py_javhey.js';
+import jav24 from './spider/video/py_24jav.js';
+import hyjx0817 from './spider/video/py_0817hyjx.js';
 
 const spiders = [
     missav_xptv,
@@ -135,7 +142,7 @@ const spiders = [
     hornyjav,
     javct,
     topjav,
-    perverzija, one, tojav, javplayer, ero, javcc, javfeed, qimao, animesex, mogu, lissav, siguaspw,];
+    perverzija, one, tojav, javplayer, ero, javcc, javfeed, qimao, animesex, mogu, lissav, siguaspw, javportals, javmit, ipornbase, jasex, javhey, jav24, hyjx0817,];
 const spiderPrefix = '/spider'; // API 路由前缀
 
 /**
