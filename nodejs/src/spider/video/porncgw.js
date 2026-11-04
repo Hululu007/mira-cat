@@ -1,4 +1,6 @@
 // porn吃瓜网 (https://porncgw.com) -> CatPawOpen spider
+// 2026-11-04 修：(1) 最新更新 API 失败/回空时回落首页 SSR 卡片；(2) /list/ 首頁改走 /list 避 301；
+// (3) /video/ 的 SSR videoSrc 无 auth_key 会 403，改用 VideoObject contentUrl 签名地址；(4) 超时 15s->30s；(5) 只用框架 req。
 // 列表为 SSR 卡片 (article.card + a.card-link + img data-src);
 // 详情页 SSR JSON 内嵌已签名 videoSrc (yd-hls.hzjvlo.cn 的 m3u8, 分片/密钥均为带签名绝对地址), play 抓一次详情页直返;
 // 短剧 /drama/{id}/ 为简介+分集列表, 分集页 /drama/{id}/{n}/ 同样内嵌 videoSrc;
@@ -10,7 +12,7 @@ const NAME = 'porn吃瓜网';
 const HOST = 'https://porncgw.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
-const TIMEOUT = 15000;
+const TIMEOUT = 30000;
 
 // 站内导航 21 个分类 (路径已逐个复核); /archives/ 为图文文章不收。
 // 最新更新 = 首页: 站点根路径无服务端分页 (/2/、/page/2/、?page=2 均 404)，
@@ -59,6 +61,7 @@ function headers(referer) {
 }
 
 // 取页面: 框架 req 优先, fetch 兜底; 返回 { html, finalUrl } (搜索 301 跳 tag 页要读最终地址)
+// 只用框架 req（App 内无全局 fetch，fetch 兜底在设备上是死代码）
 async function fetchPage(url, referer) {
   try {
     const res = await req.get(url, { headers: headers(referer), timeout: TIMEOUT });
@@ -66,16 +69,6 @@ async function fetchPage(url, referer) {
     if (html) {
       const finalUrl = res?.request?.res?.responseUrl || url;
       return { html, finalUrl };
-    }
-  } catch (e) { /* 换 fetch 兜底 */ }
-  try {
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), TIMEOUT);
-    try {
-      const r = await fetch(url, { headers: headers(referer), signal: ctl.signal });
-      if (r.ok) return { html: await r.text(), finalUrl: r.url || url };
-    } finally {
-      clearTimeout(to);
     }
   } catch (e) { /* ignore */ }
   return { html: '', finalUrl: url };
@@ -163,8 +156,17 @@ function parsePager(html) {
 }
 
 async function buildList(url, page, singlePage) {
-  const { html } = await fetchPage(url);
-  const list = parseCards(html);
+  let { html } = await fetchPage(url);
+  let list = parseCards(html);
+  if (!list.length) {
+    // 空页时换斜杠形态重试一次（有的路径 301 归一化，个别请求层跟随跳转不可靠）
+    const alt = url.endsWith('/') ? url.slice(0, -1) : url + '/';
+    if (alt !== url) {
+      const r2 = await fetchPage(alt);
+      const list2 = parseCards(r2.html);
+      if (list2.length) { html = r2.html; list = list2; }
+    }
+  }
   if (singlePage) {
     return { page, pagecount: 1, limit: list.length || 20, total: list.length, list };
   }
@@ -183,19 +185,39 @@ function catOf(tid) {
 }
 
 function catUrl(cat, page) {
-  if (cat.type_id === 'latest' || page <= 1) return HOST + cat.path;
+  if (cat.type_id === 'latest') return HOST + cat.path;
+  if (page <= 1) {
+    // /list/ 会 301 到 /list：首页直接用无斜杠地址，避开一次跳转
+    if (cat.type_id === 'list') return HOST + '/list';
+    return HOST + cat.path;
+  }
   return HOST + cat.path + page + '/';
+}
+
+function unescapeJsonStr(s) {
+  return String(s)
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\\//g, '/')
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, '\\');
 }
 
 // 取详情页 SSR JSON 里的字符串字段 (处理 \uXXXX 等转义)
 function jsonStr(html, key) {
   const m = html.match(new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
   if (!m) return '';
-  return m[1]
-    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
-    .replace(/\\\//g, '/')
-    .replace(/\\"/g, '"')
-    .replace(/\\\\/g, '\\');
+  return unescapeJsonStr(m[1]);
+}
+
+// VideoObject 的 contentUrl（带签名播单）。注意：页内第一个 contentUrl 是 logo（ImageObject），
+// 必须从 VideoObject 位置起取，否则会拿到 logo 地址。
+function videoObjectContentUrl(html) {
+  const idx = html.indexOf('VideoObject');
+  if (idx < 0) return '';
+  const seg = html.slice(idx, idx + 3000);
+  const m = seg.match(/"contentUrl"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (!m) return '';
+  return unescapeJsonStr(m[1]);
 }
 
 function ogContent(html, prop) {
@@ -239,14 +261,6 @@ async function fetchApi(url) {
     if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return null; } }
     return d || null;
   } catch (e) { /* ignore */ }
-  try {
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), TIMEOUT);
-    try {
-      const r = await fetch(url, { headers: headers(HOST + '/'), signal: ctl.signal });
-      if (r.ok) return await r.json();
-    } finally { clearTimeout(to); }
-  } catch (e) { /* ignore */ }
   return null;
 }
 
@@ -267,9 +281,19 @@ async function buildApiLatest(page) {
       vod_remarks: t(it.episode_badge) || '',
     });
   }
-  const pagecount = parseInt(pg.pages, 10) || (list.length >= 20 ? page + 1 : page);
-  const total = parseInt(pg.total, 10) || list.length;
-  return { page, pagecount, limit: list.length || 20, total, list };
+  if (list.length) {
+    const pagecount = parseInt(pg.pages, 10) || (list.length >= 20 ? page + 1 : page);
+    const total = parseInt(pg.total, 10) || list.length;
+    return { page, pagecount, limit: list.length || 20, total, list };
+  }
+  // API 失败/回空时回落：首页 SSR 卡片就是同一批最新内容（仅第 1 页回落，
+  // pagecount=page 不再翻页，避免翻页重复拉首页）
+  if (page <= 1) {
+    const { html } = await fetchPage(HOST + '/');
+    const fb = parseCards(html);
+    return { page, pagecount: page, limit: fb.length || 20, total: fb.length, list: fb };
+  }
+  return { page, pagecount: page, limit: 20, total: 0, list: [] };
 }
 
 async function category(reqIn) {
@@ -341,12 +365,17 @@ async function play(reqIn) {
   const pageUrl = HOST + path;
   const html = await getHtml(pageUrl, HOST + '/');
   // 2026-11-03 修：cshort 路 videoSrc 源站 502 已死，同页 videoSrcHevc 可用时改用后者；
-  // 其他路保持原有 videoSrc 优先，videoSrc 为空时仍回落 Hevc
+  // 2026-11-04 修：/video/ 的 SSR videoSrc 无 auth_key，实测 403 0 字节；VideoObject 的
+  // contentUrl 是同一条带签名的播单，优先用它（否则播单代理 302 回落到死链即加载失败）
   const src0 = jsonStr(html, 'videoSrc');
   const hevc = jsonStr(html, 'videoSrcHevc');
-  let src = src0;
-  if (src0 && /\/cshort\//i.test(src0) && hevc) src = hevc;
-  if (!src) src = hevc;
+  const signed = videoObjectContentUrl(html);
+  let src = '';
+  if (src0 && /\/cshort\//i.test(src0)) src = hevc;
+  else if (src0 && /auth_key=/i.test(src0)) src = src0;
+  else if (signed && /\.m3u8/i.test(signed) && /auth_key=/i.test(signed)) src = signed;
+  else if (hevc && /auth_key=/i.test(hevc)) src = hevc;
+  else src = src0 || hevc;
   if (src && /^https?:\/\//i.test(src)) {
     if (/\.m3u8(\?|#|$)/i.test(src)) {
       const proxy = proxyUrl(reqIn, '/proxy/m3u8', src, pageUrl);

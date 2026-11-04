@@ -3,10 +3,13 @@ import req from '../../util/req.js';
 // LissAV https://lissav.vip —— MissAV 系 JAV 站，只做 asian 区（语言入口即用户点的 JP/CN 两项：ja / zh-CN）
 // domestic 区走 /video/vid/ 另一套，播放未验，本蜘蛛不做
 // 列表：固定榜单 + 两个 tag + 题材（100 个 genre 作筛选卡片）；翻页走 /page/N（站方忽略 ?page=）
+// 2026-11-04 修：站方网络不稳定（VM 实测偶发 http 000 空回），getHtml 改为多 host 轮询 + 重试：lissav.vip → lissav.net（实测首页可出 48 条）；lissav.cc/.pro 只是 301 跳回 .vip，不作 fallback
+// 2026-11-04 增：顶级分类新增 巨乳/大屁股/好屁股/美乳/巨乳偏好/屁股偏好（均为 /videos/genre/ 路径，VM 实测各 12 条，翻页 /page/N 同规律）
 // 详情：/asian/{lang}/video/cid/<番号>；播放走站方自家播放器接口 /asian/{lang}/api/video/stream?video_uid=<uid>
 // 播单：接口 playlist 两条（高清主源 + 480p），分集列出供手动选；480p 线 VM 实测 200 可播，主源 VM 侧 403（设备侧可能不同）
 // 字幕：条目自带番号（cid 即番号），按条目接聚合芯（迅雷 > 迅雷看看 > SubtitleCat）
 const HOST = 'https://lissav.vip';
+const HOSTS = ['https://lissav.vip', 'https://lissav.net'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const LANGS = [{ n: '中文', v: 'zh-CN' }, { n: '日文', v: 'ja' }, { n: '英文', v: 'en' }, { n: '繁中', v: 'zh-HK' }];
 const FIXED = [
@@ -17,6 +20,12 @@ const FIXED = [
   { id: 'hot_month', name: '本月热门', path: '/videos/hot/month' },
   { id: 'tag_cn', name: '中文字幕', path: '/videos/tag/%E4%B8%AD%E6%96%87%E5%AD%97%E5%B9%95' },
   { id: 'tag_leak', name: '无码流出', path: '/videos/tag/%E6%97%A0%E7%A0%81%E6%B5%81%E5%87%BA' },
+  { id: 'genre_juru', name: '巨乳', path: '/videos/genre/%E5%B7%A8%E4%B9%B3' },
+  { id: 'genre_dpg', name: '大屁股', path: '/videos/genre/%E5%A4%A7%E5%B1%81%E8%82%A1' },
+  { id: 'genre_hpg', name: '好屁股', path: '/videos/genre/%E5%A5%BD%E5%B1%81%E8%82%A1' },
+  { id: 'genre_meiru', name: '美乳', path: '/videos/genre/%E7%BE%8E%E4%B9%B3' },
+  { id: 'genre_juru_pref', name: '巨乳偏好', path: '/videos/genre/%E5%B7%A8%E4%B9%B3%E5%81%8F%E5%A5%BD' },
+  { id: 'genre_pg_pref', name: '屁股偏好', path: '/videos/genre/%E5%B1%81%E8%82%A1%E5%81%8F%E5%A5%BD' },
 ];
 const GENRES = [{"v": "%E9%AB%98%E6%B8%85", "n": "高清"}, {"v": "%E5%8D%95%E4%BD%93%E4%BD%9C%E5%93%81", "n": "单体作品"}, {"v": "%E7%8B%AC%E5%AE%B6", "n": "独家"}, {"v": "%E4%B8%AD%E5%87%BA", "n": "中出"}, {"v": "%E5%B7%A8%E4%B9%B3", "n": "巨乳"}, {"v": "%E4%BA%BA%E5%A6%BB", "n": "人妻"}, {"v": "%E6%97%A0%E7%A0%81%E6%B5%81%E5%87%BA", "n": "无码流出"}, {"v": "%E7%B4%A0%E4%BA%BA", "n": "素人"}, {"v": "%E7%86%9F%E5%A5%B3", "n": "熟女"}, {"v": "%E7%BE%8E%E5%B0%91%E5%A5%B3", "n": "美少女"}, {"v": "%E5%8F%A3%E4%BA%A4", "n": "口交"}, {"v": "%E8%96%84%E6%A0%BC", "n": "薄格"}, {"v": "%E8%87%AA%E6%8B%8D", "n": "自拍"}, {"v": "%E7%97%B4%E5%A5%B3", "n": "痴女"}, {"v": "%E5%A4%9A%E4%BA%BA%E8%BF%90%E5%8A%A8", "n": "多人运动"}, {"v": "%E9%AA%91%E4%B9%98", "n": "骑乘"}, {"v": "%E8%8B%97%E6%9D%A1", "n": "苗条"}, {"v": "%E6%BD%AE%E5%90%B9", "n": "潮吹"}, {"v": "4K", "n": "4K"}, {"v": "NTR", "n": "NTR"}, {"v": "%E7%BE%8E%E4%B9%B3", "n": "美乳"}, {"v": "%E4%B9%B3%E4%BA%A4", "n": "乳交"}, {"v": "%E4%B8%AD%E6%96%87%E5%AD%97%E5%B9%95", "n": "中文字幕"}, {"v": "%E5%A5%B3%E9%AB%98%E4%B8%AD%E7%94%9F", "n": "女高中生"}, {"v": "4%E5%B0%8F%E6%97%B6%E4%BB%A5%E4%B8%8A", "n": "4小时以上"}, {"v": "%E9%A2%9C%E5%B0%84", "n": "颜射"}, {"v": "%E6%B7%AB%E4%B9%B1", "n": "淫乱"}, {"v": "%E4%BC%81%E5%88%92", "n": "企划"}, {"v": "%E4%B8%9A%E9%A6%80", "n": "业馀"}, {"v": "%E5%89%A7%E6%83%85", "n": "剧情"}, {"v": "%E6%89%8B%E6%B7%AB", "n": "手淫"}, {"v": "%E9%A5%BC", "n": "饼"}, {"v": "%E4%B9%B1%E4%BC%A6", "n": "乱伦"}, {"v": "%E6%90%AD%E8%AE%AA", "n": "搭讪"}, {"v": "%E5%A6%84%E6%83%B3", "n": "妄想"}, {"v": "%E5%90%88%E9%9B%86", "n": "合集"}, {"v": "%E6%81%8B%E7%89%A9%E7%99%96", "n": "恋物癖"}, {"v": "%E5%A7%90%E5%A7%90", "n": "姐姐"}, {"v": "%E7%BA%AA%E5%BD%95%E7%89%87", "n": "纪录片"}, {"v": "%E4%BB%85%E9%80%81%E8%B4%A7", "n": "仅送货"}, {"v": "%E5%81%B7%E6%8B%8D", "n": "偷拍"}, {"v": "%E8%88%94%E9%98%B4", "n": "舔阴"}, {"v": "%E5%88%B6%E6%9C%8D", "n": "制服"}, {"v": "%E7%BE%9E%E8%BE%B1", "n": "羞辱"}, {"v": "%E8%A7%92%E8%89%B2%E6%89%AE%E6%BC%94", "n": "角色扮演"}, {"v": "%E5%89%83%E6%AF%9B", "n": "剃毛"}, {"v": "OL", "n": "OL"}, {"v": "%E4%B8%8D%E4%BC%A6", "n": "不伦"}, {"v": "%E5%A5%B3%E5%A4%A7%E5%AD%A6%E7%94%9F", "n": "女大学生"}, {"v": "%E8%87%AA%E6%85%B0", "n": "自慰"}, {"v": "%E8%BE%A3%E5%A6%B9", "n": "辣妹"}, {"v": "%E5%A4%A7%E5%B1%81%E8%82%A1", "n": "大屁股"}, {"v": "%E5%B0%8F%E5%8F%AA%E9%A9%AC", "n": "小只马"}, {"v": "%E6%8C%89%E6%91%A9%E6%A3%92", "n": "按摩棒"}, {"v": "%E6%8B%98%E6%9D%9F", "n": "拘束"}, {"v": "%E5%85%A8%E9%AB%98%E6%B8%85%20%28FHD%29", "n": "全高清 (FHD)"}, {"v": "%E7%BE%9E%E8%80%BB", "n": "羞耻"}, {"v": "%E5%A5%BD%E5%B1%81%E8%82%A1", "n": "好屁股"}, {"v": "%E5%87%BA%E9%81%93%E4%BD%9C", "n": "出道作"}, {"v": "%E7%BE%8E%E4%B8%BD%E7%9A%84%E8%83%B8%E9%83%A8", "n": "美丽的胸部"}, {"v": "S1%20NO.1%20STYLE", "n": "S1 NO.1 STYLE"}, {"v": "Madonna", "n": "Madonna"}, {"v": "%E6%8E%A5%E5%90%BB", "n": "接吻"}, {"v": "%E5%BC%BA%E5%88%B6%E5%8F%A3%E4%BA%A4", "n": "强制口交"}, {"v": "%E5%B1%81%E8%82%A1%E5%81%8F%E5%A5%BD", "n": "屁股偏好"}, {"v": "%E7%8E%A9%E5%85%B7", "n": "玩具"}, {"v": "%E4%B9%B1%E4%BA%A4", "n": "乱交"}, {"v": "%E5%A5%B3%E5%90%8C%E6%80%A7%E6%81%8B", "n": "女同性恋"}, {"v": "%E6%9C%AA%E7%BB%8F%E5%AE%A1%E6%9F%A5", "n": "未经审查"}, {"v": "%E6%B7%AB%E8%AF%AD", "n": "淫语"}, {"v": "%E5%A5%87%E9%97%BB%E8%B6%A3%E4%BA%8B", "n": "奇闻趣事"}, {"v": "%E8%82%9B%E9%97%A8", "n": "肛门"}, {"v": "%E9%A3%8E%E4%BF%97%E5%A8%98", "n": "风俗娘"}, {"v": "%E6%B3%B3%E8%A3%85", "n": "泳装"}, {"v": "----", "n": "----"}, {"v": "%E5%B7%B2%E5%A9%9A%E5%A5%B3%E4%BA%BA", "n": "已婚女人"}, {"v": "%E4%B8%BB%E8%A7%82%E8%A7%86%E8%A7%92", "n": "主观视角"}, {"v": "69", "n": "69"}, {"v": "%E4%B8%9D%E8%A2%9C", "n": "丝袜"}, {"v": "%E6%8D%86%E7%BB%91", "n": "捆绑"}, {"v": "%E5%90%B9", "n": "吹"}, {"v": "%E6%8C%89%E6%91%A9", "n": "按摩"}, {"v": "%E6%8C%89%E6%91%A9%E6%B2%B9", "n": "按摩油"}, {"v": "%E6%8C%87%E6%8F%92", "n": "指插"}, {"v": "%E5%90%84%E7%A7%8D%E8%81%8C%E4%B8%9A", "n": "各种职业"}, {"v": "%E6%A0%A1%E6%9C%8D", "n": "校服"}, {"v": "%E5%8E%9F%E6%9D%A5%E7%9A%84", "n": "原来的"}, {"v": "%E8%B4%AB%E4%B9%B3", "n": "贫乳"}, {"v": "%E8%B6%85%E8%96%84%E6%A0%BC", "n": "超薄格"}, {"v": "%E6%AF%8D%E4%BA%B2", "n": "母亲"}, {"v": "%E6%9E%81%E9%99%90%E9%AB%98%E6%BD%AE", "n": "极限高潮"}, {"v": "%E5%A7%90%E5%A6%B9", "n": "姐妹"}, {"v": "%E5%A5%B3%E6%95%99%E5%B8%88", "n": "女教师"}, {"v": "%E5%90%9E%E7%B2%BE", "n": "吞精"}, {"v": "%E5%B7%A8%E4%B9%B3%E5%81%8F%E5%A5%BD", "n": "巨乳偏好"}, {"v": "HHH%E3%82%B0%E3%83%AB%E3%83%BC%E3%83%97", "n": "HHHグループ"}, {"v": "%E5%B9%B4%E7%B3%95", "n": "年糕"}, {"v": "SM", "n": "SM"}, {"v": "%E3%83%86%E3%82%A3%E3%83%83%E3%82%B7%E3%83%A5", "n": "ティッシュ"}, {"v": "%E9%87%8E%E5%A4%96%E9%9C%B2%E5%87%BA", "n": "野外露出"}];
 
@@ -38,18 +47,41 @@ function clean(s) {
     .replace(/\s+/g, ' ').trim();
 }
 
-async function getHtml(path) {
-  let url = String(path || '');
-  if (url.startsWith('//')) url = 'https:' + url;
-  else if (url.startsWith('/')) url = HOST + url;
+async function fetchHtmlOnce(url, referer) {
   try {
     const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
+      headers: { 'User-Agent': UA, 'Referer': referer, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
       timeout: 20000,
     });
     if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
   } catch (e) { return ''; }
+}
+
+// 列表/详情抓取：站方偶发网络层失败（VM 实测 http 000），单次失败不直接回空；
+// 按 host 轮询（.vip → .net），两轮之间停 600ms；全部失败才回空。
+async function getHtml(path) {
+  let url = String(path || '');
+  if (url.startsWith('//')) url = 'https:' + url;
+  else if (url.startsWith('/')) url = HOST + url;
+  let cands = [url];
+  for (const h of HOSTS) {
+    if (url.startsWith(h + '/')) {
+      const rest = url.slice(h.length);
+      cands = HOSTS.map((hh) => hh + rest);
+      break;
+    }
+  }
+  for (let round = 0; round < 2; round++) {
+    for (const u of cands) {
+      const m = u.match(/^(https?:\/\/[^/]+)/);
+      const referer = (m ? m[1] : HOST) + '/';
+      const d = await fetchHtmlOnce(u, referer);
+      if (d) return d;
+    }
+    if (round === 0) await new Promise((r) => setTimeout(r, 600));
+  }
+  return '';
 }
 
 // 字幕芯取数原语（与 py_mogu 一致）：统一回 {status, body}
@@ -444,14 +476,18 @@ async function search(reqIn) {
 
 async function fetchStream(lang, uid) {
   if (!uid) return [];
-  try {
-    const r = await reqRaw(HOST + '/asian/' + lang + '/api/video/stream?video_uid=' + encodeURIComponent(uid),
-      { 'User-Agent': UA, 'Referer': HOST + '/asian/' + lang + '/', 'Accept': 'application/json' }, 10000);
-    if (r.status !== 200 || !r.body) return [];
-    const j = JSON.parse(r.body);
-    if (!j || !Array.isArray(j.playlist)) return [];
-    return j.playlist.filter((e) => e && e.url);
-  } catch (e) { return []; }
+  for (const h of HOSTS) {
+    try {
+      const r = await reqRaw(h + '/asian/' + lang + '/api/video/stream?video_uid=' + encodeURIComponent(uid),
+        { 'User-Agent': UA, 'Referer': h + '/asian/' + lang + '/', 'Accept': 'application/json' }, 10000);
+      if (r.status !== 200 || !r.body) continue;
+      const j = JSON.parse(r.body);
+      if (!j || !Array.isArray(j.playlist)) continue;
+      const pl = j.playlist.filter((e) => e && e.url);
+      if (pl.length) return pl;
+    } catch (e) { /* 下一个 host */ }
+  }
+  return [];
 }
 
 async function detail(reqIn) {

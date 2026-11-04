@@ -2,6 +2,7 @@ import req from '../../util/req.js';
 
 // 丝瓜视频 https://siguaspw.cc —— 与桃花视频同 CMS（/video/<19位数字>/ + data-url 播单 + cdn_lines）
 // 分类：首页实测 228 个 /category/cateNN/（创作者/题材/厂牌/更多四组作分区 + 筛选卡片，分区按分类名语义归纳，cate ID 与名均取自首页）
+// 2026-11-04 新增 8 个顶级分类（题材标签区已证实 cate，名与 ID 均取自首页实测；现有 5 类与 filters 结构不动）
 // 列表翻页：/category/<cate>/<页码>/；详情 data-url 拼 cdn_lines 首选 cloudfront 线（d1uy7itup9paqh，VM 实测 200）
 // 播放：单码率媒体播单（AES-128），不设假多档；字幕按条目接（仅标题含番号的条目才接芯，多数中文标题无番号则不接）
 const HOST = 'https://siguaspw.cc';
@@ -461,6 +462,21 @@ const ZONE_META = [
 async function home() {
   const classes = [{ type_id: 'home', type_name: '首页推荐' }];
   for (const z of ZONE_META) classes.push({ type_id: z.id, type_name: z.name });
+  // 2026-11-04 新增顶级分类：题材标签区已证实的 8 个 cate（名与 ID 均取自首页实测 ZONES.tag）。
+  // 注意：用户点名的 无码流出 / 巨乳 / 大屁股 在数据里无完全对应名字，本轮未加（见报告），
+  // 也不用同义词顶替；下面 8 个是已证实的题材标签，与原有 5 类、filters 互不干扰。
+  // category() 的兜底分支（非 home、非 zone id 时直接以 type_id 作 cate）已覆盖这些类，无需改 category()。
+  const EXTRA_CLASSES = [
+    { type_id: 'cate151', type_name: '探花' },
+    { type_id: 'cate153', type_name: '出轨偷情' },
+    { type_id: 'cate158', type_name: '女女同性' },
+    { type_id: 'cate160', type_name: 'SM调教' },
+    { type_id: 'cate163', type_name: '户外露出' },
+    { type_id: 'cate166', type_name: '制服诱惑' },
+    { type_id: 'cate167', type_name: '校园女神' },
+    { type_id: 'cate168', type_name: '按摩会所' },
+  ];
+  for (const c of EXTRA_CLASSES) classes.push(c);
   const filters = {};
   for (const z of ZONE_META) {
     const list = ZONES[z.key] || [];

@@ -29,8 +29,8 @@ import req from '../../util/req.js';
 //       守卫不变: room_status 必须 'public' 且 hls_source 非空才返 (hidden 房 hls_source 为空)。
 //       流是 LL-HLS + fMP4 (EXT-X-PART 低延迟分片), 媒体列表/分片仍由播放器直连 mmcdn,
 //       明文无加密、无需 Worker 代办。主列表 token 75s 后复拉仍 200 (实测), 代理内缓存 60s。
-// 抓取兜底: req → fetch → r.jina.ai 中转 三层 (列表/上下文是 JSON 接口、播放才抓 HTML 兜底,
-//       年龄/地区门若只拦 HTML 也不影响列表; VM 出口实测全程无年龄门/地区门 200 直达)。
+// 抓取策略（2026-11-04 重构，见文件头“列表取数”一节）：列表/上下文只走 req 两腿——
+//       Worker 优先、直连兜底；App 内没有全局 fetch，fetch/jina 腿是死代码，已删。
 // 搜索: 站方 roomlist 的 keywords 参数即站内搜索 (实测部分匹配用户名, total 上限 500), 直接复用。
 
 const KEY = 'py_chaturbate';
@@ -41,11 +41,20 @@ const CTX_API = HOST + '/api/chatvideocontext/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
-const TIMEOUT = 12000;
+const TIMEOUT = 8000;
 
-// 2026-11-01 Worker 腿：手机浏览器能出 room-list JSON（坐实是 App 侧 req 被拦，不是设备网络问题），
-// 且 fetch/jina 腿在 App 内不存在；直连失败时走用户自有 Worker 代取（只放行 /api/ 路径）。
-// 部署后把真实域名替换掉下面占位符再推；占位符推上去是跑不通的，特意如此。
+// 列表取数（2026-11-04 重构，根因见下）：
+//   第 1 腿：用户自有 list Worker（chaturbate.li768435813.workers.dev，只放行 /api/ 路径；
+//     2026-11-04 VM 实测 room-list 与 chatvideocontext 均 200 + 真 JSON，Safari UA 亦通；
+//     该域名已是已部署生效的真地址，不要再当占位符替换）。
+//   第 2 腿：req 直连 chaturbate.com（仅作 Worker 挂掉时的兜底）。
+//   为什么 Worker 必须放第一腿：站方对 App 内裸 axios（无 Cookie、无浏览器指纹）做 bot 检查，
+//     手机 Safari 能出真 JSON、App 内 req 过不了；旧版直连放第一腿且超时 12s，直连一旦 hang 住，
+//     App 的单次调用时限内根本走不到 Worker 腿，列表恒空。Worker 优先则健康时 1~2s 即回。
+//   为什么删 fetch/jina 腿：App 内没有全局 fetch，这两腿在 App 内是死代码；且它们会让 VM 测试
+//     走 jina 通过、掩盖 App 真实失败（旧版“VM 通过、App 空”就是这么来的）。
+//   两腿均为 req，超时各 8s，总预算 16s。模式参照同仓 py_javplayer（site-fetch Worker 优先，
+//     再 jina、再直连；本源因 App 无 fetch，jina 腿不适用，故只有两腿）。
 const LIST_WORKER = 'https://chaturbate.li768435813.workers.dev/?u=';
 
 // 分类: type_id 编码 —— all | g:{gender} | r:{region} | gr:{gender}:{region} |
@@ -104,6 +113,9 @@ const CATS = [
 
 function t(v) { return String(v == null ? '' : v).trim(); }
 
+// 纯文本取数（仅 req；App 内无 fetch，fetch/jina 分支已删）。
+// 仅用于详情的房间页 HTML 兜底（主通道是 ctx API）；房间页不在 Worker 放行范围
+// （非 /api/ 路径回 400），故不走 Worker。
 async function fetchText(url, timeout = TIMEOUT) {
   try {
     const { data, status } = await req.get(url, {
@@ -111,38 +123,26 @@ async function fetchText(url, timeout = TIMEOUT) {
       timeout,
     });
     if (status === 200 && data != null) return typeof data === 'string' ? data : JSON.stringify(data);
-  } catch (e) { /* 换通道2 */ }
-  try {
-    const ctl = new AbortController();
-    const tm = setTimeout(() => ctl.abort(), timeout);
-    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': REFERER }, signal: ctl.signal });
-    clearTimeout(tm);
-    if (r.ok) return await r.text();
-  } catch (e) { /* 换通道3 */ }
-  try {
-    const ctl = new AbortController();
-    const tm = setTimeout(() => ctl.abort(), timeout);
-    const r = await fetch('https://r.jina.ai/' + url, { signal: ctl.signal });
-    clearTimeout(tm);
-    if (r.ok) return await r.text();
   } catch (e) { /* ignore */ }
   return '';
 }
 
+// 列表/上下文 JSON 取数：Worker 优先（8s），直连兜底（8s）；两腿均为 req。
 async function fetchJson(url) {
+  try {
+    const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
+      headers: { 'Accept': 'application/json' },
+      timeout: TIMEOUT,
+    });
+    if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
+  } catch (e) { /* 换直连腿 */ }
   try {
     const { data, status } = await req.get(url, {
       headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
       timeout: TIMEOUT,
     });
     if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
-  } catch (e) { /* 换 Worker 腿 */ }
-  try {
-    const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), { timeout: TIMEOUT });
-    if (status === 200 && data) return typeof data === 'string' ? JSON.parse(data) : data;
-  } catch (e) { /* 换通道3 */ }
-  const raw = await fetchText(url);
-  if (raw) { try { return JSON.parse(raw); } catch (e) { /* ignore */ } }
+  } catch (e) { /* 两腿皆败 */ }
   return null;
 }
 
@@ -227,7 +227,7 @@ async function getDossier(username) {
       hls_source: t(j.hls_source),
     };
   }
-  const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, 15000);
+  const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, TIMEOUT);
   if (!html) return null;
   const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
   if (!m) return null;
@@ -350,21 +350,14 @@ function filterMaster(raw, baseUrl) {
   return out.join('\n') + '\n';
 }
 
-// 主列表拉取 (req → fetch 两层即可, mmcdn 无年龄门; 不走 jina 以免改写文本)
-async function fetchPlaylist(url, timeout = 8000) {
+// 主列表拉取（仅 req；mmcdn 无年龄门；不走 jina 以免改写文本）
+async function fetchPlaylist(url, timeout = TIMEOUT) {
   try {
     const { data, status } = await req.get(url, {
       headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': REFERER },
       timeout,
     });
     if (status === 200 && data != null) return typeof data === 'string' ? data : JSON.stringify(data);
-  } catch (e) { /* 换通道2 */ }
-  try {
-    const ctl = new AbortController();
-    const tm = setTimeout(() => ctl.abort(), timeout);
-    const r = await fetch(url, { headers: { 'User-Agent': UA, 'Accept': '*/*', 'Referer': REFERER }, signal: ctl.signal });
-    clearTimeout(tm);
-    if (r.ok) return await r.text();
   } catch (e) { /* ignore */ }
   return '';
 }
