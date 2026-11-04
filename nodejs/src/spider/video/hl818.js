@@ -8,6 +8,8 @@ const HOST = 'https://818hlw1.com/';
 // 2026-11-01 中转腿：App 内 req 到 818hlw1.com 被拦（首页拿不到、回落 4 写死分类），
 // 直取为空时走 javsb-relay 的 /hl 代取（白名单仅 818hlw1.com，只转文字页）。
 const RELAY_HL = 'https://javsb-relay-production.up.railway.app/hl?url=';
+// round3：m3u8 走独立 CF Worker 中转（用户已部署，见文件头 round3 说明）。
+const RELAY = 'https://818hlw.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 // 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
 // 2026-10-28 四轮：cell 域每次 301 到随机 jvtshrap.cc 子域，设备端加载不出内容；
@@ -37,6 +39,10 @@ const IMG_PROXY_BAGUA = 'https://bagua-img-proxy.li768435813.workers.dev/img?url
 // 改法：m3u8 一律直出（parse:0 + 直链），与 mp4 走同一条设备已证实的路径；
 // 代理路由与函数保留，已缓存的 fix6 版 js2p 播放地址仍可解析。
 // 直出若仍播不了，则只剩设备网络到 hls.ohjzmm.cn/分片域被拦一种可能，下一步走中转。
+// 2026-11-04 round3：直出在设备上同样全灭（mp4 能播、m3u8 全灭与代理无关），
+// 故改走独立 CF Worker 中转：播单/分片/密钥全部经 relay 取数并改写为 relay 自身
+// 的无查询串地址，播放器绝不直接碰源站 m3u8 域；Worker 文件见 hl818-round3/worker.js，
+// 由用户手动粘贴部署（助理无权直接改其 CF 账号）。蜘蛛侧只改 play() 的 m3u8 返回。
 
 function proxyCover(url) {
   url = String(url || '').trim();
@@ -318,10 +324,13 @@ async function play(reqIn) {
     const isVideo = /\.(m3u8|mp4|ts)/i.test(id);
     return { parse: isVideo ? 0 : 1, url: id, header: H() };
   }
-  // round2：m3u8 直出，不再走 js2p 代理（见文件头 round2 说明）。
-  // 代理路由与 proxyPlaylistUrl 保留：缓存的 fix6 版 js2p 地址仍走路由层解析。
+  // round3：m3u8 走独立 CF Worker 中转（见文件头 round3 说明）。
+  // 播放器只见无查询串的 relay 地址，绝不直接碰源站 m3u8 域；mp4 仍直出不动；
+  // js2p 代理路由与 proxyPlaylistUrl 保留：缓存的 fix6 版 js2p 地址仍走路由层解析。
   if (/\.m3u8(\?|#|$)/i.test(playlistUrl)) {
-    return { parse: 0, url: playlistUrl, header: H() };
+    const relayUrl = RELAY.replace(/\/+$/, '')
+      + '/p/' + b64url(playlistUrl) + '/' + (detailUrl ? b64url(detailUrl) : '-');
+    return { parse: 0, url: relayUrl, header: H() };
   }
   const isVideo2 = /\.(m3u8|mp4|ts)/i.test(playlistUrl);
   return { parse: isVideo2 ? 0 : 1, url: playlistUrl, header: H() };

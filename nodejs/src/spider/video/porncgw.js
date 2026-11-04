@@ -7,6 +7,9 @@
 // (c) 播单代理上游失败时先用 referer 详情页现取新鲜签名播单自愈一次，仍失败才 302；
 // (d) 取数层加瞬时失败重试（3 次、间隔 600ms）+ CF 挑战页识别，对应“几分钟前能加载、现在又不能”的抖动；
 // (e) 旧 ?u=&r= 代理格式仍保留兼容（已缓存的旧播单地址仍可用）。
+// 2026-11-04 Worker 取数腿：App 直接请求 porncgw.com 被拦/被挑战（手机浏览器能开、VM 能通，
+// 唯独 App 内请求失败），故 porncgw.com 取数（fetchPage/fetchApi）一律改走独立 CF Worker
+// （worker.js，与 818 relay 同批部署；由用户手动粘贴部署）。视频分片/密钥仍走本地代理不动。
 // 列表为 SSR 卡片 (article.card + a.card-link + img data-src);
 // 详情页 SSR JSON 内嵌已签名 videoSrc (yd-hls.hzjvlo.cn 的 m3u8, 分片/密钥均为带签名绝对地址), play 抓一次详情页直返;
 // 短剧 /drama/{id}/ 为简介+分集列表, 分集页 /drama/{id}/{n}/ 同样内嵌 videoSrc;
@@ -16,6 +19,8 @@ import req from '../../util/req.js';
 const KEY = 'py_porncgw';
 const NAME = 'porn吃瓜网';
 const HOST = 'https://porncgw.com';
+// porncgw-worker 取数：App 直接请求 porncgw.com 被拦/被挑战时改走 Worker（与 818 relay 同批部署）。
+const RELAY = 'https://porncgw.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 const TIMEOUT = 30000;
@@ -84,10 +89,11 @@ async function fetchPage(url, referer) {
   let last = { html: '', finalUrl: url };
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await req.get(url, { headers: headers(referer), timeout: TIMEOUT });
+      const res = await req.get(viaWorker(url), { headers: headers(referer), timeout: TIMEOUT });
       const html = String(res?.data || '');
       if (html && !isChallengeHtml(html)) {
-        const finalUrl = res?.request?.res?.responseUrl || url;
+        const hdrs = res?.headers || {};
+        const finalUrl = hdrs['x-final-url'] || hdrs['X-Final-Url'] || res?.request?.res?.responseUrl || url;
         return { html, finalUrl };
       }
       last = { html: '', finalUrl: url };
@@ -281,7 +287,7 @@ async function home() {
 async function fetchApi(url) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const res = await req.get(url, { headers: headers(HOST + '/'), timeout: TIMEOUT });
+      const res = await req.get(viaWorker(url), { headers: headers(HOST + '/'), timeout: TIMEOUT });
       let d = res?.data;
       if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = null; } }
       if (d) return d;
@@ -469,6 +475,10 @@ function b64url(s) {
     return Buffer.from(String(s), 'utf8').toString('base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   } catch (e) { return ''; }
+}
+// 经 Worker 取数：目标 URL 编进无查询串路径段；Worker 只放行 porncgw.com。
+function viaWorker(url) {
+  return RELAY.replace(/\/+$/, '') + '/f/' + b64url(url);
 }
 function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
