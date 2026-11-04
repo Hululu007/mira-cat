@@ -154,33 +154,60 @@ function validJsonBody(d) {
 // 2026-11-05 round2（照搬 porncgw 能通的韧性）：Worker 腿 3 次重试、单次超时 30s；
 //   直连腿单次、超时同步 30s（此前直连 8s 在手机慢网下易误杀）；房间页腿同步 30s。
 //   列表路径（affiliate 直连）不动。两腿均做形状校验，形状不对即换腿/重试。
+// 诊断版（临时，查完即撤）：记录最近一次详情取数各腿结果，供 detail() 在失败时展示。
+let diagCtx = '';
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
+function diagErr(e, ms) {
+  const sec = (ms / 1000).toFixed(1) + 's';
+  const msg = String((e && e.message) || e);
+  if (/timeout/i.test(msg)) return '超时/' + sec;
+  const m = msg.match(/ECONN\w*|ENOTFOUND|EAI_AGAIN/);
+  return (m ? m[0] : '抛错') + '/' + sec;
+}
 async function fetchJson(url) {
+  let wDiag = 'W未跑', dDiag = 'D未跑';
   for (let attempt = 0; attempt < 3; attempt++) {
+    const t0 = Date.now();
     try {
       const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
         headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
         timeout: CTX_TIMEOUT,
       });
+      const sec = ((Date.now() - t0) / 1000).toFixed(1) + 's';
       if (status === 200 && data) {
-        const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-        if (validJsonBody(parsed)) return parsed;
+        let parsed = null, parseErr = false;
+        try { parsed = typeof data === 'string' ? JSON.parse(data) : data; }
+        catch (e) { parseErr = true; }
+        if (!parseErr && validJsonBody(parsed)) { diagCtx = 'W' + (attempt + 1) + '次/200/有效/' + sec; return parsed; }
+        wDiag = 'W' + (attempt + 1) + '次/' + (parseErr ? '解析失败' : '200/无效体') + '/' + sec;
+      } else {
+        wDiag = 'W' + (attempt + 1) + '次/' + (status || '无响应') + '/' + sec;
       }
-    } catch (e) { /* retry */ }
+    } catch (e) { wDiag = 'W' + (attempt + 1) + '次/' + diagErr(e, Date.now() - t0); }
     if (attempt < 2) await sleep(600);
   }
-  try {
-    const { data, status } = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
-      timeout: CTX_TIMEOUT,
-    });
-    if (status === 200 && data) {
-      const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-      if (validJsonBody(parsed)) return parsed;
-    }
-  } catch (e) { /* 两腿皆败 */ }
+  {
+    const t0 = Date.now();
+    try {
+      const { data, status } = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
+        timeout: CTX_TIMEOUT,
+      });
+      const sec = ((Date.now() - t0) / 1000).toFixed(1) + 's';
+      if (status === 200 && data) {
+        let parsed = null, parseErr = false;
+        try { parsed = typeof data === 'string' ? JSON.parse(data) : data; }
+        catch (e) { parseErr = true; }
+        if (!parseErr && validJsonBody(parsed)) { diagCtx = wDiag + ' D1次/200/有效/' + sec; return parsed; }
+        dDiag = 'D1次/' + (parseErr ? '解析失败' : '200/无效体') + '/' + sec;
+      } else {
+        dDiag = 'D1次/' + (status || '无响应') + '/' + sec;
+      }
+    } catch (e) { dDiag = 'D1次/' + diagErr(e, Date.now() - t0); }
+  }
+  diagCtx = wDiag + ' ' + dDiag;
   return null;
 }
 
@@ -339,10 +366,12 @@ async function getDossier(username) {
       hls_source: t(j.hls_source),
     };
   }
+  const t0 = Date.now();
   const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, CTX_TIMEOUT);
-  if (!html) return null;
+  const pSec = ((Date.now() - t0) / 1000).toFixed(1) + 's';
+  if (!html) { diagCtx += ' 页:空/' + pSec; return null; }
   const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
-  if (!m) return null;
+  if (!m) { diagCtx += ' 页:无dossier字段/' + pSec; return null; }
   try {
     const d = JSON.parse(JSON.parse('"' + m[1] + '"'));
     return {
@@ -351,7 +380,7 @@ async function getDossier(username) {
       num_viewers: d.num_viewers || 0,
       hls_source: t(d.hls_source),
     };
-  } catch (e) { return null; }
+  } catch (e) { diagCtx += ' 页:解析失败/' + pSec; return null; }
 }
 
 function cleanId(raw) {
@@ -370,7 +399,8 @@ async function detail(reqIn) {
     remarks = live ? `直播中 · ${d.num_viewers || 0}人观看` : `当前状态: ${t(d.room_status) || '未知'}`;
     if (t(d.room_title)) content = t(d.room_title);
   } else {
-    remarks = '房间已下线或不存在';
+    // 诊断版（临时）：失败时展示各腿诊断而非笼统的下线文案，查完即撤。
+    remarks = diagCtx ? ('诊断 ' + diagCtx) : '房间已下线或不存在';
   }
   const vod = {
     vod_id: username,

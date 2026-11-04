@@ -35,6 +35,24 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+// 诊断版（临时，查完即撤）：记录最近一次 getHtml 各腿结果，供 home() 在空列表时展示。
+let diagGetHtml = '';
+function diagOutcome(r, err, ms) {
+  const sec = (ms / 1000).toFixed(1) + 's';
+  if (err) {
+    const msg = String((err && err.message) || err);
+    if (/timeout/i.test(msg)) return '超时/' + sec;
+    const m = msg.match(/ECONN\w*|ENOTFOUND|EAI_AGAIN/);
+    return (m ? m[0] : '抛错') + '/' + sec;
+  }
+  const st = (r && r.status) || 0;
+  if (!r || st !== 200) return st + '/' + sec;
+  const body = (r.data != null) ? String(r.data) : '';
+  if (!body) return '空体/' + sec;
+  if (isChallengeHtml(body)) return '挑战页/' + sec;
+  return '200/' + Math.round(body.length / 1024) + 'KB/' + sec;
+}
+
 function unescapeHtml(s) {
   return String(s || '')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -78,22 +96,29 @@ async function getHtml(path) {
   // Worker 优先（手机直连被拦时走 Worker）；round2：单次超时提到 30s、Worker 腿 3 次重试、
   //   回包强制 String 化、挑战页视为失败（此前单次 20s、无重试、严格 string 校验，
   //   手机慢网下易超时丢包或把挑战页当成功回空；直连兜底保留，Worker 未部署时行为不变）。
+  // 诊断版：每腿记 attempts + 末次结果 + 耗时，供 home() 空列表时展示。
+  let wDiag = 'W未跑', dDiag = 'D未跑';
   for (let attempt = 0; attempt < 3; attempt++) {
+    const t0 = Date.now();
     try {
       const r = await req.get(viaWorker(url), { headers, timeout: 30000 });
       const body = (r && r.data != null) ? String(r.data) : '';
-      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
-    } catch (e) { /* retry */ }
+      wDiag = 'W' + (attempt + 1) + '次/' + diagOutcome(r, null, Date.now() - t0);
+      if (r && r.status === 200 && body && !isChallengeHtml(body)) { diagGetHtml = wDiag + ' ' + dDiag; return body; }
+    } catch (e) { wDiag = 'W' + (attempt + 1) + '次/' + diagOutcome(null, e, Date.now() - t0); }
     if (attempt < 2) await sleep(600);
   }
   for (let attempt = 0; attempt < 2; attempt++) {
+    const t0 = Date.now();
     try {
       const r = await req.get(url, { headers, timeout: 30000 });
       const body = (r && r.data != null) ? String(r.data) : '';
-      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
-    } catch (e) { /* retry */ }
+      dDiag = 'D' + (attempt + 1) + '次/' + diagOutcome(r, null, Date.now() - t0);
+      if (r && r.status === 200 && body && !isChallengeHtml(body)) { diagGetHtml = wDiag + ' ' + dDiag; return body; }
+    } catch (e) { dDiag = 'D' + (attempt + 1) + '次/' + diagOutcome(null, e, Date.now() - t0); }
     if (attempt < 1) await sleep(600);
   }
+  diagGetHtml = wDiag + ' ' + dDiag;
   return '';
 }
 
@@ -512,6 +537,11 @@ async function home() {
   for (const c of CATS) classes.push({ type_id: c.id, type_name: c.name });
   let list = [];
   try { list = parseCards(await getHtml('/'), HOST).slice(0, 30); } catch (e) { list = []; }
+  // 诊断版（临时）：空列表时展示取数诊断，供截图定位；成功时不出现，查完即撤。
+  if (!list.length && diagGetHtml) {
+    list = [{ vod_id: 'diag', vod_name: '诊断取数 ' + diagGetHtml, vod_pic: '', vod_remarks: '诊断版，查完即撤' }];
+    if (/200\//.test(diagGetHtml)) list.push({ vod_id: 'diag2', vod_name: '诊断解析 取数成功但0卡', vod_pic: '', vod_remarks: '' });
+  }
   return { class: classes, filters: {}, list };
 }
 
