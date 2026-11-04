@@ -82,7 +82,25 @@ async function getHtml(url) {
       timeout: 20000,
     });
     if (r.status && r.status !== 200) return '';
-    return typeof r.data === 'string' ? r.data : '';
+    const raw = typeof r.data === 'string' ? r.data : '';
+    // 2026-11-05: 站方新加 xsg-base64-v2 混淆壳（document.write 输出 base64 编码的
+    // 真实页面，无 JS 引擎时直接解析只能拿到空壳）；壳里只有一段长 base64，解开即
+    // 真实页面（含 ms2-card 卡片），解不开或解开后无卡片时回落原文。
+    if (raw.includes('data-xsg-obfuscation')) {
+      try {
+        const cands = raw.match(/"([A-Za-z0-9+/=]{1000,})"/g) || [];
+        let best = '';
+        for (const c of cands) {
+          const inner = c.slice(1, -1);
+          if (inner.length > best.length) best = inner;
+        }
+        if (best) {
+          const decoded = Buffer.from(best, 'base64').toString('utf-8');
+          if (decoded.includes('<article')) return decoded;
+        }
+      } catch (e) { /* fall through */ }
+    }
+    return raw;
   } catch (e) { return ''; }
 }
 

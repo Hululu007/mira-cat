@@ -15,6 +15,16 @@ import req from '../../util/req.js';
 // 搜索：/search/<关键词>（实测 FNS-274 返回 1 条）；详情 JSON-LD identifier.value 即番号，字幕按条目接。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const RELAY = 'https://javrate.li768435813.workers.dev';
+// 2026-11-05: 手机直连 javrate.com 拿不到内容（VM 全通），取数改走 Worker 优先、
+// 直连兜底；Worker 未部署时 Worker 腿速败、行为与原来一致，部署后无需重推即生效。
+function b64url(str) {
+  try {
+    return Buffer.from(String(str), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+function viaWorker(url) { return RELAY + '/f/' + b64url(url); }
 
 function unescapeHtml(s) {
   return String(s || '')
@@ -55,11 +65,14 @@ async function getHtml(path) {
   let url = String(path || '');
   if (url.startsWith('//')) url = 'https:' + url;
   else if (url.startsWith('/')) url = HOST + url;
+  const headers = { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
+  // Worker 优先（手机直连被拦时走 Worker）；Worker 腿失败时回落直连（VM 与未部署时行为不变）。
   try {
-    const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
-      timeout: 20000,
-    });
+    const r = await req.get(viaWorker(url), { headers, timeout: 20000 });
+    if (r.status === 200 && typeof r.data === 'string' && r.data) return r.data;
+  } catch (e) { /* fall through to direct */ }
+  try {
+    const r = await req.get(url, { headers, timeout: 20000 });
     if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
   } catch (e) { return ''; }
