@@ -333,6 +333,30 @@ async function category(reqIn) {
 // 主通道: /api/chatvideocontext/{username}/ JSON (约 5KB, 快);
 // 兜底: 房间页内嵌 initialRoomDossier (约 195KB HTML, 慢)。
 // 房间不存在/已下线且无任何信息时返回 null。
+// 嵌入页地址 (官方推广 iframe 的 revshare 形态, 含用户 affiliate 码):
+// 嵌入页是给第三方网站嵌房间用的, 其 Cloudflare 规则可能比主接口松, 故在
+// ctx 与房间页都被拦的节点上仍可能拿到 dossier; 只走直连 (Worker 不放行 /embed/)。
+function embedUrl(username) {
+  const u = encodeURIComponent(username);
+  return `${HOST}/embed/${u}/?bgcolor=white&campaign=ezKE2&disable_sound=0&join_overlay=1&room=${u}&tour=9oGW&track=embed`;
+}
+
+function parseDossier(html) {
+  if (!html) return null;
+  const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
+  if (!m) return null;
+  try {
+    const d = JSON.parse(JSON.parse('"' + m[1] + '"'));
+    if (!d || typeof d !== 'object' || !('room_status' in d || 'hls_source' in d)) return null;
+    return {
+      room_status: t(d.room_status),
+      room_title: t(d.room_title),
+      num_viewers: d.num_viewers || 0,
+      hls_source: t(d.hls_source),
+    };
+  } catch (e) { return null; }
+}
+
 async function getDossier(username) {
   const j = await fetchJson(CTX_API + encodeURIComponent(username) + '/');
   if (j && typeof j === 'object' && ('room_status' in j || 'hls_source' in j)) {
@@ -343,19 +367,12 @@ async function getDossier(username) {
       hls_source: t(j.hls_source),
     };
   }
-  const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, CTX_TIMEOUT);
-  if (!html) return null;
-  const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
-  if (!m) return null;
-  try {
-    const d = JSON.parse(JSON.parse('"' + m[1] + '"'));
-    return {
-      room_status: t(d.room_status),
-      room_title: t(d.room_title),
-      num_viewers: d.num_viewers || 0,
-      hls_source: t(d.hls_source),
-    };
-  } catch (e) { return null; }
+  // 嵌入页腿 (直连): 规则可能比主接口松, 在被拦节点上仍可能拿到 dossier。
+  const emb = parseDossier(await fetchText(embedUrl(username), CTX_TIMEOUT));
+  if (emb) return emb;
+  const room = parseDossier(await fetchText(`${HOST}/${encodeURIComponent(username)}/`, CTX_TIMEOUT));
+  if (room) return room;
+  return null;
 }
 
 function cleanId(raw) {
@@ -435,8 +452,9 @@ function absUrl(u, base) {
 
 // 把主列表裁到一档: 无 targetH 时取最高档 (高度优先, 其次码率)；有 targetH 时
 // 取不高于它的最高档，全高于它时取最低档。只保留该变体 + 它引用的音频组，
-// 所有 URI 改写为以主列表地址为基准的绝对地址。正文不含任何本地地址。
-function filterMaster(raw, baseUrl, targetH) {
+// 变体与音频 URI 改写为本地 /proxy/playlist 地址 (toProxy 提供, 无 toProxy 时直连绝对地址)。
+// 正文不含任何本地地址以外的上游地址 (变体/音频经代理转普通 HLS, 分片仍直连)。
+function filterMaster(raw, baseUrl, targetH, toProxy) {
   const lines = String(raw).split(/\r?\n/);
   const head = [];
   const mediaByGroup = new Map();
@@ -484,11 +502,15 @@ function filterMaster(raw, baseUrl, targetH) {
   for (const h of head) { if (h !== '#EXTM3U') out.push(h); }
   if (top.audio && mediaByGroup.has(top.audio)) {
     for (const ml of mediaByGroup.get(top.audio)) {
-      out.push(ml.replace(/URI="([^"]+)"/, (mm, u) => `URI="${absUrl(u, baseUrl)}"`));
+      out.push(ml.replace(/URI="([^"]+)"/, (mm, u) => {
+        const abs = absUrl(u, baseUrl);
+        return `URI="${toProxy ? toProxy(abs) : abs}"`;
+      }));
     }
   }
   out.push(top.inf);
-  out.push(absUrl(top.uri, baseUrl));
+  const vabs = absUrl(top.uri, baseUrl);
+  out.push(toProxy ? toProxy(vabs) : vabs);
   return out.join('\n') + '\n';
 }
 
@@ -508,7 +530,9 @@ const masterCache = new Map(); // url -> { text, exp }
 const MASTER_CACHE_TTL = 60000;
 
 // GET /proxy/master?u={b64url 主列表地址}&h={档位高度} —— 返回裁到指定档（无 h 时最高档）的主列表;
+// 变体与音频 URI 改写为本地 /proxy/playlist (转普通 HLS), 分片仍 mmcdn 直连;
 // 拉取/裁剪失败时 302 跳回原始主列表, 播放器退回自选档行为 (不劣于第一版)。
+// 代理地址形态为 js2p://_WEB_ 常量, 故 60 秒主列表缓存不会使代理地址过期。
 async function masterProxy(request, reply) {
   const q = request?.query || {};
   if (!q.u) { reply.code(400).send('missing u'); return; }
@@ -530,13 +554,56 @@ async function masterProxy(request, reply) {
     return;
   }
   const raw = await fetchPlaylist(target);
-  const filtered = raw && raw.includes('#EXT-X-STREAM-INF') ? filterMaster(raw, target, h) : '';
+  const filtered = raw && raw.includes('#EXT-X-STREAM-INF')
+    ? filterMaster(raw, target, h, (abs) => proxyUrl(request, '/proxy/playlist', abs) || abs)
+    : '';
   if (!filtered) { reply.redirect(target); return; }
   if (masterCache.size > 64) masterCache.delete(masterCache.keys().next().value);
   masterCache.set(cacheKey, { text: filtered, exp: nowMs + MASTER_CACHE_TTL });
   reply.header('Content-Type', 'application/vnd.apple.mpegurl');
   reply.header('Cache-Control', 'no-cache');
   reply.send(filtered);
+}
+
+// 把 LLHLS 媒体列表转回普通 HLS: 去掉 PART/PART-INF/SERVER-CONTROL/PRELOAD-HINT,
+// 只留整段 (EXTINF + 分片 URI, 改写为绝对直链)。播放器按普通 HLS 播, 不再不停要
+// 0.8 秒小片与阻塞等新片, 恢复以前不卡的播法。无 PART 的普通列表原样过 (仅绝对化)。
+// 分片本身仍走 mmcdn 直连, 只列表经本地代理; 不走 Railway, 不动额度。
+function convertPlaylist(raw, baseUrl) {
+  const out = [];
+  for (const rawLine of String(raw || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#EXT-X-PART') || line.startsWith('#EXT-X-PRELOAD-HINT') || line.startsWith('#EXT-X-SERVER-CONTROL')) continue;
+    if (line.startsWith('#')) {
+      out.push(line.replace(/URI="([^"]+)"/g, (mm, u) => `URI="${absUrl(u, baseUrl)}"`));
+      continue;
+    }
+    out.push(absUrl(line, baseUrl));
+  }
+  const text = out.join('\n') + '\n';
+  return text.includes('#EXTM3U') ? text : '';
+}
+
+// GET /proxy/playlist?u={b64url 媒体列表地址} —— 取回后转普通 HLS 返回 (不缓存,
+// 直播窗口每 2 秒滑动, 缓存会冻住窗口); 拉取/转换失败时 302 跳回原始列表,
+// 播放器退回直连 LLHLS (不劣于现在)。
+async function playlistProxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  try { target = unb64url(q.u); } catch (e) { reply.code(400).send('bad u'); return; }
+  let host = '';
+  try { host = new URL(target).hostname; } catch (e) { /* ignore */ }
+  if (!/^https:\/\//.test(target) || !(host === 'live.mmcdn.com' || host.endsWith('.live.mmcdn.com'))) {
+    reply.code(400).send('bad u'); return;
+  }
+  const raw = await fetchPlaylist(target);
+  const converted = raw && raw.includes('#EXTM3U') ? convertPlaylist(raw, target) : '';
+  if (!converted) { reply.redirect(target); return; }
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(converted);
 }
 
 async function play(reqIn) {
@@ -580,8 +647,12 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // 主列表裁档代理 (GET): 只处理 m3u8 文本, 媒体列表/分片保持 mmcdn 直连
+      // 主列表裁档代理 + 媒体列表转普通 HLS (GET): 只处理 m3u8 文本, 分片保持 mmcdn 直连
       fastify.get('/proxy/master', masterProxy);
+      fastify.get('/proxy/playlist', playlistProxy);
     },
   };
 }
+
+// 仅供桩测用 (App 只用 default, 具名导出不影响打包)。
+export { parseDossier, convertPlaylist, filterMaster };
