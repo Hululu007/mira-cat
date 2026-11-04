@@ -1,18 +1,14 @@
 import req from '../../util/req.js';
 
-// Chaturbate (py_chaturbate) —— 2026-11-05 从 REX lai_chaturbate 2.0.3 全量重写，替换旧版蜘蛛。
-// 旧版（本地 /proxy/master 裁档 + 分片直连 mmcdn + req→LIST_WORKER→jina 取数）已删除，不再保留；
-// 本版取数与播放逻辑与 REX 2.0.3 一一对应，唯一差别是取数通道：
-//   REX 用 Widget.http 直连站方；猫源 App 的 req 在部分手机上直连 chaturbate.com 被拦（2026-11-03 实测），
-//   故本版取数两腿：① req 直连（REX 路径）；② chaturbate-hls Worker /api 代理（需 Worker v9+，
-//   仅放行 chaturbate.com/api/* 与 *.live.mmcdn.com 主清单；播放本就依赖该 Worker，故不新增依赖面）。
-//   房间页兜底（initialRoomDossier）只走直连腿（代理不放行房间页），主通道 CTX 走双腿已足够。
-//   App 内无全局 fetch，不用 fetch；jina 对 CB 只回首页、取不到 JSON，不用。
+// Chaturbate (py_chaturbate) —— 2026-11-05 从 REX lai_chaturbate 2.0.3 完全参照重写，替换旧版蜘蛛。
+// 完全参照：分类、列表、详情、解析、播放地址形态与 REX 2.0.3 一一对应，不加任何额外东西——
+//   无分辨率选单（REX 只锁最高档），无 Worker /api 兜底腿，无 LIST_WORKER 腿，无 jina 腿。
+//   取数只走 req 直连（iPhone UA，与 REX pageHeaders 一致）；App 内无全局 fetch，不用 fetch。
 // 列表：GET /api/ts/roomlist/room-list/?limit=90&offset=(页-1)*90，筛选与 REX 一致
 //   （genders/regions/hashtags/from_age/to_age/new_cams/gaming/exhib/keywords）。
 // 详情：GET /api/chatvideocontext/{username}/（主）→ 房间页 initialRoomDossier（兜底）。
 // 播放：play 内现拉现解析（dossier + 主清单，防主清单 session token 过期），双线：
-//   音画双轨 = Worker /master（aw=1：音视频双轨均经 /m）；纯视频轨 = Worker /m。
+//   音画双轨 = Worker /master（aw=1：音视频双轨均经 /m；配已部署 Worker v8）；纯视频轨 = Worker /m。
 //   detail 只对公开房出线；非公开/下线房不出播放线（同 REX 不出 videoUrl），避免空地址无限转圈。
 // 分类 48 个，与 REX 2.0.3 的精选/地区/年龄/标签完全一致（顺序亦一致）。
 // 只收录 current_show='public' 且无密码的公开房；私密/票秀/密码房不收，不伪造任何凭证。
@@ -25,9 +21,7 @@ const CTX_API = HOST + '/api/chatvideocontext/';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
-const TIMEOUT = 12000;
 const CB_WORKER = 'https://chaturbate-hls.li768435813.workers.dev';
-const API_PROXY = CB_WORKER + '/api?u=';
 
 const CATS = [
   { type_id: 'all', type_name: '推荐' },
@@ -91,21 +85,11 @@ function pageHeaders() {
   };
 }
 
-// 取文本：① req 直连（REX 路径）② Worker /api 代理。任一腿 200 即回正文；否则 ''。
+// 取文本：只走 req 直连（与 REX 的 Widget.http 直连一致），200 即回正文；否则 ''。
 // （App 内 req 是 axios：非 2xx 默认抛错走 catch；本函数另验 status，双保险。）
 async function fetchText(url) {
   try {
-    const r = await req.get(url, {
-      headers: pageHeaders(), timeout: TIMEOUT,
-      responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true,
-    });
-    if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
-  } catch (e) { /* 换 Worker 腿 */ }
-  try {
-    const r = await req.get(API_PROXY + encodeURIComponent(url), {
-      headers: pageHeaders(), timeout: TIMEOUT,
-      responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true,
-    });
+    const r = await req.get(url, { headers: pageHeaders() });
     if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
   } catch (e) { /* ignore */ }
   return '';
