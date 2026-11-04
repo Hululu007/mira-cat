@@ -55,6 +55,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
 const TIMEOUT = 8000;
+const CTX_TIMEOUT = 20000; // 2026-11-05: 手机到 Worker 再到 CB 的往返慢于 VM，详情腿 8s 易超时，提到 20s（与 affiliate 腿一致）；直连腿仍 8s（已知被墙，不必久等）。
 
 // 列表取数（2026-11-04 重构，根因见下）：
 //   第 1 腿：用户自有 list Worker（chaturbate.li768435813.workers.dev，只放行 /api/ 路径；
@@ -159,7 +160,7 @@ async function fetchJson(url) {
   try {
     const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
       headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
-      timeout: TIMEOUT,
+      timeout: CTX_TIMEOUT,
     });
     if (status === 200 && data) {
       const parsed = typeof data === 'string' ? JSON.parse(data) : data;

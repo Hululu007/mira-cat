@@ -21,6 +21,7 @@ const NAME = 'porn吃瓜网';
 const HOST = 'https://porncgw.com';
 // porncgw-worker 取数：App 直接请求 porncgw.com 被拦/被挑战时改走 Worker（与 818 relay 同批部署）。
 const RELAY = 'https://porncgw.li768435813.workers.dev';
+const RELAY_PG = RELAY; // 2026-11-05: 视频中转与取数共用同一 Worker（v2 部署后 /p/ 生效；推包前必先核 v2 已部署）。
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 const TIMEOUT = 30000;
@@ -403,8 +404,10 @@ async function play(reqIn) {
   let id = t(body.id);
   if (id.includes('$')) id = id.split('$').pop().trim();
   if (/\.m3u8(\?|$)/i.test(id)) {
-    // 2026-11-04 代理修：m3u8 播单与分片/密钥必带 auth_key，播放器丢签即 403，
-    // 改走蜘蛛本地 /proxy/m3u8，播放器不再直触带签第三方地址
+    // 2026-11-05 中转修：播单与分片/密钥必带 auth_key，播放器丢签即 403，且手机
+    // 直触分片域不通（与 818 中转前同类）；改走 Worker /p/ 中转，本地代理作回落
+    const relay = pgRelayPlaylist(id, HOST + '/');
+    if (relay) return { parse: 0, url: relay, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
     const proxy = proxyUrl(reqIn, id, HOST + '/');
     return { parse: 0, url: proxy || id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   }
@@ -415,6 +418,8 @@ async function play(reqIn) {
   const src = selectPlaySrc(html);
   if (src && /^https?:\/\//i.test(src)) {
     if (/\.m3u8(\?|#|$)/i.test(src)) {
+      const relay = pgRelayPlaylist(src, pageUrl);
+      if (relay) return { parse: 0, url: relay, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
       const proxy = proxyUrl(reqIn, src, pageUrl);
       return { parse: 0, url: proxy || src, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
     }
@@ -474,6 +479,16 @@ function b64url(s) {
   try {
     return Buffer.from(String(s), 'utf8').toString('base64')
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+// 2026-11-05 视频中转：播单走 Worker /p/（Worker 改写分片/密钥/子播单为 /s/ 地址），
+// 播放器不再直触分片域；入口全路径段、零查询串。b64 失败时回空，play 内回落本地代理。
+function pgRelayPlaylist(targetUrl, referer) {
+  try {
+    const u = b64url(targetUrl);
+    const r = b64url(referer || '-');
+    if (!u || !r) return '';
+    return `${RELAY_PG}/p/${u}/${r}`;
   } catch (e) { return ''; }
 }
 // 经 Worker 取数：目标 URL 编进无查询串路径段；Worker 只放行 porncgw.com。
