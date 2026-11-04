@@ -35,27 +35,6 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// 诊断版（临时，查完即撤）：记录最近一次 getHtml 各腿结果，供 home() 在空列表时展示。
-let diagGetHtml = '';
-function diagOutcome(r, err, ms) {
-  const sec = (ms / 1000).toFixed(1) + 's';
-  if (err) {
-    // 诊断版 round2：axios 对 4xx/5xx 也抛错，须先看 e.response.status，否则 403 会被笼统记成抛错。
-    const st = err && err.response && err.response.status;
-    if (st) return st + '/' + sec;
-    const msg = String((err && err.message) || err);
-    if (/timeout/i.test(msg)) return '超时/' + sec;
-    const m = msg.match(/ECONN\w*|ENOTFOUND|EAI_AGAIN/);
-    return (m ? m[0] : '抛错') + '/' + sec;
-  }
-  const st = (r && r.status) || 0;
-  if (!r || st !== 200) return st + '/' + sec;
-  const body = (r.data != null) ? String(r.data) : '';
-  if (!body) return '空体/' + sec;
-  if (isChallengeHtml(body)) return '挑战页/' + sec;
-  return '200/' + Math.round(body.length / 1024) + 'KB/' + sec;
-}
-
 function unescapeHtml(s) {
   return String(s || '')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
@@ -99,29 +78,22 @@ async function getHtml(path) {
   // Worker 优先（手机直连被拦时走 Worker）；round2：单次超时提到 30s、Worker 腿 3 次重试、
   //   回包强制 String 化、挑战页视为失败（此前单次 20s、无重试、严格 string 校验，
   //   手机慢网下易超时丢包或把挑战页当成功回空；直连兜底保留，Worker 未部署时行为不变）。
-  // 诊断版：每腿记 attempts + 末次结果 + 耗时，供 home() 空列表时展示。
-  let wDiag = 'W未跑', dDiag = 'D未跑';
   for (let attempt = 0; attempt < 3; attempt++) {
-    const t0 = Date.now();
     try {
       const r = await req.get(viaWorker(url), { headers, timeout: 30000 });
       const body = (r && r.data != null) ? String(r.data) : '';
-      wDiag = 'W' + (attempt + 1) + '次/' + diagOutcome(r, null, Date.now() - t0);
-      if (r && r.status === 200 && body && !isChallengeHtml(body)) { diagGetHtml = wDiag + ' ' + dDiag; return body; }
-    } catch (e) { wDiag = 'W' + (attempt + 1) + '次/' + diagOutcome(null, e, Date.now() - t0); }
+      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
+    } catch (e) { /* ignore, retry */ }
     if (attempt < 2) await sleep(600);
   }
   for (let attempt = 0; attempt < 2; attempt++) {
-    const t0 = Date.now();
     try {
       const r = await req.get(url, { headers, timeout: 30000 });
       const body = (r && r.data != null) ? String(r.data) : '';
-      dDiag = 'D' + (attempt + 1) + '次/' + diagOutcome(r, null, Date.now() - t0);
-      if (r && r.status === 200 && body && !isChallengeHtml(body)) { diagGetHtml = wDiag + ' ' + dDiag; return body; }
-    } catch (e) { dDiag = 'D' + (attempt + 1) + '次/' + diagOutcome(null, e, Date.now() - t0); }
+      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
+    } catch (e) { /* ignore, retry */ }
     if (attempt < 1) await sleep(600);
   }
-  diagGetHtml = wDiag + ' ' + dDiag;
   return '';
 }
 
@@ -535,25 +507,11 @@ function catUrl(cat, page) {
   return page <= 1 ? base : (base + '?page=' + page + '&moviesort=3');
 }
 
-// 诊断版（临时）：空列表时附诊断条（home 与 category 共用；此前只加了 home，
-//   最新更新 tab 走 category('new') 故没出诊断行，本轮补上）。
-function withDiag(list) {
-  if (list.length || !diagGetHtml) return list;
-  const out = [{ vod_id: 'diag', vod_name: '诊断取数 ' + diagGetHtml, vod_pic: '', vod_remarks: '诊断版，查完即撤' }];
-  if (/200\//.test(diagGetHtml)) out.push({ vod_id: 'diag2', vod_name: '诊断解析 取数成功但0卡', vod_pic: '', vod_remarks: '' });
-  return out;
-}
-
 async function home() {
   const classes = [{ type_id: 'new', type_name: '最新更新' }];
   for (const c of CATS) classes.push({ type_id: c.id, type_name: c.name });
   let list = [];
   try { list = parseCards(await getHtml('/'), HOST).slice(0, 30); } catch (e) { list = []; }
-  // 诊断版（临时）：空列表时展示取数诊断，供截图定位；成功时不出现，查完即撤。
-  if (!list.length && diagGetHtml) {
-    list = [{ vod_id: 'diag', vod_name: '诊断取数 ' + diagGetHtml, vod_pic: '', vod_remarks: '诊断版，查完即撤' }];
-    if (/200\//.test(diagGetHtml)) list.push({ vod_id: 'diag2', vod_name: '诊断解析 取数成功但0卡', vod_pic: '', vod_remarks: '' });
-  }
   return { class: classes, filters: {}, list };
 }
 
@@ -563,14 +521,14 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!tid || tid === 'new') {
     const html = await getHtml('/movie/new');
-    return { page: 1, pagecount: 1, list: withDiag(parseCards(html, HOST)) };
+    return { page: 1, pagecount: 1, list: parseCards(html, HOST) };
   }
   const cat = CAT_MAP[tid];
   if (!cat) return { page, pagecount: page, list: [] };
   const html = await getHtml(catUrl(cat, page));
   const list = parseCards(html, HOST);
   const hasNext = page === 1 ? list.length > 0 : list.length > 0;
-  return { page, pagecount: hasNext ? page + 1 : page, list: withDiag(list) };
+  return { page, pagecount: hasNext ? page + 1 : page, list };
 }
 
 async function search(reqIn) {

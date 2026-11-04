@@ -154,63 +154,37 @@ function validJsonBody(d) {
 // 2026-11-05 round2（照搬 porncgw 能通的韧性）：Worker 腿 3 次重试、单次超时 30s；
 //   直连腿单次、超时同步 30s（此前直连 8s 在手机慢网下易误杀）；房间页腿同步 30s。
 //   列表路径（affiliate 直连）不动。两腿均做形状校验，形状不对即换腿/重试。
-// 诊断版（临时，查完即撤）：记录最近一次详情取数各腿结果，供 detail() 在失败时展示。
-let diagCtx = '';
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
-function diagErr(e, ms) {
-  const sec = (ms / 1000).toFixed(1) + 's';
-  // 诊断版 round2：axios 对 4xx/5xx 也抛错，须先看 e.response.status，否则 403 会被笼统记成抛错。
-  const st = e && e.response && e.response.status;
-  if (st) return st + '/' + sec;
-  const msg = String((e && e.message) || e);
-  if (/timeout/i.test(msg)) return '超时/' + sec;
-  const m = msg.match(/ECONN\w*|ENOTFOUND|EAI_AGAIN/);
-  return (m ? m[0] : '抛错') + '/' + sec;
-}
 async function fetchJson(url) {
-  let wDiag = 'W未跑', dDiag = 'D未跑';
   for (let attempt = 0; attempt < 3; attempt++) {
-    const t0 = Date.now();
     try {
       const { data, status } = await req.get(LIST_WORKER + encodeURIComponent(url), {
         headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
         timeout: CTX_TIMEOUT,
       });
-      const sec = ((Date.now() - t0) / 1000).toFixed(1) + 's';
       if (status === 200 && data) {
         let parsed = null, parseErr = false;
         try { parsed = typeof data === 'string' ? JSON.parse(data) : data; }
         catch (e) { parseErr = true; }
-        if (!parseErr && validJsonBody(parsed)) { diagCtx = 'W' + (attempt + 1) + '次/200/有效/' + sec; return parsed; }
-        wDiag = 'W' + (attempt + 1) + '次/' + (parseErr ? '解析失败' : '200/无效体') + '/' + sec;
-      } else {
-        wDiag = 'W' + (attempt + 1) + '次/' + (status || '无响应') + '/' + sec;
+        if (!parseErr && validJsonBody(parsed)) return parsed;
       }
-    } catch (e) { wDiag = 'W' + (attempt + 1) + '次/' + diagErr(e, Date.now() - t0); }
+    } catch (e) { /* ignore, retry */ }
     if (attempt < 2) await sleep(600);
   }
-  {
-    const t0 = Date.now();
-    try {
-      const { data, status } = await req.get(url, {
-        headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
-        timeout: CTX_TIMEOUT,
-      });
-      const sec = ((Date.now() - t0) / 1000).toFixed(1) + 's';
-      if (status === 200 && data) {
-        let parsed = null, parseErr = false;
-        try { parsed = typeof data === 'string' ? JSON.parse(data) : data; }
-        catch (e) { parseErr = true; }
-        if (!parseErr && validJsonBody(parsed)) { diagCtx = wDiag + ' D1次/200/有效/' + sec; return parsed; }
-        dDiag = 'D1次/' + (parseErr ? '解析失败' : '200/无效体') + '/' + sec;
-      } else {
-        dDiag = 'D1次/' + (status || '无响应') + '/' + sec;
-      }
-    } catch (e) { dDiag = 'D1次/' + diagErr(e, Date.now() - t0); }
-  }
-  diagCtx = wDiag + ' ' + dDiag;
+  try {
+    const { data, status } = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
+      timeout: CTX_TIMEOUT,
+    });
+    if (status === 200 && data) {
+      let parsed = null, parseErr = false;
+      try { parsed = typeof data === 'string' ? JSON.parse(data) : data; }
+      catch (e) { parseErr = true; }
+      if (!parseErr && validJsonBody(parsed)) return parsed;
+    }
+  } catch (e) { /* ignore */ }
   return null;
 }
 
@@ -369,12 +343,10 @@ async function getDossier(username) {
       hls_source: t(j.hls_source),
     };
   }
-  const t0 = Date.now();
   const html = await fetchText(`${HOST}/${encodeURIComponent(username)}/`, CTX_TIMEOUT);
-  const pSec = ((Date.now() - t0) / 1000).toFixed(1) + 's';
-  if (!html) { diagCtx += ' 页:空/' + pSec; return null; }
+  if (!html) return null;
   const m = html.match(/initialRoomDossier\s*=\s*"((?:[^"\\]|\\.)*)"/);
-  if (!m) { diagCtx += ' 页:无dossier字段/' + pSec; return null; }
+  if (!m) return null;
   try {
     const d = JSON.parse(JSON.parse('"' + m[1] + '"'));
     return {
@@ -383,12 +355,25 @@ async function getDossier(username) {
       num_viewers: d.num_viewers || 0,
       hls_source: t(d.hls_source),
     };
-  } catch (e) { diagCtx += ' 页:解析失败/' + pSec; return null; }
+  } catch (e) { return null; }
 }
 
 function cleanId(raw) {
   const s = t(raw);
   return s.includes('$') ? s.split('$').pop() : s;
+}
+
+// 从主列表文本里枚举真实档位高度（去重、降序）；无 RESOLUTION 时返回 []。
+function masterHeights(raw) {
+  const hs = new Set();
+  for (const rawLine of String(raw || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      const res = /RESOLUTION=(\d+)x(\d+)/.exec(line);
+      if (res) { const h = parseInt(res[2], 10); if (h > 0) hs.add(h); }
+    }
+  }
+  return Array.from(hs).sort((a, b) => b - a);
 }
 
 async function detail(reqIn) {
@@ -402,8 +387,14 @@ async function detail(reqIn) {
     remarks = live ? `直播中 · ${d.num_viewers || 0}人观看` : `当前状态: ${t(d.room_status) || '未知'}`;
     if (t(d.room_title)) content = t(d.room_title);
   } else {
-    // 诊断版（临时）：失败时展示各腿诊断而非笼统的下线文案，查完即撤。
-    remarks = diagCtx ? ('诊断 ' + diagCtx) : '房间已下线或不存在';
+    remarks = '房间已下线或不存在';
+  }
+  // 清晰度选单：直播房从主列表里枚举真实档位（有几档列几档，不编假档位）；
+  // 枚举失败时退回单个“直播”入口（原行为：走代理裁到最高档）。
+  let playUrl = '直播$' + username;
+  if (d && d.room_status === 'public' && t(d.hls_source)) {
+    const heights = masterHeights(await fetchPlaylist(t(d.hls_source)));
+    if (heights.length) playUrl = heights.map(h => h + 'p$' + username + '__h' + h).join('#');
   }
   const vod = {
     vod_id: username,
@@ -413,12 +404,12 @@ async function detail(reqIn) {
     vod_remarks: remarks,
     vod_content: content,
     vod_play_from: NAME,
-    vod_play_url: '直播$' + username,
+    vod_play_url: playUrl,
   };
   return { list: [vod] };
 }
 
-// ---------- 主列表锁定最高档 (本地一跳代理) ----------
+// ---------- 主列表裁档 (本地一跳代理；detail 列真实档位，h 指定档位) ----------
 
 function b64url(s) {
   return Buffer.from(String(s), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
@@ -427,13 +418,14 @@ function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
 
-// 本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub/celebjihad 先例)
-function proxyUrl(reqLike, path, targetUrl) {
+// 本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub/celebjihad 先例)；
+// h 指定档位高度时追加 &h=，代理按该档裁剪（无 h 时裁到最高档）。
+function proxyUrl(reqLike, path, targetUrl, h) {
   try {
     const server = reqLike?.server;
     const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
     const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}`;
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}${h ? '&h=' + h : ''}`;
   } catch (e) { return ''; }
 }
 
@@ -441,9 +433,10 @@ function absUrl(u, base) {
   try { return new URL(u, base).toString(); } catch (e) { return u; }
 }
 
-// 把主列表裁到最高档: 只保留最佳变体 (高度优先, 其次码率) + 它引用的音频组,
+// 把主列表裁到一档: 无 targetH 时取最高档 (高度优先, 其次码率)；有 targetH 时
+// 取不高于它的最高档，全高于它时取最低档。只保留该变体 + 它引用的音频组，
 // 所有 URI 改写为以主列表地址为基准的绝对地址。正文不含任何本地地址。
-function filterMaster(raw, baseUrl) {
+function filterMaster(raw, baseUrl, targetH) {
   const lines = String(raw).split(/\r?\n/);
   const head = [];
   const mediaByGroup = new Map();
@@ -482,7 +475,11 @@ function filterMaster(raw, baseUrl) {
   }
   if (!variants.length) return '';
   variants.sort((a, b) => (b.h - a.h) || (b.bw - a.bw));
-  const top = variants[0];
+  let top = variants[0];
+  if (targetH) {
+    const cand = variants.filter(v => v.h <= targetH);
+    top = cand.length ? cand[0] : variants[variants.length - 1];
+  }
   const out = ['#EXTM3U'];
   for (const h of head) { if (h !== '#EXTM3U') out.push(h); }
   if (top.audio && mediaByGroup.has(top.audio)) {
@@ -510,7 +507,7 @@ async function fetchPlaylist(url, timeout = TIMEOUT) {
 const masterCache = new Map(); // url -> { text, exp }
 const MASTER_CACHE_TTL = 60000;
 
-// GET /proxy/master?u={b64url 主列表地址} —— 返回裁到最高档的主列表;
+// GET /proxy/master?u={b64url 主列表地址}&h={档位高度} —— 返回裁到指定档（无 h 时最高档）的主列表;
 // 拉取/裁剪失败时 302 跳回原始主列表, 播放器退回自选档行为 (不劣于第一版)。
 async function masterProxy(request, reply) {
   const q = request?.query || {};
@@ -522,8 +519,10 @@ async function masterProxy(request, reply) {
   if (!/^https:\/\//.test(target) || !(host === 'live.mmcdn.com' || host.endsWith('.live.mmcdn.com'))) {
     reply.code(400).send('bad u'); return;
   }
+  const h = parseInt(q.h, 10) || 0;
+  const cacheKey = target + '|h=' + h;
   const nowMs = Date.now();
-  const hit = masterCache.get(target);
+  const hit = masterCache.get(cacheKey);
   if (hit && hit.exp > nowMs) {
     reply.header('Content-Type', 'application/vnd.apple.mpegurl');
     reply.header('Cache-Control', 'no-cache');
@@ -531,10 +530,10 @@ async function masterProxy(request, reply) {
     return;
   }
   const raw = await fetchPlaylist(target);
-  const filtered = raw && raw.includes('#EXT-X-STREAM-INF') ? filterMaster(raw, target) : '';
+  const filtered = raw && raw.includes('#EXT-X-STREAM-INF') ? filterMaster(raw, target, h) : '';
   if (!filtered) { reply.redirect(target); return; }
   if (masterCache.size > 64) masterCache.delete(masterCache.keys().next().value);
-  masterCache.set(target, { text: filtered, exp: nowMs + MASTER_CACHE_TTL });
+  masterCache.set(cacheKey, { text: filtered, exp: nowMs + MASTER_CACHE_TTL });
   reply.header('Content-Type', 'application/vnd.apple.mpegurl');
   reply.header('Cache-Control', 'no-cache');
   reply.send(filtered);
@@ -542,14 +541,18 @@ async function masterProxy(request, reply) {
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  const username = cleanId(body.id);
+  const rawId = cleanId(body.id);
+  const vm = /^(.*)__h(\d+)$/.exec(rawId);
+  const username = vm ? vm[1] : rawId;
+  const targetH = vm ? parseInt(vm[2], 10) : 0;
   if (!username) return { parse: 0, url: '' };
   const d = await getDossier(username);
   // 只有公开房才有游客流; hidden/private/away 等状态 hls_source 为空, 如实空返
   if (!d || d.room_status !== 'public' || !t(d.hls_source)) return { parse: 0, url: '' };
   const master = t(d.hls_source);
-  // 直返主列表会让播放器从低档起播; 改走本地代理裁到最高档。代理地址构造失败时退回直返。
-  const url = proxyUrl(reqIn, '/proxy/master', master) || master;
+  // 直返主列表会让播放器从低档起播; 改走本地代理裁档：选了档位时裁到该档，
+  // 未选时裁到最高档。代理地址构造失败时退回直返。
+  const url = proxyUrl(reqIn, '/proxy/master', master, targetH) || master;
   return {
     parse: 0,
     url,
