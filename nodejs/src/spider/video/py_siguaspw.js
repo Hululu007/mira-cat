@@ -462,6 +462,12 @@ const ZONE_META = [
 async function home() {
   const classes = [{ type_id: 'home', type_name: '首页推荐' }];
   for (const z of ZONE_META) classes.push({ type_id: z.id, type_name: z.name });
+  // 2026-11-04 用户点名加的 2 个顶级分类（已证实 ID：无码破解 cate205、大奶美乳 cate164），放在主播达人后面。
+  const USER_CLASSES = [
+    { type_id: 'cate205', type_name: '无码破解' },
+    { type_id: 'cate164', type_name: '大奶美乳' },
+  ];
+  classes.splice(2, 0, ...USER_CLASSES);
   // 2026-11-04 新增顶级分类：题材标签区已证实的 8 个 cate（名与 ID 均取自首页实测 ZONES.tag）。
   // 注意：用户点名的 无码流出 / 巨乳 / 大屁股 在数据里无完全对应名字，本轮未加（见报告），
   // 也不用同义词顶替；下面 8 个是已证实的题材标签，与原有 5 类、filters 互不干扰。
