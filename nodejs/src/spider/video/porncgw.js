@@ -1,6 +1,12 @@
 // porn吃瓜网 (https://porncgw.com) -> CatPawOpen spider
 // 2026-11-04 修：(1) 最新更新 API 失败/回空时回落首页 SSR 卡片；(2) /list/ 首頁改走 /list 避 301；
 // (3) /video/ 的 SSR videoSrc 无 auth_key 会 403，改用 VideoObject contentUrl 签名地址；(4) 超时 15s->30s；(5) 只用框架 req。
+// 2026-11-04 round2 修：(a) 播单/分片代理地址改无查询串路径段形式（播放器丢查询串即旧 ?u=&r= 代理 400，
+// 且旧改写把分片拼成 http://Host 与播单 js2p scheme 不一致，两者都是“能加载内容但播不了”的嫌疑）；
+// (b) 改写后的分片/密钥地址改路径绝对形式、沿用请求自身的 spider 前缀，不再硬拼 http://Host；
+// (c) 播单代理上游失败时先用 referer 详情页现取新鲜签名播单自愈一次，仍失败才 302；
+// (d) 取数层加瞬时失败重试（3 次、间隔 600ms）+ CF 挑战页识别，对应“几分钟前能加载、现在又不能”的抖动；
+// (e) 旧 ?u=&r= 代理格式仍保留兼容（已缓存的旧播单地址仍可用）。
 // 列表为 SSR 卡片 (article.card + a.card-link + img data-src);
 // 详情页 SSR JSON 内嵌已签名 videoSrc (yd-hls.hzjvlo.cn 的 m3u8, 分片/密钥均为带签名绝对地址), play 抓一次详情页直返;
 // 短剧 /drama/{id}/ 为简介+分集列表, 分集页 /drama/{id}/{n}/ 同样内嵌 videoSrc;
@@ -60,18 +66,35 @@ function headers(referer) {
   };
 }
 
+// CF 挑战页特征：挑战页永远不含真实卡片/播单，命中即视为取数失败、触发重试
+function isChallengeHtml(html) {
+  if (!html) return false;
+  return /Just a moment|Attention Required|challenges\.cloudflare\.com|cf-ray|cf-challenge/i.test(html);
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
 // 取页面: 框架 req 优先, fetch 兜底; 返回 { html, finalUrl } (搜索 301 跳 tag 页要读最终地址)
 // 只用框架 req（App 内无全局 fetch，fetch 兜底在设备上是死代码）
+// round2: 瞬时失败（网络错/非 2xx/空体/CF 挑战页）重试 3 次、间隔 600ms；
+// 快失败时重试总耗时约 2 秒，慢挂起时仍受单次 30s 超时约束（App 侧超时未知，见报告）
 async function fetchPage(url, referer) {
-  try {
-    const res = await req.get(url, { headers: headers(referer), timeout: TIMEOUT });
-    const html = String(res?.data || '');
-    if (html) {
-      const finalUrl = res?.request?.res?.responseUrl || url;
-      return { html, finalUrl };
-    }
-  } catch (e) { /* ignore */ }
-  return { html: '', finalUrl: url };
+  let last = { html: '', finalUrl: url };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await req.get(url, { headers: headers(referer), timeout: TIMEOUT });
+      const html = String(res?.data || '');
+      if (html && !isChallengeHtml(html)) {
+        const finalUrl = res?.request?.res?.responseUrl || url;
+        return { html, finalUrl };
+      }
+      last = { html: '', finalUrl: url };
+    } catch (e) { last = { html: '', finalUrl: url }; }
+    if (attempt < 2) await sleep(600);
+  }
+  return last;
 }
 
 async function getHtml(url, referer) {
@@ -254,13 +277,17 @@ async function home() {
 }
 
 // 最新更新走站方 JSON API 分页（SSR 根路径无分页，之前写死单页导致无法加载更多）
+// round2: 瞬时失败重试 3 次、间隔 600ms（与 fetchPage 同理）
 async function fetchApi(url) {
-  try {
-    const res = await req.get(url, { headers: headers(HOST + '/'), timeout: TIMEOUT });
-    let d = res?.data;
-    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { return null; } }
-    return d || null;
-  } catch (e) { /* ignore */ }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const res = await req.get(url, { headers: headers(HOST + '/'), timeout: TIMEOUT });
+      let d = res?.data;
+      if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = null; } }
+      if (d) return d;
+    } catch (e) { /* ignore */ }
+    if (attempt < 2) await sleep(600);
+  }
   return null;
 }
 
@@ -350,6 +377,21 @@ async function detail(reqIn) {
   };
 }
 
+// 播单选源（play() 与播单代理自愈共用）：
+// 2026-11-03 修：cshort 路 videoSrc 源站 502 已死，同页 videoSrcHevc 可用时改用后者；
+// 2026-11-04 修：/video/ 的 SSR videoSrc 无 auth_key，实测 403 0 字节；VideoObject 的
+// contentUrl 是同一条带签名的播单，优先用它（否则播单代理 302 回落到死链即加载失败）
+function selectPlaySrc(html) {
+  const src0 = jsonStr(html, 'videoSrc');
+  const hevc = jsonStr(html, 'videoSrcHevc');
+  const signed = videoObjectContentUrl(html);
+  if (src0 && /\/cshort\//i.test(src0)) return hevc;
+  if (src0 && /auth_key=/i.test(src0)) return src0;
+  if (signed && /\.m3u8/i.test(signed) && /auth_key=/i.test(signed)) return signed;
+  if (hevc && /auth_key=/i.test(hevc)) return hevc;
+  return src0 || hevc;
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -357,28 +399,17 @@ async function play(reqIn) {
   if (/\.m3u8(\?|$)/i.test(id)) {
     // 2026-11-04 代理修：m3u8 播单与分片/密钥必带 auth_key，播放器丢签即 403，
     // 改走蜘蛛本地 /proxy/m3u8，播放器不再直触带签第三方地址
-    const proxy = proxyUrl(reqIn, '/proxy/m3u8', id, HOST + '/');
+    const proxy = proxyUrl(reqIn, id, HOST + '/');
     return { parse: 0, url: proxy || id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   }
   const path = id.match(/\/(video|drama)\/\d+(?:\/\d+)?\//)?.[0] || id;
   if (!path || path.charAt(0) !== '/') return { parse: 0, url: '' };
   const pageUrl = HOST + path;
   const html = await getHtml(pageUrl, HOST + '/');
-  // 2026-11-03 修：cshort 路 videoSrc 源站 502 已死，同页 videoSrcHevc 可用时改用后者；
-  // 2026-11-04 修：/video/ 的 SSR videoSrc 无 auth_key，实测 403 0 字节；VideoObject 的
-  // contentUrl 是同一条带签名的播单，优先用它（否则播单代理 302 回落到死链即加载失败）
-  const src0 = jsonStr(html, 'videoSrc');
-  const hevc = jsonStr(html, 'videoSrcHevc');
-  const signed = videoObjectContentUrl(html);
-  let src = '';
-  if (src0 && /\/cshort\//i.test(src0)) src = hevc;
-  else if (src0 && /auth_key=/i.test(src0)) src = src0;
-  else if (signed && /\.m3u8/i.test(signed) && /auth_key=/i.test(signed)) src = signed;
-  else if (hevc && /auth_key=/i.test(hevc)) src = hevc;
-  else src = src0 || hevc;
+  const src = selectPlaySrc(html);
   if (src && /^https?:\/\//i.test(src)) {
     if (/\.m3u8(\?|#|$)/i.test(src)) {
-      const proxy = proxyUrl(reqIn, '/proxy/m3u8', src, pageUrl);
+      const proxy = proxyUrl(reqIn, src, pageUrl);
       return { parse: 0, url: proxy || src, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
     }
     return { parse: 0, url: src, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
@@ -428,7 +459,11 @@ async function search(reqIn) {
 
 // ---------- 播单改写代理（2026-11-04：分片/密钥必带 auth_key，播放器丢签即 403；
 // 播单与分片/密钥一律走蜘蛛本地代理，播放器不再直触带签第三方地址。仿 ero 先例的
-// /proxy/m3u8 路由，但分片/密钥改为字节透传而非 302（302 回到带签地址等于没修））
+// /proxy/m3u8 路由，但分片/密钥改为字节透传而非 302（302 回到带签地址等于没修）
+// 2026-11-04 round2：代理地址改无查询串路径段形式（播放器丢查询串即旧 ?u=&r= 代理 400），
+// 改写后的分片/密钥地址改路径绝对形式、沿用请求自身的 spider 前缀，不再硬拼 http://Host
+// （旧写法与播单 js2p scheme 不一致，播放器走不通 http 本地地址即分片全灭）。
+// 旧 ?u=&r= 格式仍保留兼容。
 function b64url(s) {
   try {
     return Buffer.from(String(s), 'utf8').toString('base64')
@@ -439,38 +474,46 @@ function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
 // 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 ero 先例）
-function proxyUrl(reqIn, path, targetUrl, referer) {
+// round2: 路径段形式，无查询串：{dynamic}{prefix}/proxy/{b64url 目标}/{b64url referer}
+// referer 为空时用 '-' 占位，避免尾段为空导致路径解析歧义
+function proxyUrl(reqIn, targetUrl, referer) {
   try {
     const server = reqIn?.server;
     const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
     const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+    return `${dynamic}${prefix}/proxy/${b64url(targetUrl)}/${b64url(referer || '-')}`;
   } catch (e) { return ''; }
 }
 async function fetchText(url, referer) {
-  try {
-    const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Referer': referer || HOST },
-      timeout: 20000,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-      validateStatus: () => true,
-    });
-    const text = typeof r.data === 'string' ? r.data : '';
-    if (r.status >= 200 && r.status < 300 && text) return text;
-  } catch (e) { /* 落空走 302 降级 */ }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST },
+        timeout: 20000,
+        responseType: 'text',
+        transformResponse: [(d) => d],
+        validateStatus: () => true,
+      });
+      const text = typeof r.data === 'string' ? r.data : '';
+      if (r.status >= 200 && r.status < 300 && text) return text;
+    } catch (e) { /* 重试，落空走 302 降级 */ }
+    if (attempt < 2) await sleep(600);
+  }
   return '';
 }
 async function fetchBytes(url, referer) {
-  try {
-    const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Referer': referer || HOST },
-      timeout: 30000,
-      responseType: 'arraybuffer',
-      validateStatus: () => true,
-    });
-    if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
-  } catch (e) { /* 落空走 302 降级 */ }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST },
+        timeout: 30000,
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+    } catch (e) { /* 重试，落空走 302 降级 */ }
+    if (attempt < 2) await sleep(600);
+  }
   return null;
 }
 function contentTypeFor(url) {
@@ -490,7 +533,7 @@ function rewriteProxy(raw, playlistUrl, selfBase, referer) {
         return line.replace(/URI="([^"]+)"/g, (all, uri) => {
           try {
             const abs = new URL(uri, playlistUrl).toString();
-            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}"`;
+            return `URI="${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}"`;
           } catch (e) { return all; }
         });
       }
@@ -498,30 +541,66 @@ function rewriteProxy(raw, playlistUrl, selfBase, referer) {
     }
     try {
       const abs = new URL(s, playlistUrl).toString();
-      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}`;
     } catch (e) { return line; }
   });
   return out.join('\n');
 }
-// GET /proxy/m3u8?u={b64url 地址}&r={b64url referer}：m3u8 走改写，分片/密钥/初始化段走字节透传
+// 代理入口（两种地址格式都接受）：
+// 新格式（round2）：/proxy/{b64url 目标}/{b64url referer}，无查询串；
+// 旧格式（兼容）：/proxy/m3u8?u={b64url}&r={b64url}。
+// m3u8 走改写，分片/密钥/初始化段走字节透传；
+// 改写后的分片/密钥地址取请求路径自身的 spider 前缀（路径绝对形式），
+// 播放器按播单地址的 origin 解析，正好回到同一本地代理，不再硬拼 http://Host。
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  // 新格式：从路径段取（fastify 通配符 params['*']，或直接解析原始路径）
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
   let target = '';
   let referer = HOST;
   try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
   } catch (e) { reply.code(400).send('bad u'); return; }
   if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  // 改写基址：请求路径中 '/proxy/' 之前的部分即 spider 前缀（如 /spider/py_porncgw/3）
+  let selfBase = '/spider/' + KEY + '/3';
+  try {
+    const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+    const pi = rawPath.indexOf('/proxy/');
+    if (pi > 0) selfBase = rawPath.slice(0, pi);
+  } catch (e) { /* 用默认前缀 */ }
   try {
     if (/\.m3u8(\?|#|$)/i.test(target)) {
-      const raw = await fetchText(target, referer);
+      let raw = await fetchText(target, referer);
+      // 自愈：播单上游失败时，用 referer 详情页现取新鲜签名播单重试一次
+      // （签名有时效；详情页 referer 形如站内 /video/N/ 或 /drama/N/M/）
+      if ((!raw || !raw.includes('#EXTM3U'))
+        && referer && referer.indexOf(HOST) === 0
+        && /\/(video|drama)\/\d+(?:\/\d+)?\//.test(referer)) {
+        try {
+          const dHtml = await getHtml(referer, HOST + '/');
+          const fresh = selectPlaySrc(dHtml);
+          if (fresh && /\.m3u8/i.test(fresh) && fresh !== target) {
+            target = fresh;
+            raw = await fetchText(target, referer);
+          }
+        } catch (e) { /* 自愈失败则走 302 */ }
+      }
       if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
-      const host = request.headers && request.headers.host;
-      const selfBase = host
-        ? `http://${host}/spider/${KEY}/3`
-        : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
       reply.header('Content-Type', 'application/vnd.apple.mpegurl');
       reply.header('Cache-Control', 'no-cache');
       reply.send(rewriteProxy(raw, target, selfBase, referer));
@@ -546,6 +625,7 @@ export default function createSpider() {
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
+      fastify.get('/proxy/*', m3u8Proxy);
       fastify.get('/proxy/m3u8', m3u8Proxy);
       fastify.post('/search', search);
     },
