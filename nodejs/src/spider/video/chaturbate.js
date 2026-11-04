@@ -36,10 +36,20 @@ import req from '../../util/req.js';
 //       失败、继续走下一腿（原先会静默回空且不再试直连）。超时维持 8s/8s 不变。
 // 搜索: 站方 roomlist 的 keywords 参数即站内搜索 (实测部分匹配用户名, total 上限 500), 直接复用。
 
+// 2026-11-04 round3（用户确认用自己的 affiliate 码 ezKE2）：列表源改走官方
+// affiliate API（chaturbate.com/affiliates/api/onlinerooms/?format=json&wm=ezKE2）。
+// 原因：旧 room-list API 在设备上两腿皆死（Worker 腿手机侧拒绝、直连腿 bot 墙）；
+// affiliate 接口是给联盟方服务器拉数据的 feed，VM 实测 200 + 约 8600 房。
+// 关键差异：该接口忽略 gender/limit/offset/tag 参数、恒回全量（约 11MB），故本
+// 蜘蛛一次拉取后内存缓存 120s、本地按性别/地区/标签/年纪/新人/关键词过滤分页；
+// 列表只留 current_show=public 的房（private/hidden/away 播不了）；地区按国家码
+// 映到 AS/NA/SA/ER/O（无国家码的房不进地区分类）；游戏/展示两类该 feed 无字段，
+// 已从分类里去掉（空分类不如没有）；搜索只匹配用户名 + 房间标题。
+// 详情/播放不动：仍走 ctx API（Worker 优先 + 直连兜底）取 hls_source + 本地裁档代理。
+// 注意：wm=ezKE2 是用户自己的 affiliate 跟踪码（用户 23:23 确认使用），会出现在公开仓库蜘蛛文件里。
 const KEY = 'py_chaturbate';
 const NAME = 'Chaturbate';
 const HOST = 'https://chaturbate.com';
-const API = HOST + '/api/ts/roomlist/room-list/';
 const CTX_API = HOST + '/api/chatvideocontext/';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 const REFERER = HOST + '/';
@@ -76,8 +86,6 @@ const CATS = [
   { type_id: 'r:O', type_name: '其他地区' },
   { type_id: 'gr:f:AS', type_name: '亚洲女生' },
   { type_id: 'new', type_name: '新人' },
-  { type_id: 'gaming', type_name: '游戏' },
-  { type_id: 'exhib', type_name: '展示' },
   { type_id: 'age:18:22', type_name: '18-21岁' },
   { type_id: 'age:20:31', type_name: '20-30岁' },
   { type_id: 'age:30:51', type_name: '30-50岁' },
@@ -176,29 +184,103 @@ async function fetchJson(url) {
 function roomToVod(r) {
   const marks = [];
   if (r.is_new) marks.push('新人');
-  if (r.is_gaming) marks.push('游戏');
+  if (r.is_hd) marks.push('高清');
   const remarks = `${r.num_users || 0}人观看${marks.length ? ' · ' + marks.join(' · ') : ''}`;
   return {
     vod_id: t(r.username),
     vod_name: t(r.username),
-    vod_pic: t(r.img),
+    vod_pic: t(r.image_url),
     vod_remarks: remarks,
   };
 }
 
-// params: 已解码的筛选键值 (genders/regions/hashtags/from_age/to_age/new_cams/gaming/exhib/keywords)
+// ---------- affiliate 列表（round3） ----------
+const AFF_API = 'https://chaturbate.com/affiliates/api/onlinerooms/?format=json&wm=ezKE2';
+const AFF_TIMEOUT = 20000;
+const AFF_CACHE_TTL = 120000;
+let affCache = null; // { at, rooms } —— 全量约 11MB，一次拉取后缓存，分页不再重复拉
+// 国家码 -> 地区分类（标准大洲归属；无国家码的房不进地区分类）
+const REGION_OF = {
+  BD: 'AS', CN: 'AS', HK: 'AS', IN: 'AS', JP: 'AS', KR: 'AS', KZ: 'AS', KG: 'AS',
+  MY: 'AS', NP: 'AS', PH: 'AS', PK: 'AS', TH: 'AS', VN: 'AS',
+  CA: 'NA', CR: 'NA', DO: 'NA', HN: 'NA', HT: 'NA', MX: 'NA', US: 'NA',
+  AR: 'SA', BR: 'SA', CL: 'SA', CO: 'SA', EC: 'SA', PE: 'SA', VE: 'SA',
+  AM: 'ER', AT: 'ER', BE: 'ER', BG: 'ER', CH: 'ER', CZ: 'ER', DE: 'ER', ES: 'ER',
+  FI: 'ER', FR: 'ER', GB: 'ER', HU: 'ER', IE: 'ER', IS: 'ER', IT: 'ER', MD: 'ER',
+  NL: 'ER', NO: 'ER', PL: 'ER', PT: 'ER', RO: 'ER', RS: 'ER', SK: 'ER', TR: 'ER',
+  UA: 'ER',
+  AU: 'O', EG: 'O', KE: 'O', LS: 'O', MG: 'O', NG: 'O', ZA: 'O',
+};
+
+// 拉全量 affiliate 房间（只留公开房 + 展示必需字段）；失败时用过期缓存顶一下，
+// 实在没有才回空。affiliate 接口不做 bot 墙、直连即可，不走 list Worker。
+async function fetchAffRooms() {
+  const now = Date.now();
+  if (affCache && now - affCache.at < AFF_CACHE_TTL) return affCache.rooms;
+  try {
+    const { data, status } = await req.get(AFF_API, {
+      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': REFERER },
+      timeout: AFF_TIMEOUT,
+    });
+    const arr = typeof data === 'string' ? JSON.parse(data) : data;
+    if (status === 200 && Array.isArray(arr)) {
+      const rooms = arr
+        .filter(r => r && r.username && r.current_show === 'public')
+        .map(r => ({
+          username: r.username,
+          gender: r.gender || '',
+          tags: Array.isArray(r.tags) ? r.tags : [],
+          country: r.country || '',
+          image_url: r.image_url || '',
+          room_subject: r.room_subject || '',
+          num_users: r.num_users || 0,
+          is_hd: !!r.is_hd,
+          is_new: !!r.is_new,
+          age: (typeof r.age === 'number' ? r.age : null),
+        }));
+      affCache = { at: now, rooms };
+      return rooms;
+    }
+  } catch (e) { /* fall through to stale cache */ }
+  return affCache ? affCache.rooms : [];
+}
+
+function affFilter(rooms, params) {
+  const g = params.genders || '';
+  const rg = params.regions || '';
+  const tag = params.hashtags || '';
+  const fromAge = params.from_age ? parseInt(params.from_age, 10) : null;
+  const toAge = params.to_age ? parseInt(params.to_age, 10) : null;
+  const kw = params.keywords ? String(params.keywords).toLowerCase() : '';
+  return rooms.filter(r => {
+    if (g) {
+      const want = g === 't' ? 's' : g; // affiliate 里跨性别记为 s
+      if (r.gender !== want) return false;
+    }
+    if (rg && REGION_OF[r.country] !== rg) return false;
+    if (tag && !r.tags.includes(tag)) return false;
+    if (params.new_cams && !r.is_new) return false;
+    if (fromAge != null && (r.age == null || r.age < fromAge)) return false;
+    if (toAge != null && (r.age == null || r.age > toAge)) return false;
+    if (kw) {
+      const hay = (r.username + ' ' + (r.room_subject || '')).toLowerCase();
+      if (!hay.includes(kw)) return false;
+    }
+    return true;
+  });
+}
+
+// params: 已解码的筛选键值 (genders/regions/hashtags/from_age/to_age/new_cams/keywords)；
+// gaming/exhib 该 feed 无字段，如实回空。
 async function getRoomsPage(params, page) {
-  const offset = (page - 1) * PAGE_SIZE;
-  const qs = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
-  for (const [k, v] of Object.entries(params || {})) {
-    if (v !== '' && v != null) qs.set(k, String(v));
-  }
-  const d = await fetchJson(`${API}?${qs.toString()}`);
-  if (!d || !Array.isArray(d.rooms)) return { list: [], total: 0 };
-  const list = d.rooms
-    .filter(r => r && r.username && r.current_show === 'public' && !r.has_password)
-    .map(roomToVod);
-  return { list, total: d.total_count || 0 };
+  const p = params || {};
+  if (p.gaming || p.exhib) return { list: [], total: 0 };
+  const rooms = await fetchAffRooms();
+  const filtered = affFilter(rooms, p);
+  const total = filtered.length;
+  const start = (page - 1) * PAGE_SIZE;
+  const list = filtered.slice(start, start + PAGE_SIZE).map(roomToVod);
+  return { list, total };
 }
 
 function parseTid(tid) {
