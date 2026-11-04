@@ -161,6 +161,9 @@ function sleep(ms) {
 }
 function diagErr(e, ms) {
   const sec = (ms / 1000).toFixed(1) + 's';
+  // 诊断版 round2：axios 对 4xx/5xx 也抛错，须先看 e.response.status，否则 403 会被笼统记成抛错。
+  const st = e && e.response && e.response.status;
+  if (st) return st + '/' + sec;
   const msg = String((e && e.message) || e);
   if (/timeout/i.test(msg)) return '超时/' + sec;
   const m = msg.match(/ECONN\w*|ENOTFOUND|EAI_AGAIN/);
