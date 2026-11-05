@@ -562,7 +562,7 @@ async function play(reqIn) {
 
 export default function createSpider() {
   return {
-    meta: { key: 'py_0817hyjx', name: '0817hyjx', type: 3 },
+    meta: { key: 'py_0817hyjx', name: 'AV影社', type: 3 },
     api: async (fastify) => {
       fastify.post('/init', async () => ({}));
       fastify.post('/home', home);
