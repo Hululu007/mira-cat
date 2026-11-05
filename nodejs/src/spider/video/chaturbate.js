@@ -1,9 +1,11 @@
 import req from '../../util/req.js';
 
 // Chaturbate (py_chaturbate) —— 2026-11-05 从 REX lai_chaturbate 2.0.3 完全参照重写，替换旧版蜘蛛。
-// 完全参照：分类、列表、详情、解析、播放地址形态与 REX 2.0.3 一一对应，不加任何额外东西——
-//   无分辨率选单（REX 只锁最高档），无 Worker /api 兜底腿，无 LIST_WORKER 腿，无 jina 腿。
-//   取数只走 req 直连（iPhone UA，与 REX pageHeaders 一致）；App 内无全局 fetch，不用 fetch。
+// 2026-11-05 用户令：任何节点都能播——取数加 Worker /api 兜底（直连先行、失败才走 Worker）。
+//   分类、列表、详情、解析、播放地址形态与 REX 2.0.3 一一对应；无分辨率选单（REX 只锁最高档），无 jina 腿。
+//   直连通时行为与纯 REX 版完全一致；直连失败（非 200/抛错/8s 未回，如非 LA 节点遇 Cloudflare 真人验证）
+//   才走已部署 Worker v9 的 /api（白名单含 chaturbate.com/api/* 与 *.live.mmcdn.com，站方不弹 Worker 出口验证）。
+//   App 内无全局 fetch，不用 fetch。
 // 列表：GET /api/ts/roomlist/room-list/?limit=90&offset=(页-1)*90，筛选与 REX 一致
 //   （genders/regions/hashtags/from_age/to_age/new_cams/gaming/exhib/keywords）。
 // 详情：GET /api/chatvideocontext/{username}/（主）→ 房间页 initialRoomDossier（兜底）。
@@ -22,6 +24,8 @@ const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/6
 const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
 const CB_WORKER = 'https://chaturbate-hls.li768435813.workers.dev';
+const WORKER_API = CB_WORKER + '/api?u=';
+const DIRECT_TIMEOUT_MS = 8000;
 
 const CATS = [
   { type_id: 'all', type_name: '推荐' },
@@ -85,11 +89,23 @@ function pageHeaders() {
   };
 }
 
-// 取文本：只走 req 直连（与 REX 的 Widget.http 直连一致），200 即回正文；否则 ''。
+// 取文本：直连先行（与 REX 的直连一致），直连失败才走 Worker /api 兜底。
+// 直连失败 = 非 200 / 抛错 / 8s 未回（如非 LA 节点遇 Cloudflare 真人验证，
+// 直连拿到的是验证页而非 JSON）。直连通时不走 Worker，行为与纯 REX 版一致。
 // （App 内 req 是 axios：非 2xx 默认抛错走 catch；本函数另验 status，双保险。）
 async function fetchText(url) {
+  const direct = (async () => {
+    try {
+      const r = await req.get(url, { headers: pageHeaders() });
+      if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    } catch (e) { /* fall through to Worker */ }
+    return '';
+  })();
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(''), DIRECT_TIMEOUT_MS));
+  const d = await Promise.race([direct, timeout]);
+  if (d) return d;
   try {
-    const r = await req.get(url, { headers: pageHeaders() });
+    const r = await req.get(WORKER_API + encodeURIComponent(url), { headers: pageHeaders() });
     if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
   } catch (e) { /* ignore */ }
   return '';
@@ -172,7 +188,8 @@ async function category(reqIn) {
 
 // 取房间播放信息 {room_status, room_title, num_viewers, hls_source}；
 // 主通道: /api/chatvideocontext/{username}/ JSON（约 5KB，快）；
-// 兜底: 房间页内嵌 initialRoomDossier（约 195KB HTML，慢；只走直连腿）。
+// 兜底: 房间页内嵌 initialRoomDossier（约 195KB HTML，慢；房间页不在 Worker 白名单内，
+// 此路直连失败即空——但主通道 CTX 经 Worker 可通，故兜底很少被需要）。
 // 房间不存在/已下线且无任何信息时返回 null。
 async function getDossier(username) {
   const j = await fetchJson(CTX_API + encodeURIComponent(username) + '/');
