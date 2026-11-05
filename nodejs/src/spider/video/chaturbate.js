@@ -11,6 +11,8 @@ import req from '../../util/req.js';
 //   （genders/regions/hashtags/from_age/to_age/new_cams/gaming/exhib/keywords）。
 // 详情：GET /api/chatvideocontext/{username}/（主）→ 房间页 initialRoomDossier（兜底）。
 // 播放：play 内现拉现解析（dossier + 主清单，防主清单 session token 过期），双线：
+//   2026-11-05 LA 真机双线转圈修法：主清单取数改 Worker 优先（fetchTextWorkerFirst），
+//   其余（列表/详情/dossier/双线地址形态）一律不动；REX 已定版（模块 2.0.3 + Worker v10）不动。
 //   音画双轨 = Worker /master（aw=1：音视频双轨均经 /m；配已部署 Worker v8）；纯视频轨 = Worker /m。
 //   detail 只对公开房出线；非公开/下线房不出播放线（同 REX 不出 videoUrl），避免空地址无限转圈。
 // 分类 48 个，与 REX 2.0.3 的精选/地区/年龄/标签完全一致（顺序亦一致）。
@@ -117,6 +119,32 @@ async function fetchText(url) {
   })();
   const wtimeout = new Promise((resolve) => setTimeout(() => resolve(''), WORKER_TIMEOUT_MS));
   return Promise.race([viaWorker, wtimeout]);
+}
+
+// 主清单取数专用：Worker 优先（直连兜底）。2026-11-05 LA 真机：列表能出（直连通）、
+//   详情能开（dossier 通），但双线转圈——主清单直连（edge mmcdn）疑在手机蜘蛛 req 上
+//   挂住/被拦，而 Worker /api 从 VM 实测能拉主清单 200。故播单解析先走 Worker（8s），
+//   直连只作 3s 兜底；列表/详情仍直连优先，不动。
+async function fetchTextWorkerFirst(url) {
+  const viaWorker = (async () => {
+    try {
+      const r = await req.get(WORKER_API + encodeURIComponent(url), { headers: pageHeaders() });
+      if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    } catch (e) { /* fall through to direct */ }
+    return '';
+  })();
+  const wtimeout = new Promise((resolve) => setTimeout(() => resolve(''), WORKER_TIMEOUT_MS));
+  const w = await Promise.race([viaWorker, wtimeout]);
+  if (w) return w;
+  const direct = (async () => {
+    try {
+      const r = await req.get(url, { headers: pageHeaders() });
+      if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    } catch (e) { /* ignore */ }
+    return '';
+  })();
+  const timeout = new Promise((resolve) => setTimeout(() => resolve(''), DIRECT_TIMEOUT_MS));
+  return Promise.race([direct, timeout]);
 }
 
 async function fetchJson(url) {
@@ -238,7 +266,7 @@ function absEdge(u, masterUrl) {
 // 手机侧拉主清单，裁出最高 BANDWIDTH 一档视频 + 其 AUDIO 组默认音频（与 REX 一致）。
 // 返回 { vAbs, aAbs, inf } 或 null（任一步失败）。
 async function parseMaster(hlsSource) {
-  const text = await fetchText(hlsSource);
+  const text = await fetchTextWorkerFirst(hlsSource);
   if (!text || text.indexOf('#EXTM3U') !== 0) return null;
   const lines = text.split('\n');
   const audios = [];
