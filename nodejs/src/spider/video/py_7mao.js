@@ -10,9 +10,9 @@ import req from '../../util/req.js';
 const HOST = 'https://7maoduanju.com';
 const API = HOST + '/api/toc/v1';
 // 取数三腿：主站直连 → www 同源（实测同后端、同数据）→ Worker 兜底。
-// Worker 待用户部署：https://7mao.li768435813.workers.dev（根回 7mao fetch ok），未部署前该腿失败即跳过。
+// Worker 待用户部署：https://7mao-fetch.li768435813.workers.dev（根回 7mao fetch ok），未部署前该腿失败即跳过。
 const API_HOSTS = [HOST, 'https://www.7maoduanju.com'];
-const FETCH_WORKER = 'https://7mao.li768435813.workers.dev';
+const FETCH_WORKER = 'https://7mao-fetch.li768435813.workers.dev';
 const B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 function b64url(s) {
   const bytes = [];

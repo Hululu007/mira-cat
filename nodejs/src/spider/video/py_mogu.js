@@ -13,9 +13,9 @@ import req from '../../util/req.js';
 const HOST = 'https://moguds.cc';
 const CDN = 'https://dfdf.tjacq.com';
 const ALT_CDN = 'https://d1uy7itup9paqh.cloudfront.net';
-// 取数 Worker（2026-11-05 待用户部署：https://mogu.li768435813.workers.dev，根回 mogu fetch ok；
+// 取数 Worker（2026-11-05 待用户部署：https://mogu-fetch.li768435813.workers.dev，根回 mogu fetch ok；
 // 未部署前 Worker 腿取数失败即回落，行为与现在一致）。直连优先，Worker 只作 CF 挑战/拦截时的兜底。
-const FETCH_WORKER = 'https://mogu.li768435813.workers.dev';
+const FETCH_WORKER = 'https://mogu-fetch.li768435813.workers.dev';
 // 纯 JS b64url（与 REX 版同一实现；App 内 Buffer 可用，但与 REX 共用一份更稳）
 const B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 function b64url(s) {
