@@ -75,24 +75,26 @@ async function getHtml(path) {
   if (url.startsWith('//')) url = 'https:' + url;
   else if (url.startsWith('/')) url = HOST + url;
   const headers = { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
-  // Worker 优先（手机直连被拦时走 Worker）；round2：单次超时提到 30s、Worker 腿 3 次重试、
-  //   回包强制 String 化、挑战页视为失败（此前单次 20s、无重试、严格 string 校验，
-  //   手机慢网下易超时丢包或把挑战页当成功回空；直连兜底保留，Worker 未部署时行为不变）。
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const r = await req.get(viaWorker(url), { headers, timeout: 30000 });
-      const body = (r && r.data != null) ? String(r.data) : '';
-      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
-    } catch (e) { /* ignore, retry */ }
-    if (attempt < 2) await sleep(600);
-  }
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await req.get(url, { headers, timeout: 30000 });
-      const body = (r && r.data != null) ? String(r.data) : '';
-      if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
-    } catch (e) { /* ignore, retry */ }
-    if (attempt < 1) await sleep(600);
+  // 取数：Worker 优先（手机直连被拦时走 Worker），直连兜底；每腿单次、有界返回。
+  // 2026-11-05 LA 鉴别：LA 节点也空，排除 IP/验证问题；旧版 Worker 3×30s +
+  //   直连 2×30s，挂住最长约 150 秒才回空，超 App 蜘蛛超时致空。故 Worker 8s、
+  //   直连 3s 双界，总耗时至多约 11 秒；挑战页仍视为失败（其余逻辑不变）。
+  const legs = [
+    { u: viaWorker(url), ms: 8000 },
+    { u: url, ms: 3000 },
+  ];
+  for (const leg of legs) {
+    const p = (async () => {
+      try {
+        const r = await req.get(leg.u, { headers, timeout: leg.ms });
+        const body = (r && r.data != null) ? String(r.data) : '';
+        if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
+      } catch (e) { /* ignore, next leg */ }
+      return '';
+    })();
+    const to = new Promise((resolve) => setTimeout(() => resolve(''), leg.ms));
+    const body = await Promise.race([p, to]);
+    if (body) return body;
   }
   return '';
 }
