@@ -1,8 +1,8 @@
 import req from '../../util/req.js';
 
 // 24JAV https://www4.24-jav.com/ —— WordPress 站（泰语界面，日语 AV）
-// 帖子 = /<番号小写>/（如 /adn-814/）；播放 = 详情页 mee18player iframe 的 md5 拼确定性 master 链
-//   https://mee18player.com/hlsr2/<md5>/master（VM 实测 4 个标题均直接返回 1080p 单档 master 播单，
+// 帖子 = /<番号小写>/（如 /adn-814/）；播放 = 详情页 mee 播放器 iframe 的 token 拼确定性 master 链
+//   https://<mee18player.com|meeplayer.com>/hlsr2/<40位hex>/master（VM 实测 4 个标题均直接返回 1080p 单档 master 播单，
 //   无需调 player 的 /api/video + /api/resolve；该 API 在 VM 侧数次调用后回 403 Forbidden，属上游限流，
 //   master 直链不受影响）。播单 variant 段为 .jpg 后缀分片（站方自家播放器同样如此），属 HLS 正常形态。
 // 分类：首页实测 70 个 /genre/<slug>/ + 菜单/归档实测的 /category/subthai|uncensored|censored/
@@ -13,7 +13,6 @@ import req from '../../util/req.js';
 // 字幕：与模板同一套 Layer A（迅雷 > 迅雷看看 > SubtitleCat），仅番号条目接芯；单码率 1080p，不编假档位。
 const HOST = 'https://www4.24-jav.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
-const PLAYER_HOST = 'https://mee18player.com';
 
 function unescapeHtml(s) {
   return String(s || '')
@@ -108,14 +107,17 @@ function parseCards(html) {
   return out;
 }
 
-// 详情页 mee18player iframe：https://mee18player.com/play/<32位md5>
+// 详情页 mee 播放器 iframe：https://<mee18player.com|meeplayer.com>/play/<40位hex>
+// （2026-11-05 实测 token 为 40 位 hex，旧口径称 32 位 md5，只取前 32 位拼 master 会 404；
+//   另有同款 meeplayer.com，master 按 iframe 的 host 拼。）
 function extractMeeMd5(html) {
-  const m = String(html || '').match(/mee18player\.com\/play\/([a-f0-9]{32})/i);
-  return m ? m[1].toLowerCase() : '';
+  const m = String(html || '').match(/https?:\/\/(mee18player\.com|meeplayer\.com)\/play\/([a-f0-9]{32,64})/i);
+  if (!m) return null;
+  return { host: m[1].toLowerCase(), token: m[2].toLowerCase() };
 }
 
-function masterUrl(md5) {
-  return PLAYER_HOST + '/hlsr2/' + md5 + '/master';
+function masterUrl(mee) {
+  return 'https://' + (mee && mee.host ? mee.host : 'mee18player.com') + '/hlsr2/' + mee.token + '/master';
 }
 
 // 解析 master 播单的 STREAM-INF 档位（RESOLUTION + 下一行 variant URL）；失败返回空数组。
@@ -535,12 +537,12 @@ async function detail(reqIn) {
     const im = html.match(/<img[^>]+class="[^"]*entry-image[^"]*"[^>]+src="([^"]+)"/i);
     if (im) posterPic = normUrl(im[1].trim());
   }
-  const md5 = extractMeeMd5(html);
+  const mee = extractMeeMd5(html);
   let playUrl = '';
-  if (md5) {
+  if (mee) {
     // 优先读 master 播单拆真实档位（实测均为单档 1080p）；读不到则直接给 master 单档。
-    const variants = parseMasterVariants(await getText(masterUrl(md5)));
-    const opts = variants.length ? variants : [{ label: '正片', url: masterUrl(md5) }];
+    const variants = parseMasterVariants(await getText(masterUrl(mee)));
+    const opts = variants.length ? variants : [{ label: '正片', url: masterUrl(mee) }];
     playUrl = opts.map((o) => o.label + '$' + durl + '@@' + o.url).join('#');
   }
   return {
@@ -548,7 +550,7 @@ async function detail(reqIn) {
       vod_id: rawId,
       vod_name: mainTitle,
       vod_pic: posterPic,
-      vod_remarks: md5 ? '1080p' : '',
+      vod_remarks: mee ? '1080p' : '',
       vod_content: '24JAV',
       vod_play_from: '24JAV',
       vod_play_url: playUrl,
@@ -568,8 +570,8 @@ async function play(reqIn) {
   if (!target) {
     // 自愈：重取详情页再提 md5 拼 master；仍无则走网页兜底，绝不返回 parse:0 空 url。
     if (durl) {
-      const md5 = extractMeeMd5(await getHtml(durl.startsWith('http') ? durl.slice(HOST.length) : durl));
-      if (md5) target = masterUrl(md5);
+      const mee = extractMeeMd5(await getHtml(durl.startsWith('http') ? durl.slice(HOST.length) : durl));
+      if (mee) target = masterUrl(mee);
     }
     if (!target) return { parse: 1, url: durl || HOST + '/' };
   }
