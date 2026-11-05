@@ -3,8 +3,9 @@ import req from '../../util/req.js';
 // Chaturbate (py_chaturbate) —— 2026-11-05 从 REX lai_chaturbate 2.0.3 完全参照重写，替换旧版蜘蛛。
 // 2026-11-05 用户令：任何节点都能播——取数加 Worker /api 兜底（直连先行、失败才走 Worker）。
 //   分类、列表、详情、解析、播放地址形态与 REX 2.0.3 一一对应；无分辨率选单（REX 只锁最高档），无 jina 腿。
-//   直连通时行为与纯 REX 版完全一致；直连失败（非 200/抛错/8s 未回，如非 LA 节点遇 Cloudflare 真人验证）
-//   才走已部署 Worker v9 的 /api（白名单含 chaturbate.com/api/* 与 *.live.mmcdn.com，站方不弹 Worker 出口验证）。
+//   直连通时行为与纯 REX 版完全一致；直连失败（非 200/抛错/3s 未回，如非 LA 节点遇 Cloudflare 真人验证）
+//   才走已部署 Worker v9 的 /api（白名单含 chaturbate.com/api/* 与 *.live.mmcdn.com，站方不弹 Worker 出口验证；
+//   Worker 腿另有 8s 界，取数总有界返回，不会无限挂住）。
 //   App 内无全局 fetch，不用 fetch。
 // 列表：GET /api/ts/roomlist/room-list/?limit=90&offset=(页-1)*90，筛选与 REX 一致
 //   （genders/regions/hashtags/from_age/to_age/new_cams/gaming/exhib/keywords）。
@@ -25,7 +26,8 @@ const REFERER = HOST + '/';
 const PAGE_SIZE = 90;
 const CB_WORKER = 'https://chaturbate-hls.li768435813.workers.dev';
 const WORKER_API = CB_WORKER + '/api?u=';
-const DIRECT_TIMEOUT_MS = 8000;
+const DIRECT_TIMEOUT_MS = 3000;
+const WORKER_TIMEOUT_MS = 8000;
 
 const CATS = [
   { type_id: 'all', type_name: '推荐' },
@@ -90,8 +92,10 @@ function pageHeaders() {
 }
 
 // 取文本：直连先行（与 REX 的直连一致），直连失败才走 Worker /api 兜底。
-// 直连失败 = 非 200 / 抛错 / 8s 未回（如非 LA 节点遇 Cloudflare 真人验证，
+// 直连失败 = 非 200 / 抛错 / 3s 未回（如非 LA 节点遇 Cloudflare 真人验证，
 // 直连拿到的是验证页而非 JSON）。直连通时不走 Worker，行为与纯 REX 版一致。
+// 2026-11-05 手机实测“转一会儿才空”：直连在手机上是挂住而非快败，8s 直连超时 +
+// Worker 无界等待会超出 App 蜘蛛超时致空，故直连 3s、Worker 8s 双界，取数总有界返回。
 // （App 内 req 是 axios：非 2xx 默认抛错走 catch；本函数另验 status，双保险。）
 async function fetchText(url) {
   const direct = (async () => {
@@ -104,11 +108,15 @@ async function fetchText(url) {
   const timeout = new Promise((resolve) => setTimeout(() => resolve(''), DIRECT_TIMEOUT_MS));
   const d = await Promise.race([direct, timeout]);
   if (d) return d;
-  try {
-    const r = await req.get(WORKER_API + encodeURIComponent(url), { headers: pageHeaders() });
-    if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
-  } catch (e) { /* ignore */ }
-  return '';
+  const viaWorker = (async () => {
+    try {
+      const r = await req.get(WORKER_API + encodeURIComponent(url), { headers: pageHeaders() });
+      if (r && r.status === 200 && r.data != null) return typeof r.data === 'string' ? r.data : JSON.stringify(r.data);
+    } catch (e) { /* ignore */ }
+    return '';
+  })();
+  const wtimeout = new Promise((resolve) => setTimeout(() => resolve(''), WORKER_TIMEOUT_MS));
+  return Promise.race([viaWorker, wtimeout]);
 }
 
 async function fetchJson(url) {
