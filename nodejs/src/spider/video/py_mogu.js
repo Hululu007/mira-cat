@@ -1,6 +1,10 @@
 import req from '../../util/req.js';
 
 // 蘑菇视频 https://moguds.cc —— 视频站（由用户提供的 upload-2.js 移植）
+// 2026-11-05 修复：详情页站方已改版（#article-videos 消失，播放地址改走
+// window.__ARCHIVE_PLAYER__.rawPath + CDN 基址），旧解析全线取不到播单；
+// 另修 URL 归一化（cdn_lines 里 cloudfront 写成 https:/// 三斜杠）；
+// 列表/详情取数加 Worker 兜底（直连 → mogu Worker /f/，未部署前行为不变）。
 // 分类：16 个大区作顶级分类，各区细分（cate3～cate288）走筛选卡片 filters.sub
 // 列表：<a href="/video/\d+/"> 卡片，封面走 dfdf.tjacq.com（实测无 Referer 也 200，无需 @ 后缀）
 // 详情：#article-videos data-url + cdn_lines 组直链（首选 dfdf，备选 cloudfront）；播放直链 parse:0
@@ -9,6 +13,36 @@ import req from '../../util/req.js';
 const HOST = 'https://moguds.cc';
 const CDN = 'https://dfdf.tjacq.com';
 const ALT_CDN = 'https://d1uy7itup9paqh.cloudfront.net';
+// 取数 Worker（2026-11-05 待用户部署：https://mogu.li768435813.workers.dev，根回 mogu fetch ok；
+// 未部署前 Worker 腿取数失败即回落，行为与现在一致）。直连优先，Worker 只作 CF 挑战/拦截时的兜底。
+const FETCH_WORKER = 'https://mogu.li768435813.workers.dev';
+// 纯 JS b64url（与 REX 版同一实现；App 内 Buffer 可用，但与 REX 共用一份更稳）
+const B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function b64url(s) {
+  const bytes = [];
+  const str = String(s || '');
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 128) bytes.push(c);
+    else if (c < 2048) { bytes.push(192 | (c >> 6), 128 | (c & 63)); }
+    else if (c < 55296 || c >= 57344) { bytes.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63)); }
+    else {
+      i++;
+      const c2 = str.charCodeAt(i);
+      const cp = 65536 + (((c & 1023) << 10) | (c2 & 1023));
+      bytes.push(240 | (cp >> 18), 128 | ((cp >> 12) & 63), 128 | ((cp >> 6) & 63), 128 | (cp & 63));
+    }
+  }
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = i + 1 < bytes.length ? bytes[i + 1] : 0, b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out += B64T[b0 >> 2] + B64T[((b0 & 3) << 4) | (b1 >> 4)] + (i + 1 < bytes.length ? B64T[((b1 & 15) << 2) | (b2 >> 6)] : '=') + (i + 2 < bytes.length ? B64T[b2 & 63] : '=');
+  }
+  return out.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function viaWorker(url) {
+  return FETCH_WORKER.replace(/\/+$/, '') + '/f/' + b64url(url);
+}
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 const ZONES = [
@@ -59,6 +93,8 @@ function absUrl(u, host) {
 function normUrl(u) {
   let s = String(u || '').trim();
   if (!s) return '';
+  // 站方 cdn_lines 常写 https:/dfdf（单斜杠）或 https:///cloudfront（三斜杠），一律压成标准 https://
+  s = s.replace(/^(https?:)\/*/, '$1//');
   s = s.replace(/^(https?:)\/([^/])/, '$1//$2');
   if (s.startsWith('dfdf.tjacq.com/')) s = 'https://' + s;
   s = s.replace('dfdf.tjacq.com', 'd1uy7itup9paqh.cloudfront.net');
@@ -72,18 +108,36 @@ function pickPlayBase(bases) {
   return list[0] || ALT_CDN;
 }
 
-async function getHtml(path) {
-  let url = String(path || '');
-  if (url.startsWith('//')) url = 'https:' + url;
-  else if (url.startsWith('/')) url = HOST + url;
+function isChallengeHtml(html) {
+  const s = String(html || '');
+  if (s.length < 200) return false;
+  return s.includes('Just a moment') || s.includes('cf-browser-verification')
+    || s.includes('Attention Required') || s.includes('__CF$cv$params')
+    || s.includes('challenge-platform') || s.includes('cf-challenge')
+    || s.includes('developers.cloudflare.com');
+}
+
+async function fetchHtmlOnce(url, timeoutMs) {
   try {
     const r = await req.get(url, {
       headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
-      timeout: 20000,
+      timeout: timeoutMs || 20000,
     });
     if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
   } catch (e) { return ''; }
+}
+
+async function getHtml(path) {
+  let url = String(path || '');
+  if (url.startsWith('//')) url = 'https:' + url;
+  else if (url.startsWith('/')) url = HOST + url;
+  const direct = await fetchHtmlOnce(url, 20000);
+  if (direct && !isChallengeHtml(direct)) return direct;
+  // 直连空回或被 CF 挑战页拦截时走 Worker 兜底（Worker 未部署则仍为空，与现在一致）
+  const via = await fetchHtmlOnce(viaWorker(url), 20000);
+  if (via && !isChallengeHtml(via)) return via;
+  return direct && !isChallengeHtml(direct) ? direct : '';
 }
 
 // 字幕聚合芯的取数原语：统一回 {status, body}；设备 axios 走配置调用
@@ -473,7 +527,7 @@ function parseCdnLines(html) {
     try {
       const arr = JSON.parse(m[1].replace(/\\\//g, '/'));
       for (const it of arr || []) {
-        const b = String((it && it.cdnLine) || '').replace(/\/+$/, '').replace(/^(https?:)\/([^\/])/, '$1//$2');
+        const b = normUrl(String((it && it.cdnLine) || '').replace(/\/+$/, ''));
         if (b.startsWith('http') && !bases.includes(b)) bases.push(b);
       }
     } catch (e) { /* ignore */ }
@@ -523,6 +577,44 @@ function extractPlayStream(html) {
   m = html.match(/https?:\/\/[^\s"'$<>]+\.mp4[^\s"'$<>]*/i);
   if (m) return { url: m[0].replace(/\\u002F/g, '/').replace(/\\\//g, '/'), viaDataUrl: false };
   return { url: '', viaDataUrl: false };
+}
+
+// 2026-11-05 站方详情页改版：#article-videos 已消失，播放器改由
+// window.__ARCHIVE_PLAYER__ = {"rawPath":"\/video\/<日期>\/<id>\/<hash>.m3u8",
+//   "vttFile":"","posterImg":"https:\/dfdf...\/image\/...","cdnLine":"https:\/dfdf.tjacq.com",...}
+// 提供播单相对路径；rawPath 接 CDN 基址（优先 cdn_lines 的 cloudfront 线）即为播单。
+function unescJsonStr(s) {
+  return String(s || '').replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\"/g, '"');
+}
+
+function extractArchivePlayer(html) {
+  const out = { rawPath: '', cdnLine: '', posterImg: '', vttFile: '' };
+  const m = String(html || '').match(/window\.__ARCHIVE_PLAYER__\s*=\s*\{/);
+  if (!m) return out;
+  const seg = String(html || '').slice(m.index, m.index + 4000);
+  const rp = seg.match(/"rawPath"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (rp) out.rawPath = unescJsonStr(rp[1]);
+  const cl = seg.match(/"cdnLine"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (cl) out.cdnLine = unescJsonStr(cl[1]);
+  const pi = seg.match(/"posterImg"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (pi) out.posterImg = unescJsonStr(pi[1]);
+  const vf = seg.match(/"vttFile"\s*:\s*"((?:\\.|[^"\\])*)"/);
+  if (vf) out.vttFile = unescJsonStr(vf[1]);
+  return out;
+}
+
+function archivePlayUrl(html) {
+  const ap = extractArchivePlayer(html);
+  if (!ap.rawPath) return '';
+  let raw = ap.rawPath.trim();
+  if (!raw) return '';
+  if (raw.startsWith('http')) return normUrl(raw);
+  if (raw.startsWith('//')) return normUrl('https:' + raw);
+  const bases = parseCdnLines(html);
+  let base = pickPlayBase(bases);
+  if (ap.cdnLine && !bases.some((b) => b.includes('cloudfront'))) base = normUrl(ap.cdnLine);
+  if (!base) base = ALT_CDN;
+  return normUrl(base.replace(/\/+$/, '') + (raw.startsWith('/') ? raw : '/' + raw));
 }
 
 async function home() {
@@ -587,12 +679,15 @@ async function detail(reqIn) {
   let mainTitle = '高清视频';
   if (tM) mainTitle = tM[1].trim().replace(/\s*[-_]\s*蘑菇视频\s*$/i, '').trim() || '高清视频';
   if (mainTitle) subCacheName(durl, mainTitle); // 字幕搜索键优先用真片名
-  const stream = extractPlayStream(html);
-  let playUrl = '';
-  if (stream.viaDataUrl) {
-    playUrl = stream.url;
-  } else if (stream.url) {
-    playUrl = stream.url;
+  // 新版详情优先走 __ARCHIVE_PLAYER__；旧解析（article-videos / 播放变量 / 裸 m3u8）留作兜底
+  let playUrl = archivePlayUrl(html);
+  if (!playUrl) {
+    const stream = extractPlayStream(html);
+    if (stream.viaDataUrl) {
+      playUrl = stream.url;
+    } else if (stream.url) {
+      playUrl = stream.url;
+    }
   }
   if (!playUrl) {
     const v = extractPlayerVarUrl(html, 'player_aaaa') || extractPlayerVarUrl(html, 'player_data');
@@ -608,6 +703,8 @@ async function detail(reqIn) {
     }
   }
   let posterPic = '';
+  const ap0 = extractArchivePlayer(html);
+  if (ap0.posterImg) posterPic = normUrl(ap0.posterImg);
   const dfdf = String(html || '').match(/dfdf\.tjacq\.com\/image\/[^\s"']+/g);
   if (dfdf && dfdf.length) posterPic = normUrl('https://' + dfdf[0]);
   if (!posterPic) {

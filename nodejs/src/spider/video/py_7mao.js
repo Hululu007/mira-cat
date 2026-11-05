@@ -1,10 +1,44 @@
 import req from '../../util/req.js';
 
 // 七猫短剧 https://7maoduanju.com —— JSON API 短剧站（由用户提供的 VIP.py 移植）
+// 2026-11-05 修复：代码与站方 API 在 VM 侧全通（列表/线路/专题/搜索/详情/播单均 200），
+// 手机侧内容仍空，属手机网络到站方 API 不通（非代码回归：本文件自 11-02 后未改动，
+// API 同期未变）。改动：取数改三腿（直连 → www 同源 → 7mao Worker /f/ 兜底），
+// 直连失败/超时即换腿；Worker 待用户部署，未部署前行为与现在一致。
 // 分类：4 个静态 + /categories 动态线路 + /topics 专题（2026-11-03 实测：线路 11 条、专题 4 个）
 // 详情 episodes 优先 seoContentUrl，否则由 mediaKey 组装 7cat-media 直链；播放直链 parse:0
 const HOST = 'https://7maoduanju.com';
 const API = HOST + '/api/toc/v1';
+// 取数三腿：主站直连 → www 同源（实测同后端、同数据）→ Worker 兜底。
+// Worker 待用户部署：https://7mao.li768435813.workers.dev（根回 7mao fetch ok），未部署前该腿失败即跳过。
+const API_HOSTS = [HOST, 'https://www.7maoduanju.com'];
+const FETCH_WORKER = 'https://7mao.li768435813.workers.dev';
+const B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function b64url(s) {
+  const bytes = [];
+  const str = String(s || '');
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 128) bytes.push(c);
+    else if (c < 2048) { bytes.push(192 | (c >> 6), 128 | (c & 63)); }
+    else if (c < 55296 || c >= 57344) { bytes.push(224 | (c >> 12), 128 | ((c >> 6) & 63), 128 | (c & 63)); }
+    else {
+      i++;
+      const c2 = str.charCodeAt(i);
+      const cp = 65536 + (((c & 1023) << 10) | (c2 & 1023));
+      bytes.push(240 | (cp >> 18), 128 | ((cp >> 12) & 63), 128 | ((cp >> 6) & 63), 128 | (cp & 63));
+    }
+  }
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i], b1 = i + 1 < bytes.length ? bytes[i + 1] : 0, b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out += B64T[b0 >> 2] + B64T[((b0 & 3) << 4) | (b1 >> 4)] + (i + 1 < bytes.length ? B64T[((b1 & 15) << 2) | (b2 >> 6)] : '=') + (i + 2 < bytes.length ? B64T[b2 & 63] : '=');
+  }
+  return out.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function viaWorker(url) {
+  return FETCH_WORKER.replace(/\/+$/, '') + '/f/' + b64url(url);
+}
 const MEDIA = 'https://7cat-media.bedfpk.cn';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PAGE = 30;
@@ -26,15 +60,39 @@ function hdr() {
   };
 }
 
-async function api(path) {
+// 拒收 CF/Worker 的 JSON 错误信封（如未部署 Worker 时的 404 {"type":"https://developers.cloudflare.com/...",
+// "title":"Error 1042: Cloudflare Error"}——它能 JSON.parse 成功，须按失败处理，否则详情会把错误标题当剧名。
+function apiJsonOk(d, status) {
+  if (typeof status === 'number' && (status < 200 || status >= 300)) return false;
+  if (d && typeof d === 'object' && typeof d.type === 'string' && d.type.indexOf('http') === 0) return false;
+  return true;
+}
+
+async function apiOnce(url, timeoutMs) {
   try {
-    const r = await req.get(API + path, { headers: hdr(), timeout: 20000 });
+    const r = await req.get(url, { headers: hdr(), timeout: timeoutMs || 8000 });
     const d = r.data;
+    let out = null;
     if (typeof d === 'string') {
-      try { return JSON.parse(d); } catch (e) { return null; }
+      try { out = JSON.parse(d); } catch (e) { return null; }
+    } else {
+      out = d;
     }
-    return d;
+    if (!apiJsonOk(out, r.status)) return null;
+    return out;
   } catch (e) { return null; }
+}
+
+// 三腿取数：主站直连（8s）→ www 同源（8s）→ Worker 兜底（10s）；
+// 任一腿返回合法 JSON 即停；全失败返回 null（上层按空列表处理，与现在一致）。
+async function api(path) {
+  for (const h of API_HOSTS) {
+    const d = await apiOnce(h + '/api/toc/v1' + path, 8000);
+    if (d !== null && d !== undefined) return d;
+  }
+  const w = await apiOnce(viaWorker(API + path), 10000);
+  if (w !== null && w !== undefined) return w;
+  return null;
 }
 
 function vod(j) {
