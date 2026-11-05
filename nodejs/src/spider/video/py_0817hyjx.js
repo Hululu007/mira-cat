@@ -111,9 +111,13 @@ function parseCards(html) {
   let m;
   while ((m = re.exec(String(html || ''))) !== null) {
     const inner = m[1];
-    const hrefM = inner.match(/href=["'](\/cn\/[A-Za-z0-9][^"']*)["']/);
+    // 2026-11-05: 站方卡片 href 改为绝对地址（https://www.0817hyjx.com/cn/xxx），
+    //   只认相对 /cn/ 会漏全部卡片；任意 href 均取 /cn/<slug> 归一为相对地址。
+    const hrefM = inner.match(/href=["']([^"']+)["']/);
     if (!hrefM) continue;
-    const href = hrefM[1];
+    const slugM = hrefM[1].match(/\/cn\/([A-Za-z0-9][^"'?#]*)/);
+    if (!slugM) continue;
+    const href = '/cn/' + slugM[1];
     if (seen.has(href)) continue;
     seen.add(href);
     const imgM = inner.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
