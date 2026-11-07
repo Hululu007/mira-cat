@@ -53,6 +53,24 @@ import req from '../../util/req.js';
 //       FL/DD 等通用线永不返回直链，最终只剩 hls3 直链/嗅探兜底。
 //       v7 探活改走框架 req，fetch 仅作有 fetch 环境的第二通道。
 //       F4 默认线仍直返 Worker /f4、不探活；Worker v2 本体零改动。
+// 播放 (v8, 2026-11-08): 站方改版导致 v7 全线仍转圈（实测坐实，见 REPORT）：
+//       (1) 详情页 #sextb-player 里不再有 iframe（播放器改由 JS 经
+//       POST /ajax/player 注入），extractDefaultEmbed 恒为空；(2) ajax
+//       须带 pt（详情页 window.__pt，32 hex）+ 与该页同会话的
+//       PHPSESSID Cookie，回包 {player_enc, next_pt, next_pk}，player
+//       明文须用 __pk 做 XOR 解密；无 pt → E_TOK_LEN，无/错 Cookie →
+//       E_SID，旧 pt 重用 → E_TOK_MISS；每次成功轮换 next_pt/next_pk。
+//       v7 的 ajax 不带 pt，借线全灭、默认线为空 → play 恒回空地址。
+//       v8：详情页同源抓取令牌+Cookie（一次 GET 的响应即令牌会话，
+//       另起 GET 取 Cookie 会拿到另一会话、必 E_SID——实测坐实），
+//       默认线走 ajax episode=0（站方 player_default 同款），借线
+//       共用令牌链，失效时重取详情页换新令牌重试一次。Worker v2 与
+//       播放地址形态（parse:0 + Worker 直返）一字未动——Worker 腿
+//       已用新解密出的 embed 实测全链通（/f4→/p 1879 片→首分片纯 TS）。
+//       另评估过的换思路方案：本地字节代理（24JAV/蘑菇 v2）解不了
+//       令牌墙（仍须先拿到 embed）、Worker 侧全解（javcc/chaturbate
+//       形态）须用户先部署 v3 且 CF 出口过站方 WAF 未验证、site-fetch
+//       腿白名单无 sextb 且同样解不了令牌墙——均不及 v8 直接。
 // 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist、子列表、每个分片
 //       请求都必须带 Origin: https://f4scdn.com 才能 200（UA-only 403、
 //       Referer 403）。其官方 api/play?ab=0 能拿签名 src，但 src 的列表与
@@ -192,17 +210,46 @@ async function timedFetchPost(url, data, headers, timeoutMs) {
   }
 }
 
+// 最近一次 sextb 页面成功响应的会话信息（与该页 __pt 绑定，ajax 必须同源同 Cookie）：
+// lastSextbCookie = 该响应的 PHPSESSID；lastSextbPageUrl = 该响应的完整 URL。
+// 只认 req 通道（axios 回 response.headers）；fetch 通道拿不到本站 set-cookie，
+// 其 HTML 的会话未知——此时清空，避免拿旧会话 Cookie 去撞新令牌（必 E_SID 且
+// 可能烧掉令牌）。App 运行时无全局 fetch，此分支走不到。
+let lastSextbCookie = '';
+let lastSextbPageUrl = '';
+function stashSextbSession(url, resHeaders) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (!/sextb\.(net|cc)$/.test(host)) return;
+    const sc = resHeaders && (resHeaders['set-cookie'] || resHeaders['Set-Cookie']);
+    if (!sc) return;
+    const arr = Array.isArray(sc) ? sc : [sc];
+    const ck = arr.map((x) => String(x).split(';')[0].trim()).filter(Boolean).join('; ');
+    if (ck) { lastSextbCookie = ck; lastSextbPageUrl = url; }
+  } catch (e) { /* ignore */ }
+}
+
 // 单次取页面 (req 通道 + fetch 通道)，命中拦截页视为失败
 async function rawGet(url, headers, timeoutMs) {
   const to = timeoutMs || 25000;
   // 通道1: 框架 req
   try {
-    const { data, status } = await req.get(url, { headers, timeout: to });
-    if (status === 200 && typeof data === 'string' && !isBlockedPage(data)) return data;
+    const { data, status, headers: resHeaders } = await req.get(url, { headers, timeout: to });
+    if (status === 200 && typeof data === 'string' && !isBlockedPage(data)) {
+      stashSextbSession(url, resHeaders);
+      return data;
+    }
   } catch (e) { /* 换通道2 */ }
   // 通道2: 原生 fetch
   const txt = await timedFetchText(url, headers, to);
-  if (txt && !isBlockedPage(txt)) return txt;
+  if (txt && !isBlockedPage(txt)) {
+    try {
+      if (/sextb\.(net|cc)$/.test(new URL(url).hostname.toLowerCase())) {
+        lastSextbCookie = ''; lastSextbPageUrl = '';
+      }
+    } catch (e) { /* ignore */ }
+    return txt;
+  }
   return '';
 }
 
@@ -274,10 +321,11 @@ async function postJsonFast(durl, body, extra) {
     'X-Requested-With': 'XMLHttpRequest',
     ...(extra || {}),
   };
-  // 通道1: 框架 req
+  // 通道1: 框架 req（validateStatus 全收：站方令牌错回 403 JSON
+  // {error,code:E_TOK_LEN/E_TOK_MISS/E_SID}，调用方须见得到才能换令牌重试）
   try {
-    const { data: res, status } = await req.post(ajaxUrl, data, { headers, timeout: 8000 });
-    if (status === 200 && res != null) {
+    const { data: res, status } = await req.post(ajaxUrl, data, { headers, timeout: 8000, validateStatus: () => true });
+    if (res != null) {
       const s = typeof res === 'string' ? res : JSON.stringify(res);
       if (s && !/Your request was blocked/i.test(s)) return s;
     }
@@ -600,17 +648,88 @@ async function resolveEmbed(embedUrl, durl) {
   return resolveGeneric(embedUrl, durl);
 }
 
-// POST /ajax/player 取某条线路的 embed URL
-async function ajaxEmbed(durl, ep, filmId, extra) {
-  const resp = await postJsonFast(durl, { episode: ep.episode, filmId }, extra);
-  if (!resp) return '';
-  try {
-    const json = JSON.parse(resp);
-    const playerHtml = t(json.player);
-    const em = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
-               playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
-    if (em) return fixUrl(em[1]);
-  } catch (e) { /* ignore */ }
+// 从详情页提取播放令牌（站方新版：window.__pt/__pk 各 32 hex）
+function extractPlayerTokens(html) {
+  const h = String(html || '');
+  const pt = (h.match(/window\.__pt\s*=\s*"([0-9a-fA-F]{32})"/) || [])[1] || '';
+  const pk = (h.match(/window\.__pk\s*=\s*"([0-9a-fA-F]{32})"/) || [])[1] || '';
+  return { pt, pk };
+}
+
+// 纯 JS base64 解码（App 蜘蛛运行时无 Buffer/atob，不可用 Node 专属 API）
+const B64TAB = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function b64ToBytes(b64) {
+  let clean = String(b64 || '').replace(/[^A-Za-z0-9+/=]/g, '');
+  while (clean.length % 4) clean += '='; // 容错无填充 base64（站方现行带填充，此行为防御）
+  const rev = {};
+  for (let i = 0; i < B64TAB.length; i++) rev[B64TAB[i]] = i;
+  const out = [];
+  for (let i = 0; i + 4 <= clean.length; i += 4) {
+    const c0 = rev[clean[i]]; const c1 = rev[clean[i + 1]];
+    const c2 = clean[i + 2] === '=' ? 0 : rev[clean[i + 2]];
+    const c3 = clean[i + 3] === '=' ? 0 : rev[clean[i + 3]];
+    if (c0 == null || c1 == null || c2 == null || c3 == null) return null;
+    out.push((c0 << 2) | (c1 >> 4));
+    if (clean[i + 2] !== '=') out.push(((c1 & 15) << 4) | (c2 >> 2));
+    if (clean[i + 3] !== '=') out.push(((c2 & 3) << 6) | c3);
+  }
+  return out;
+}
+
+// 站方 player_enc 解密（与站方 sextb.js 的 xorDecrypt 同款：base64 解码后按
+// 密钥逐字节 XOR）。回包的 player_enc 用本次请求所带 pt 配对的 pk 加密，
+// 故必须先用旧 pk 解密、再轮换 next_pt/next_pk，顺序不可反。
+function xorDecryptPlayer(enc, key) {
+  if (!enc || !key) return '';
+  const bytes = b64ToBytes(enc);
+  if (!bytes || !bytes.length) return '';
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] ^ key.charCodeAt(i % key.length));
+  return out;
+}
+
+function iframeSrcOf(playerHtml) {
+  const html = t(playerHtml);
+  if (!html) return '';
+  const em = html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/) ||
+             html.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
+  return em ? fixUrl(em[1]) : '';
+}
+
+// POST /ajax/player 取某条线路的 embed URL（v8 站方新版）。
+// sess 为共享令牌状态 {pt, pk, pageUrl}：pt/pk 来自同一详情页响应，
+// pageUrl 为该详情页 URL（ajax 必须发到令牌来源同源，.cc/.net 不混用）；
+// extra 须含与该会话匹配的 Cookie（取自同一响应，见 rawGet 旁注）。
+// 成功回包 {player_enc, next_pt, next_pk}：先用旧 pk 解密、再轮换令牌
+// （旧 pt 用一次即废，重用 → E_TOK_MISS）；旧版 {player} 明文仍兼容。
+// 令牌/会话错（E_TOK_*/E_SID）或空回包时经 refreshTok 重取详情页换新
+// 令牌+Cookie 重试一次（重取不杀旧令牌，实测坐实），仍失败返回 ''。
+async function ajaxEmbed(durl, ep, filmId, sess, extra, refreshTok) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const body = { episode: ep.episode, filmId };
+    if (sess && sess.pt) body.pt = sess.pt;
+    const target = (sess && sess.pageUrl) || durl;
+    const resp = await postJsonFast(target, body, extra);
+    let json = null;
+    try { json = resp ? JSON.parse(resp) : null; } catch (e) { json = null; }
+    if (json && !json.error) {
+      if (json.player) return iframeSrcOf(json.player);
+      if (json.player_enc && sess && sess.pk) {
+        const html = xorDecryptPlayer(json.player_enc, sess.pk);
+        if (json.next_pt) sess.pt = json.next_pt;
+        if (json.next_pk) sess.pk = json.next_pk;
+        const em = iframeSrcOf(html);
+        if (em) return em;
+      }
+      return '';
+    }
+    const tokErr = json && json.error && /E_TOK|E_SID/.test(String(json.code || ''));
+    if (!tokErr && json && json.error) return '';
+    if (attempt === 0 && typeof refreshTok === 'function') {
+      try { if (await refreshTok()) continue; } catch (e) { /* 不再重试 */ }
+    }
+    return '';
+  }
   return '';
 }
 
@@ -827,56 +946,81 @@ async function play(reqIn) {
   // 默认 F4 反而最后才轮到，慢且险（探活/超时误杀）。v5 默认线最先。
   // v6: 用户点了指定线路集（hint）且与默认线不同时，第一步让路——
   // 先走第二步借线（hint 排最先），借线全灭再回落默认线（见第三步前）。
-  const defLine = !defEmbed ? '' : (isF4HostName(hostOf(defEmbed)) ? 'F4' : (isSwHostName(hostOf(defEmbed)) ? 'SW' : ''));
-  async function tryDefaultEmbed() {
-    if (!defEmbed) return null;
-    const dhost = hostOf(defEmbed);
-    if (isF4HostName(dhost)) {
-      // F4 默认: Worker /f4 全链已在真实部署上逐跳验通（api/play 收 CF
-      // 出口、列表/分片注入 Origin 后均 200）。学 JavGG 已真机验证的
-      // 形态——直接返回 Worker 地址、不探活（探活是蜘蛛侧多余的一次
-      // 往返，抖动/超时会误杀好线路，JavGG 从不探活且真机可播）。
-      const w = workerF4Url(defEmbed, durl);
+  // —— v8 会话与令牌（与详情页同一响应绑定，见 rawGet 旁注）——
+  // 令牌与 Cookie 必须来自同一详情页响应：另起 GET 取 Cookie 会拿到另一
+  // 会话，ajax 必 E_SID（且错会话用令牌会烧掉令牌）——实测坐实；故旧的
+  // “单取 Cookie”整段删除，改用 getHtml 时顺带记下的会话。
+  // 无令牌时（jina 兜底页等）不用上次 play 的残留会话：pageUrl 回 durl、
+  // Cookie 不带，避免拿旧会话撞新请求。
+  const _tk = extractPlayerTokens(html);
+  const sess = { pt: _tk.pt, pk: _tk.pk, pageUrl: _tk.pt ? (lastSextbPageUrl || durl) : durl };
+  const sessionHeaders = {};
+  try { sessionHeaders.Origin = new URL(sess.pageUrl).origin; } catch (e) {}
+  if (lastSextbCookie && sess.pt) sessionHeaders.Cookie = lastSextbCookie;
+  // 令牌/会话失效时重取详情页换新令牌+Cookie（重取不杀旧令牌，实测坐实），每 play 最多一次。
+  let refreshed = false;
+  async function refreshTok() {
+    if (refreshed) return false;
+    refreshed = true;
+    const h = await getHtml(durl);
+    if (!h) return false;
+    const t2 = extractPlayerTokens(h);
+    if (!t2.pt) return false;
+    sess.pt = t2.pt; sess.pk = t2.pk;
+    if (lastSextbPageUrl) sess.pageUrl = lastSextbPageUrl;
+    try { sessionHeaders.Origin = new URL(sess.pageUrl).origin; } catch (e) {}
+    if (lastSextbCookie) sessionHeaders.Cookie = lastSextbCookie;
+    return true;
+  }
+
+  // 按 embed 宿主分流出线（默认线与借线共用）：F4 → Worker /f4 直返不探活
+  // （JavGG 已真机验证的形态：直返 Worker 地址、不探活）；SW → Worker /v
+  // 快速探活 4s，失败记 hls3 作最后手段、不在这里判死；其他宿主 → 蜘蛛内
+  // 直解。返回 play 结果或 null（交给下一条线路）。
+  async function resolveLineEmbed(embed, durl) {
+    const host = hostOf(embed);
+    if (isF4HostName(host)) {
+      const w = workerF4Url(embed, durl);
       if (w) return subAttach({ parse: 0, url: w, header: uaHead }, subsP);
-    } else if (isSwHostName(dhost)) {
-      const w = workerVUrl(defEmbed, durl);
+      return null;
+    }
+    if (isSwHostName(host)) {
+      const w = workerVUrl(embed, durl);
       if (w) {
-        // SW 的 Worker 链有逐视频死链（只有 hls3/hls2 的视频，其 CDN 拦
-        // CF 出口，/v 必 502）→ 只对 SW 做一次快速探活（4s），过不了
-        // 就落到第二步借 F4 线，不在这里判死。
         if (await probePlaylist(w, uaHead, 4000)) {
           return subAttach({ parse: 0, url: w, header: uaHead }, subsP);
         }
-      } else {
-        const r = await resolveStreamHgInSpider(defEmbed, durl, true);
-        if (r) return subAttach(r, subsP);
+        if (!swLastResort) {
+          const links = await decodeStreamHgLinks(embed, durl);
+          if (links.hls3) swLastResort = links.hls3;
+        }
+        return null;
       }
-    } else {
-      try {
-        const r = await resolveEmbed(defEmbed, durl);
-        if (r && r.url) return subAttach(r, subsP);
-      } catch (e) { /* 落到借线 */ }
+      const r = await resolveStreamHgInSpider(embed, durl, true);
+      if (r) return subAttach(r, subsP);
+      return null;
     }
+    try {
+      const r = await resolveEmbed(embed, durl);
+      if (r && r.url) return subAttach(r, subsP);
+    } catch (e) { /* 落到借线 */ }
     return null;
+  }
+
+  const defLine = !defEmbed ? '' : (isF4HostName(hostOf(defEmbed)) ? 'F4' : (isSwHostName(hostOf(defEmbed)) ? 'SW' : ''));
+  async function tryDefaultEmbed() {
+    if (defEmbed) return resolveLineEmbed(defEmbed, durl);
+    // 新版站：默认播放器须走 ajax episode=0（站方 player_default 同款），
+    // 详情页 HTML 里已无 iframe；无令牌（jina 兜底页等）时不发 ajax。
+    if (!filmId || !sess.pt) return null;
+    const ep0 = await ajaxEmbed(durl, { episode: 0 }, filmId, sess, sessionHeaders, refreshTok);
+    if (!ep0) return null;
+    return resolveLineEmbed(ep0, durl);
   }
   if (!hint || hint === defLine) {
     const d0 = await tryDefaultEmbed();
     if (d0) return d0;
   }
-
-  // 会话态补强（best-effort）：直连详情页取 Set-Cookie 回带到 ajax POST，
-  // 并补浏览器 XHR 本来就会带的 Origin；拿不到则与今天一致，绝不因此失败。
-  let sessionHeaders = {};
-  try { sessionHeaders.Origin = new URL(durl).origin; } catch (e) {}
-  try {
-    const ck = await req.get(durl, { headers: { 'User-Agent': UA }, timeout: 6000 });
-    const sc = ck && ck.headers && (ck.headers['set-cookie'] || ck.headers['Set-Cookie']);
-    if (sc) {
-      const arr = Array.isArray(sc) ? sc : [sc];
-      const cookie = arr.map(s => String(s).split(';')[0].trim()).filter(Boolean).join('; ');
-      if (cookie) sessionHeaders.Cookie = cookie;
-    }
-  } catch (e) { /* 无会话态也继续 */ }
 
   // —— 第二步: 借线（POST /ajax/player），全部线路按优先级试 ——
   // 优先级: F4 > SW > PM > FL > DD > US > ST > PP（F4 借线只需一次 ajax
@@ -904,31 +1048,12 @@ async function play(reqIn) {
     if (defEmbed && episodes.length && ep.episode === episodes[0].episode && nm !== hint) continue;
     if (!filmId) break;
     borrowed++;
-    const embed = await ajaxEmbed(durl, ep, filmId, sessionHeaders);
+    const embed = await ajaxEmbed(durl, ep, filmId, sess, sessionHeaders, refreshTok);
     if (!embed) continue;
     if (!firstEmbed) firstEmbed = embed;
-    const host = hostOf(embed);
     try {
-      if (isF4HostName(host)) {
-        const w = workerF4Url(embed, durl);
-        if (w) return subAttach({ parse: 0, url: w, header: uaHead }, subsP);
-        continue;
-      }
-      if (isSwHostName(host)) {
-        const w = workerVUrl(embed, durl);
-        if (w && await probePlaylist(w, uaHead, 4000)) {
-          return subAttach({ parse: 0, url: w, header: uaHead }, subsP);
-        }
-        // Worker 链对此视频不通: 蜘蛛内解 hls3 记下作最后手段（手机是
-        // 住宅/移动出口，hls3 的 ASN 门禁可能放行），先继续借其他线
-        if (!swLastResort) {
-          const links = await decodeStreamHgLinks(embed, durl);
-          if (links.hls3) swLastResort = links.hls3;
-        }
-        continue;
-      }
-      const r = await resolveEmbed(embed, durl);
-      if (r && r.url) return subAttach(r, subsP);
+      const r = await resolveLineEmbed(embed, durl);
+      if (r) return r;
     } catch (e) { /* 换下一条线路 */ }
   }
 
