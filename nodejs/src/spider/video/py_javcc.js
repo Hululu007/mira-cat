@@ -7,6 +7,16 @@
 // /x/v-master.m3u8/<token>；再按 RESOLUTION 分档出线（单档只出一线，
 // 多档各出一线，绝不编造清晰度；解不出时回落嵌页 parse:1，绝不输出
 // 无 token 的模板地址）。
+// 2026-11-07 播放链实测坐实（7 部片）：站方现分两条后端——/ved/ 线
+// （api.videplay.us/ved/）分片是 tiktokcdn 的 .image 伪装地址，70 字节
+// PNG 头 + 真 TS，播放器按 image/png 拒收、建不起时间轴；/o/ 线
+// （dual.streamhx.win）部分视频 master 稳定 502（站方后端按视频死掉，
+// 换头/重试/换出口都 502，无他腿可换）。故出线一律走自家 javcc-hls
+// Worker（/v 现解、/p 改写清单、/s 剥 PNG 头并强制 video/MP2T）；
+// master 拉不到时出 Worker /v 单线（服务端重解新 token 再拉，仍 502
+// 时 Worker 直回 502 文本快败，不再把 502 地址交给播放器转圈）。
+// REX 慢与字幕无关：javcc.me 详情 3~19 秒、嵌页 3~15 秒，串行跟链是主因；
+// 猫源 play() 的 6 秒字幕预算是芯的既定设计，本次不动。
 // 字幕聚合：与猫源 27 源同款芯（迅雷/迅雷看看/SubtitleCat 三槽、严过滤、
 // 全局上限 10、单槽软上限 8、详情串行预热、play 挂 subs、无命中不带键）。
 // 注意：全程只用框架 req（猫源 App 无全局 fetch）；短剧在本站无对应内容，
@@ -16,6 +26,9 @@ import req from '../../util/req.js';
 const KEY = 'py_javcc';
 const NAME = 'JavCC';
 const HOST = 'https://javcc.me';
+// 自家 javcc-hls Worker（2026-11-07 首版，须用户部署到自己的 Cloudflare
+// 账号，地址 javcc-hls.li768435813.workers.dev；根路径应回 v1 (png-strip)）。
+const WORKER = 'https://javcc-hls.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
 async function getText(url, referer, timeoutMs) {
@@ -390,13 +403,29 @@ async function resolveLines(embedUrl, durl) {
   const masterText = await getText(master, embedUrl);
   const variants = masterText ? parseMasterVariants(masterText) : [];
   if (variants.length) {
+    // 每档出一线，地址走 Worker /p（Worker 改写分片为 /s/<名>.ts、剥 PNG 头；
+    // 直连原变体清单会拿到 .image 伪装分片、播不了）。
+    const lines = [];
     for (const v of variants) {
-      embedCache.set(v.url, embedUrl);
+      const wu = workerPUrl(v.url, embedUrl);
+      embedCache.set(wu, embedUrl);
       if (embedCache.size > 200) embedCache.delete(embedCache.keys().next().value);
+      lines.push({ name: v.name, url: wu });
     }
-    return variants;
+    return lines;
   }
-  return [{ name: '正片', url: master }];
+  // master 拉不到（dual 502 类）：交 Worker /v，服务端重抓 embed、现解
+  // 新 token、再拉 master（服务端重试一次）；仍 502 时 Worker 直回 502
+  // 文本快败，不再把 502 的 master 地址交给播放器转圈。
+  return [{ name: '正片', url: workerVUrl(embedUrl, durl) }];
+}
+
+// 自家 javcc-hls Worker（2026-11-07 首版）：/p 改写变体清单、/v 全链现解。
+function workerPUrl(variantUrl, embedUrl) {
+  return WORKER + '/p?u=' + encodeURIComponent(variantUrl) + '&e=' + encodeURIComponent(embedUrl);
+}
+function workerVUrl(embedUrl, durl) {
+  return WORKER + '/v?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
 }
 
 async function detail(reqIn) {
