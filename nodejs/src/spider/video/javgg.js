@@ -47,6 +47,14 @@ import req from '../../util/req.js';
 //     play() 解出后跳过 collectEmbeds: vidhide-only 直接返回 Worker 地址(本地零网络),
 //     playmate/vidara 仍竞速直解。旧 id(无 $@ 负载)自动回退原 collectEmbeds 流程。
 //   → Worker v2 给 /v、/p 加 Cache API 边缘缓存并在 /v 时后台预热首变体 /p 与首分片。
+// 第七轮(2026-11-07, 清晰度自选): 用户真机: 一切正常, 只改播放能选分辨率, 现在分辨率低。
+//   实测根因: vidara master 是 480→720→1080 三档升序 (15 样本全同), 播放器默认吃首档
+//   = 480p; playmate master 单档 (720p 封顶, 2026-10-20 实测)、vidhide 走 Worker v3
+//   已直返最高档媒体列表, 两者都不用分集。改法: detail 期只解优先级最高的
+//   playmate/vidara 线, 取 master 变体按档位出多集 (1080p/720p/480p, 集 id 即变体
+//   媒体列表直链), 末尾保留一集正片 (旧 playId, 兜底 vidhide/f4/嗅探); 单档或解
+//   码失败回退单集正片, 行为与第六轮完全一致。play() 只加集名前缀剥离, 其余不动。
+//   f4/other 仍只作嗅探, 无 master 可分, 不动。
 
 const KEY = 'py_javgg';
 const NAME = 'JavGG';
@@ -347,14 +355,23 @@ async function detail(reqIn) {
   // play() 解出后跳过 collectEmbeds 往返。收集失败/为空则退回旧 id 形式，
   // play() 会按原流程现场收集，行为与第四轮完全一致。
   let playId = postId ? postId + '$' + durl : durl;
+  // 清晰度分集 (第七轮): 只解一条最优可解码线, 变体 >= 2 档才分集, 否则 null 回退正片
+  let qualityEps = null;
   if (postId) {
     try {
       const embeds = await collectEmbeds(postId, 4000);
       if (embeds && embeds.length) {
         const payload = b64urlEncode(JSON.stringify({ e: embeds.map(e => e.embedUrl) }));
         if (payload) playId += '$@' + payload;
+        qualityEps = await tryQualityEpisodes(embeds, durl);
       }
     } catch (e) { /* 保持旧 id 形式 */ }
+  }
+
+  // 多集: 1080p/720p/480p(变体直链) + 正片(旧 playId 兜底); 无分集时只剩正片
+  let playUrl = `正片$${playId}`;
+  if (qualityEps && qualityEps.length >= 2) {
+    playUrl = qualityEps.map(v => v.label + '$' + v.url).join('#') + '#正片$' + playId;
   }
 
   const vod = {
@@ -363,7 +380,7 @@ async function detail(reqIn) {
     vod_pic: pic,
     vod_content: content,
     vod_play_from: 'JavGG',
-    vod_play_url: `正片$${playId}`,
+    vod_play_url: playUrl,
   };
   subRegister(id, vod);
   return { list: [vod] };
@@ -440,12 +457,59 @@ async function collectEmbeds(postId, budgetMs) {
   return embeds;
 }
 
+// 解析 master 播单的变体: 只认带 RESOLUTION 的档位, 按高度降序返回
+// [{label:'1080p', url:<变体媒体列表绝对地址>}]; 不足 2 档或无 RESOLUTION 返回 []。
+// 变体 URI 相对 master 地址解析 (自带 token 查询串, 原样保留); 同高度只留带宽最大者。
+function parseVariants(masterText, masterUrl) {
+  const lines = String(masterText || '').split('\n');
+  const byHeight = new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/#EXT-X-STREAM-INF:([^\n]*)/);
+    if (!m) continue;
+    const res = (m[1].match(/RESOLUTION=(\d+)x(\d+)/) || [])[2] || '';
+    const bw = parseInt((m[1].match(/BANDWIDTH=(\d+)/) || [])[1] || '0', 10) || 0;
+    const uri = (lines[i + 1] || '').trim();
+    const h = parseInt(res, 10);
+    if (!h || !uri || uri.startsWith('#')) continue;
+    let abs = '';
+    try { abs = new URL(uri, masterUrl).toString(); } catch (e) { continue; }
+    const prev = byHeight.get(h);
+    if (!prev || bw > prev.bw) byHeight.set(h, { label: h + 'p', url: abs, bw });
+  }
+  return [...byHeight.values()].sort((a, b) => parseInt(b.label, 10) - parseInt(a.label, 10))
+    .map(v => ({ label: v.label, url: v.url }));
+}
+
+// detail 期解一档: 只解优先级最高的 playmate/vidara 线, 取其 master 变体。
+// 全程 6s 封顶 (解码 4s + 拉 master 4s, 超时即弃); 失败/单档/无变体返回 null,
+// detail 回退单集正片。vidhide/f4 不解 (前者 Worker 已给最高档, 后者只嗅探)。
+async function tryQualityEpisodes(embeds, durl) {
+  const best = (embeds || []).find(e => e.kind === 'playmate' && e.decoder)
+    || (embeds || []).find(e => e.kind === 'vidara' && e.decoder);
+  if (!best) return null;
+  try {
+    const variants = await withTimeout((async () => {
+      const got = await best.decoder(best.embedUrl, durl, 4000);
+      if (!got || !got.url) return null;
+      const txt = await getText(got.url, { 'Referer': best.embedUrl }, 100, 4000);
+      if (!txt) return null;
+      return parseVariants(txt, got.url);
+    })(), 6000);
+    return (variants && variants.length >= 2) ? variants : null;
+  } catch (e) { return null; }
+}
+
 // 播放: playmate/vidara 竞速直解 → 没有或失败立刻 parse:1 嗅探，全程不解 vidhide
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.startsWith('正片$')) id = id.slice(3);
+  // 分集直链 (第七轮): 个别 App 会把 "集名$地址" 整段传回, 先剥掉集名前缀再走
+  // 下面的直链分支。只当剩余部分是直链媒体地址时剥离, 旧的 postId$durl$@payload
+  // 形 id 不含 .m3u8/.mp4, 不受影响。
+  const dm = id.match(/^[^$\s]{1,30}\$(https?:\/\/\S+)$/);
+  if (dm && /\.(m3u8|mp4)(\?|#|$)/i.test(dm[1])) id = dm[1];
   const subsP = subSearchAll(subNormKey(id)).catch(() => []);
   if (/\.m3u8(\?|$)/i.test(id)) {
     return subAttach({ parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } }, subsP);

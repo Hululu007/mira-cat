@@ -39,12 +39,20 @@ import req from '../../util/req.js';
 //       SW 在 Worker 不通时留蜘蛛内 hls3 直链作最后手段（手机住宅
 //       出口可能过 hls3 的 ASN 门禁，不探活、交播放器试）；详情页无
 //       播放器标记时换镜像再抓一次（防 DDoS 拦截页毒死整条链）。
-// 播放 (v6, 2026-11-07): (1) 转圈根因是 F4 分片伪装——seg_XXXXX.png
-//       文件名 + image/png 下发，HLS 内核拒收分片、建不起时间轴，
-//       Worker v2 已修（分片改写 /s/<名>.ts + 强制 video/MP2T），
-//       蜘蛛侧返回的 Worker 地址形态不变；(2) 点指定线路集时第一步
-//       不再抢先返回默认线：hint 与默认线不同先走借线（hint 排最先），
-//       借线全灭再回落默认线——此前点 SW/FL/DD 集永远播的是默认 F4。
+// 播放 (v7, 2026-11-07): 上轮（蜘蛛 v6 + Worker v2）已部署仍全线转圈后
+//       复查坐实的两处真机执行缺陷（链路本身已逐跳验通，见下）：
+//       (1) 字幕预热键与点播键对不上：detail 预热用 eps[0]（形如
+//       F4$<durl>@F4），play 侧先剥 $ 前缀与 @hint 再查，键永远
+//       对不上 → 预热白做，每次点播都重跑最多 6s 的字幕搜索；
+//       play() 在 App 超时内回不来，表现为一直转圈。v7 改用裸
+//       详情 URL（vod_id）预热，与 play 侧键一致，共用同一趟。
+//       (2) 探活全是 fetch-only：timedFetchBytes 只走原生 fetch，
+//       而 App 蜘蛛运行时里全局 fetch 不存在（2026-10-22 JAVSB
+//       诊断卡实证：fetch 通道在设备上 0-4ms 秒死）→ SW /v 探活、
+//       通用 m3u8/mp4 探活在真机上永远失败，SW 线永不直返 /v、
+//       FL/DD 等通用线永不返回直链，最终只剩 hls3 直链/嗅探兜底。
+//       v7 探活改走框架 req，fetch 仅作有 fetch 环境的第二通道。
+//       F4 默认线仍直返 Worker /f4、不探活；Worker v2 本体零改动。
 // 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist、子列表、每个分片
 //       请求都必须带 Origin: https://f4scdn.com 才能 200（UA-only 403、
 //       Referer 403）。其官方 api/play?ab=0 能拿签名 src，但 src 的列表与
@@ -333,19 +341,44 @@ function extractGenericFile(text) {
 }
 
 // 带超时的二进制 GET 探活（只关心状态码与前几个字节）
+// v7: 通道 1 改走框架 req —— App 蜘蛛运行时里全局 fetch 不存在
+// （2026-10-22 JAVSB 诊断卡实证），原 fetch-only 实现导致 SW /v
+// 探活、通用 m3u8/mp4 探活在真机上永远失败。fetch 仅作有 fetch
+// 的环境（Node/浏览器 harness）的第二通道，且 typeof 守卫。
 async function timedFetchBytes(url, headers, timeoutMs, range) {
-  const ctl = new AbortController();
-  const to = setTimeout(() => ctl.abort(), timeoutMs || 7000);
+  const h = { ...(headers || {}) };
+  if (range) h['Range'] = range;
+  const to = timeoutMs || 7000;
+  // 通道 1: 框架 req（设备侧唯一可用通道）
   try {
-    const h = { ...(headers || {}) };
-    if (range) h['Range'] = range;
-    const r = await fetch(url, { headers: h, signal: ctl.signal });
-    const buf = await r.arrayBuffer().catch(() => new ArrayBuffer(0));
-    return { status: r.status, text: new TextDecoder().decode(buf.slice(0, 4096)), size: buf.byteLength };
+    const r = await req.get(url, { headers: h, timeout: to, responseType: 'arraybuffer', validateStatus: () => true, maxRedirects: 5 });
+    const raw = r && r.data;
+    if (typeof raw === 'string') {
+      return { status: r.status || 0, text: raw.slice(0, 4096), size: raw.length };
+    }
+    let buf = new ArrayBuffer(0);
+    try {
+      if (raw instanceof ArrayBuffer) buf = raw;
+      else if (raw && typeof raw.byteLength === 'number' && raw.buffer instanceof ArrayBuffer) {
+        buf = raw.buffer.slice(raw.byteOffset || 0, (raw.byteOffset || 0) + raw.byteLength);
+      }
+    } catch (e) { /* 空结果 */ }
+    return { status: r.status || 0, text: new TextDecoder().decode(buf.slice(0, 4096)), size: buf.byteLength };
+  } catch (e) { /* 换通道 2 */ }
+  // 通道 2: 原生 fetch（仅 Node/浏览器环境；App 里不存在，跳过）
+  if (typeof fetch !== 'function') return { status: 0, text: '', size: 0 };
+  try {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), to);
+    try {
+      const r = await fetch(url, { headers: h, signal: ctl.signal });
+      const buf = await r.arrayBuffer().catch(() => new ArrayBuffer(0));
+      return { status: r.status, text: new TextDecoder().decode(buf.slice(0, 4096)), size: buf.byteLength };
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (e) {
     return { status: 0, text: '', size: 0 };
-  } finally {
-    clearTimeout(to);
   }
 }
 
@@ -1004,7 +1037,11 @@ function subRegister(detailIds, vod) {
       }
     }
     for (const k of keys) subCacheName(k, name);
-    const warmKey = eps[0] || (vod.vod_id ? String(vod.vod_id) : '');
+    // v7: 预热键必须与 play() 的 subSearchAll 键一致（裸详情 URL）。
+    // 旧版用 eps[0]（形如 F4$<durl>@F4），play 侧先剥 $ 前缀与 @hint
+    // 再查，键永远对不上 → 预热白做，每次点播都重跑最多 6s 的字幕
+    // 搜索，play() 在 App 超时内回不来。vod_id 即 play 侧的裸 durl。
+    const warmKey = vod.vod_id ? String(vod.vod_id) : (eps[0] || '');
     if (warmKey) subWarm(warmKey);
   } catch (e) { /* 字幕登记失败不影响详情 */ }
 }
