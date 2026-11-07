@@ -21,6 +21,13 @@ import req from '../../util/req.js';
 //   头不同），代理只改写 7KB 清单文本。play() 给本地 /proxy/m3u8 地址
 //   （Ero/JavFeed 同款，前缀取 reqIn?.server 动态值，绝不写死），取不到
 //   时回落原直链；代理拉不到有效清单时 302 回原地址，不比旧行为更差。
+// 2026-11-07 返工二轮（播放仍失败）：同轮同包里 24JAV 的本地代理在手机上通了，
+//   蘑菇的没通。找不同点：v1 只改写清单文本，分片与密钥仍由播放器直连 dfdf；
+//   24JAV 是全程字节代理，播放器只跟蜘蛛说话。v2 照 24JAV 先例改：清单改写行
+//   一律指回本地代理（完整 http:// 绝对地址），分片字节经代理透传（支持 Range），
+//   密钥（16 字节）同样走代理取回；播放器不再直连 dfdf / cloudfront。
+//   mogu-fetch Worker 的 /f 只放行 moguds.cc（实测 dfdf 回 400 bad target），
+//   代理取数只能走直连 req.get（同 24JAV）。
 // 分类：7 大区作顶级分类，各区细分走筛选卡片 filters.sub；6 个分组父类
 //   （cate13/22/36/47/55/59）站方本身无内容，不列为细分，默认取各组首个有内容的子类。
 // 列表：<a href="/video/\d+/"> 卡片，封面 data-src 走 dfdf.tjacq.com（实测 200）
@@ -637,17 +644,16 @@ function archivePlayUrl(html) {
   return normUrl(base.replace(/\/+$/, '') + (raw.startsWith('/') ? raw : '/' + raw));
 }
 
-// ---------- 播放清单代理（同 Ero/JavFeed 先例；2026-11-07 返工新增） ----------
-// play() 不再直接交 dfdf 原播单：原播单分片行指向 d3s00 cloudfront，手机上该腿
-// 未验证且同类分发已死过；代理实时拉清单改写——分片/密钥行一律改指播单自身
-// origin（dfdf；sxtmo 播单则改指 sxtmo，两线分片逐字节相同已实测），相对
-// URI（如 /keyhome/video.key）补成绝对地址（改写后播单由蜘蛛 origin 发出，
-// 相对 URI 若不补会错解析到蜘蛛 host）。分片本身不透传，播放器直接向 dfdf
-// 取分片（封面已证手机到 dfdf 通）；取不到有效清单时 302 回原地址。
+// ---------- 播放清单代理 v2（同 24JAV 已验证形态；2026-11-07 返工二轮） ----------
+// v1 只改写清单文本，分片与密钥仍由播放器直连 dfdf；24JAV 同轮同包已证：
+// 播放器直连上游 CDN 的腿在手机上不可靠，只有全程走蜘蛛代理的形态通。
+// v2 照 24JAV 先例改：清单改写行一律指回本地代理（完整 http:// 绝对地址），
+// 分片字节经代理透传（支持 Range，便于拖动）；密钥（16 字节）同样走代理取回。
+// 播放器全程只跟蜘蛛说话，不再直连 dfdf / cloudfront。取不到时 302 回原地址。
 function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
-// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 Ero 先例；
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 Ero/24JAV 先例；
 // 前缀取 reqIn?.server 动态值，绝不写死）
 function proxyUrl(reqIn, path, targetUrl, referer) {
   try {
@@ -657,61 +663,122 @@ function proxyUrl(reqIn, path, targetUrl, referer) {
     return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
   } catch (e) { return ''; }
 }
-async function fetchPlaylistText(url, referer) {
-  try {
-    const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
-      timeout: 15000,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-      validateStatus: () => true,
-    });
-    const text = typeof r.data === 'string' ? r.data : '';
-    if (r.status >= 200 && r.status < 300 && text) return text;
-  } catch (e) { /* 落空走 302 降级 */ }
-  return '';
-}
-function rewriteM3u8(raw, playlistUrl) {
-  let originHost = '';
-  try { originHost = new URL(playlistUrl).hostname; } catch (e) { originHost = ''; }
-  function sameOrigin(u) {
+// 取字节（清单/分片/密钥通用）：30s 超时、2 次尝试；失败返回 null，走 302 降级
+async function fetchBytes(url, referer) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const abs = new URL(u, playlistUrl).toString();
-      if (!originHost) return abs;
-      const parsed = new URL(abs);
-      if (parsed.hostname.endsWith('.cloudfront.net')) parsed.hostname = originHost;
-      return parsed.toString();
-    } catch (e) { return u; }
+      const r = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
+        timeout: 30000,
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+    } catch (e) { /* 重试，落空走 302 降级 */ }
   }
+  return null;
+}
+// 改写清单正文：# 行的 URI="..."（密钥）与 master 的 variant 行走查询串形式
+// /proxy/m3u8?u=&r=；媒体清单的分片行走路径段形式 /proxy/<b64>/<b64>.ts（末尾
+// 加 .ts 后缀过 ffmpeg 分片后缀白名单；b64url 字母表无 '.'，代理入口先剥后缀
+// 再解码，无歧义）。selfBase 是完整 http:// 绝对基址（取请求 Host 拼），
+// 改写后的行不再是裸路径/上游直链，播放器无需以 js2p:// 为基址解析、也无需直连上游。
+function rewriteM3u8(raw, playlistUrl, selfBase, referer) {
+  const isMaster = String(raw).includes('#EXT-X-STREAM-INF');
   const lines = String(raw).split(/\r?\n/);
-  return lines.map((line) => {
-    const str = line.trim();
-    if (!str) return line;
-    if (str.startsWith('#')) {
-      if (str.includes('URI="')) {
-        return line.replace(/URI="([^"]+)"/g, (all, uri) => 'URI="' + sameOrigin(uri) + '"');
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try {
+            const abs = new URL(uri, playlistUrl).toString();
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}"`;
+          } catch (e) { return all; }
+        });
       }
       return line;
     }
-    return sameOrigin(str);
-  }).join('\n');
+    try {
+      const abs = new URL(s, playlistUrl).toString();
+      if (isMaster) return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}.ts`;
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
 }
-// GET /proxy/m3u8?u={b64url 清单地址}&r={b64url referer}
+// 代理入口（两种地址格式都接受）：
+// 主格式（detail/play 发出）：/proxy/m3u8?u={b64url}&r={b64url}；
+// 分片格式（改写后的媒体清单分片行）：/proxy/{b64url 目标}/{b64url referer}.ts。
+// 取回的文本是 #EXTM3U 即按清单改写；否则按字节透传：查询串形式来的是密钥
+// （16 字节）回 application/octet-stream，路径段形式来的是分片回 video/mp2t
+// （支持 Range，便于拖动）。
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  let viaPath = false;
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; viaPath = true; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
   let target = '';
   let referer = HOST + '/';
   try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
   } catch (e) { reply.code(400).send('bad u'); return; }
   if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const raw = await fetchPlaylistText(target, referer);
-  if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
-  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  // 改写基址：同 24JAV，用请求 Host 拼完整 http:// 绝对地址；无 Host 时退回
+  // proxyUrl 拼出的 js2p:// 形式（不比旧行为更差）。
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+  const buf = await fetchBytes(target, referer);
+  if (!buf || !buf.length) { reply.redirect(target); return; }
+  const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+  if (head.trimStart().startsWith('#EXTM3U')) {
+    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+    reply.header('Cache-Control', 'no-cache');
+    reply.send(rewriteM3u8(buf.toString('utf8'), target, selfBase, referer));
+    return;
+  }
+  // 非清单内容：路径段形式来的是分片；查询串形式来的是密钥（16 字节）。
+  const range = request?.headers && request.headers.range;
+  const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+  if (viaPath) {
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      const start = parseInt(m[1], 10);
+      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
+      if (start < buf.length && start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', `bytes ${start}-${end}/${buf.length}`);
+        reply.send(buf.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(buf);
+    return;
+  }
+  reply.header('Content-Type', 'application/octet-stream');
   reply.header('Cache-Control', 'no-cache');
-  reply.send(rewriteM3u8(raw, target));
+  reply.send(buf);
 }
 
 async function home() {
@@ -856,6 +923,7 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      fastify.get('/proxy/*', m3u8Proxy);
       fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
