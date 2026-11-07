@@ -1,18 +1,22 @@
 import req from '../../util/req.js';
 
 // 蘑菇视频 https://moguds.cc —— 视频站（由用户提供的 upload-2.js 移植）
-// 2026-11-05 修复：详情页站方已改版（#article-videos 消失，播放地址改走
-// window.__ARCHIVE_PLAYER__.rawPath + CDN 基址），旧解析全线取不到播单；
-// 另修 URL 归一化（cdn_lines 里 cloudfront 写成 https:/// 三斜杠）；
-// 列表/详情取数加 Worker 兜底（直连 → mogu Worker /f/，未部署前行为不变）。
-// 分类：16 个大区作顶级分类，各区细分（cate3～cate288）走筛选卡片 filters.sub
-// 列表：<a href="/video/\d+/"> 卡片，封面走 dfdf.tjacq.com（实测无 Referer 也 200，无需 @ 后缀）
-// 详情：#article-videos data-url + cdn_lines 组直链（首选 dfdf，备选 cloudfront）；播放直链 parse:0
+// 2026-11-07 重建：站方分类体系已整体重排（旧 cate68～cate288 全线失效，站方返回空模板页；
+//   旧 cate3～cate67 大批改名错位），按 2026-11-07 实测 live map 重建为 7 大区 60 细分；
+//   另修 CDN：d1uy7itup9paqh.cloudfront.net 分发已死（TLS 握手即断，同 VM 上其他 cloudfront
+//   分发正常；站方 cdn_lines 现为 dfdf + mkdscvxr3w34.sxtmo.com，已无 cloudfront），
+//   封面与播单改回 dfdf 主线、sxtmo 备选，不再改写为 cloudfront；
+//   播单内分片走 d3s00p19cjdhyv.cloudfront.net（实测 206 通），播单本身只负责指路；
+//   详情页仍走 window.__ARCHIVE_PLAYER__.rawPath + CDN 基址。
+// 分类：7 大区作顶级分类，各区细分走筛选卡片 filters.sub；6 个分组父类
+//   （cate13/22/36/47/55/59）站方本身无内容，不列为细分，默认取各组首个有内容的子类。
+// 列表：<a href="/video/\d+/"> 卡片，封面 data-src 走 dfdf.tjacq.com（实测 200）
+// 详情：__ARCHIVE_PLAYER__.rawPath 组直链（首选 dfdf，备选 sxtmo）；播放直链 parse:0
 // 字幕：详情预热 + 播放带 subs（与 32 个带芯猫源同一套聚合芯：迅雷/迅雷看看/SubtitleCat 三槽，带时长显示与名字+时长去重）
-// 清晰度：站方每片只给一条单码率播单（实测 720p），无多档切换机制，故不设假清晰度选单
+// 清晰度：站方每片只给一条单码率播单（实测无多档切换机制），故不设假清晰度选单
 const HOST = 'https://moguds.cc';
 const CDN = 'https://dfdf.tjacq.com';
-const ALT_CDN = 'https://d1uy7itup9paqh.cloudfront.net';
+const ALT_CDN = 'https://mkdscvxr3w34.sxtmo.com'; // 站方 cdn_lines 第二线；d1uy7 cloudfront 分发已死（2026-11-07 实测 TLS 断），不再使用
 // 取数 Worker（2026-11-05 待用户部署：https://mogu-fetch.li768435813.workers.dev，根回 mogu fetch ok；
 // 未部署前 Worker 腿取数失败即回落，行为与现在一致）。直连优先，Worker 只作 CF 挑战/拦截时的兜底。
 const FETCH_WORKER = 'https://mogu-fetch.li768435813.workers.dev';
@@ -46,22 +50,13 @@ function viaWorker(url) {
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 const ZONES = [
-  { id: "zone_featured", name: "🔥今日精选", default: "route_home_featured", subs: [{ n: "今日推荐", v: "route_home_featured" }, { n: "顶级网黄", v: "cate3" }, { n: "福利姬", v: "cate4" }, { n: "传媒精选", v: "cate6" }, { n: "JVID", v: "cate7" }, { n: "锅锅酱", v: "cate8" }] },
-  { id: "zone_theme", name: "💋热门主题", default: "cate9", subs: [{ n: "巨乳大奶", v: "cate9" }, { n: "抖音风", v: "cate10" }, { n: "樱花小猫", v: "cate12" }, { n: "反差女友", v: "cate13" }, { n: "调教性奴", v: "cate15" }, { n: "ASMR", v: "cate16" }, { n: "高潮自慰", v: "cate18" }, { n: "露出野战", v: "cate20" }, { n: "SWAG", v: "cate21" }, { n: "绿帽淫妻", v: "cate23" }, { n: "群交滥交", v: "cate24" }, { n: "风骚少妇", v: "cate25" }, { n: "AI女神", v: "cate27" }, { n: "风骚母狗", v: "cate28" }, { n: "断袖男同", v: "cate29" }, { n: "原创短剧", v: "cate30" }, { n: "足交口爆", v: "cate31" }, { n: "炮桶小屋", v: "cate32" }, { n: "无套内射", v: "cate33" }, { n: "黑鬼长屌", v: "cate34" }, { n: "女同百合", v: "cate35" }, { n: "伪娘人妖", v: "cate36" }] },
-  { id: "zone_creator", name: "💃网红达人", default: "cate37", subs: [{ n: "吴梦梦", v: "cate37" }, { n: "网黄", v: "cate38" }, { n: "umate原创", v: "cate39" }, { n: "Naomii", v: "cate40" }, { n: "YuiPeach", v: "cate41" }, { n: "唐伯虎", v: "cate42" }, { n: "饼干姐姐", v: "cate43" }, { n: "台北娜娜", v: "cate44" }, { n: "MASKU", v: "cate45" }, { n: "Xreind", v: "cate46" }, { n: "小桃酱", v: "cate47" }, { n: "安安小晗", v: "cate48" }, { n: "柚子猫", v: "cate49" }, { n: "王梨奈", v: "cate50" }, { n: "辛尤里", v: "cate51" }, { n: "粉色情人", v: "cate52" }, { n: "阿朱", v: "cate53" }, { n: "奶咪", v: "cate54" }, { n: "有根棒棒", v: "cate55" }, { n: "不见星空", v: "cate56" }, { n: "Kitty", v: "cate57" }, { n: "妮可", v: "cate58" }, { n: "Cos女神", v: "cate59" }, { n: "玩偶姊姊", v: "cate60" }, { n: "司雨", v: "cate61" }, { n: "谭晓彤", v: "cate62" }, { n: "刘玥", v: "cate63" }, { n: "Vivian", v: "cate64" }, { n: "多乙", v: "cate65" }, { n: "朱可儿", v: "cate66" }, { n: "周大萌", v: "cate67" }] },
-  { id: "zone_media", name: "🎬传媒厂牌", default: "cate69", subs: [{ n: "麻豆传媒", v: "cate69" }, { n: "蜜桃传媒", v: "cate70" }, { n: "葫芦影业", v: "cate71" }, { n: "香蕉视频", v: "cate72" }, { n: "兔子先生", v: "cate73" }, { n: "OnlyFans", v: "cate74" }, { n: "91制片厂", v: "cate75" }, { n: "ED Mosaic", v: "cate76" }, { n: "IBiZa Media", v: "cate77" }, { n: "SA国际传媒", v: "cate78" }, { n: "乌托邦", v: "cate79" }, { n: "大象传媒", v: "cate80" }, { n: "天美传媒", v: "cate81" }, { n: "扣扣传媒", v: "cate82" }, { n: "性视界", v: "cate83" }, { n: "星空传媒", v: "cate84" }, { n: "映秀传媒", v: "cate85" }, { n: "杏吧原版", v: "cate86" }, { n: "果冻传媒", v: "cate87" }, { n: "爱神传媒", v: "cate88" }, { n: "爱豆传媒", v: "cate89" }, { n: "精东影业", v: "cate90" }, { n: "糖心Vlog", v: "cate91" }, { n: "萝莉社", v: "cate92" }] },
-  { id: "zone_cos", name: "🎀福利姬社", default: "cate94", subs: [{ n: "桥本香菜", v: "cate94" }, { n: "米菲兔", v: "cate95" }, { n: "捅主任", v: "cate96" }, { n: "npxvip", v: "cate97" }, { n: "Andm", v: "cate98" }, { n: "liburin", v: "cate99" }, { n: "谭晓彤", v: "cate100" }, { n: "小水水", v: "cate101" }, { n: "小鸟酱", v: "cate102" }, { n: "HAMAR", v: "cate103" }, { n: "铃木美子", v: "cate104" }, { n: "占星猫", v: "cate105" }, { n: "芋圆呀", v: "cate106" }, { n: "小丁妹妹", v: "cate107" }, { n: "米娜学姐", v: "cate108" }, { n: "米胡桃", v: "cate109" }, { n: "萌白酱", v: "cate110" }, { n: "麻酥酥", v: "cate111" }, { n: "白桃少女", v: "cate112" }, { n: "八月未央", v: "cate113" }] },
-  { id: "zone_melon", name: "🍉黑料吃瓜", default: "cate115", subs: [{ n: "网红大瓜", v: "cate115" }, { n: "校园猛料", v: "cate116" }, { n: "大奶孕妇", v: "cate117" }, { n: "独家泄密", v: "cate118" }, { n: "热门吃瓜", v: "cate119" }, { n: "潜规则", v: "cate120" }, { n: "反差泄露", v: "cate121" }, { n: "裸贷风波", v: "cate122" }, { n: "轮奸呀", v: "cate123" }, { n: "饥渴新娘", v: "cate124" }, { n: "强奸醉奸", v: "cate125" }, { n: "迷奸", v: "cate126" }] },
-  { id: "zone_pornhub", name: "🌐P站精选", default: "cate128", subs: [{ n: "AnnyWalker", v: "cate128" }, { n: "MilaAzul", v: "cate129" }, { n: "Comatozze", v: "cate130" }, { n: "Honey", v: "cate131" }, { n: "Luxury", v: "cate132" }, { n: "kittyxk", v: "cate133" }, { n: "JennyKitty", v: "cate134" }, { n: "LeoLulu", v: "cate135" }, { n: "PurpleB", v: "cate136" }, { n: "MilaLioness", v: "cate137" }, { n: "Pinklov", v: "cate138" }, { n: "PornForce", v: "cate139" }, { n: "Shinaryen", v: "cate140" }, { n: "EvaElfie", v: "cate141" }, { n: "Candy", v: "cate142" }, { n: "Kenzie", v: "cate143" }, { n: "CarlaCu", v: "cate144" }, { n: "webto", v: "cate145" }, { n: "SiaSib", v: "cate146" }] },
-  { id: "zone_flower", name: "🔎探花寻芳", default: "cate148", subs: [{ n: "沈先生", v: "cate148" }, { n: "赵总寻花", v: "cate149" }, { n: "小天探花", v: "cate150" }, { n: "换妻探花", v: "cate151" }, { n: "七天探花", v: "cate152" }, { n: "千人斩", v: "cate153" }, { n: "午夜尋花", v: "cate154" }, { n: "91大神", v: "cate155" }, { n: "按摩会所", v: "cate156" }, { n: "韩国嫖妓", v: "cate157" }, { n: "陈先生", v: "cate158" }, { n: "太子寻花", v: "cate159" }, { n: "翼屌寻花", v: "cate160" }, { n: "小宝寻花", v: "cate161" }, { n: "文轩探花", v: "cate162" }] },
-  { id: "zone_taboo", name: "🌪️逆天乱伦", default: "cate164", subs: [{ n: "兄妹情深", v: "cate164" }, { n: "最爱岳母", v: "cate165" }, { n: "淫荡儿媳", v: "cate166" }, { n: "淫乱父女", v: "cate167" }, { n: "照顾小侄女", v: "cate168" }, { n: "师生恋情", v: "cate169" }, { n: "母子情深", v: "cate170" }, { n: "姐弟爱恋", v: "cate171" }, { n: "调教嫂子", v: "cate172" }, { n: "照顾小姨子", v: "cate173" }] },
-  { id: "zone_erotic", name: "🔞精品三级", default: "cate175", subs: [{ n: "韩国三级", v: "cate175" }, { n: "香港三级", v: "cate176" }, { n: "台湾三级", v: "cate177" }, { n: "欧洲情色", v: "cate178" }, { n: "俄乌色情", v: "cate179" }, { n: "越南菲律宾", v: "cate180" }, { n: "印度情色", v: "cate181" }, { n: "日本三级", v: "cate182" }, { n: "美国色情", v: "cate183" }, { n: "东南亚情色", v: "cate184" }] },
-  { id: "zone_live", name: "📡火热直播", default: "cate186", subs: [{ n: "多人淫交", v: "cate186" }, { n: "车震直播", v: "cate187" }, { n: "日韩主播", v: "cate188" }, { n: "户外直播", v: "cate189" }, { n: "抖音网红", v: "cate190" }, { n: "主播勾引", v: "cate191" }, { n: "快手网红", v: "cate192" }, { n: "对着你", v: "cate193" }, { n: "AVOVE", v: "cate194" }, { n: "MISSWAEM", v: "cate195" }, { n: "妖骚蛇姬", v: "cate196" }, { n: "大啵啵", v: "cate197" }, { n: "虎牙辣妹", v: "cate198" }] },
-  { id: "zone_uniform", name: "👗制服诱惑", default: "cate200", subs: [{ n: "古装诱惑", v: "cate200" }, { n: "萝莉塔", v: "cate201" }, { n: "空姐诱惑", v: "cate202" }, { n: "丝袜诱惑", v: "cate203" }, { n: "职场OL", v: "cate204" }, { n: "清涩校服", v: "cate205" }, { n: "三点泳装", v: "cate206" }, { n: "JK短裙", v: "cate207" }, { n: "女仆装", v: "cate208" }, { n: "护士打针", v: "cate209" }, { n: "国风旗袍", v: "cate210" }, { n: "体操运动", v: "cate211" }, { n: "其他制服", v: "cate212" }] },
-  { id: "zone_asia", name: "🌸日韩精选", default: "cate214", subs: [{ n: "骑兵精选", v: "cate214" }, { n: "高清优质", v: "cate215" }, { n: "FC2高清", v: "cate216" }, { n: "VR视觉", v: "cate217" }, { n: "人妻巨乳", v: "cate218" }, { n: "少女制服", v: "cate219" }, { n: "药物迷奸", v: "cate220" }, { n: "强暴系列", v: "cate221" }, { n: "轮奸系列", v: "cate222" }, { n: "筱田佑", v: "cate223" }, { n: "森澤佳奈", v: "cate224" }, { n: "三上悠亜", v: "cate225" }, { n: "AkihoYoshizawa", v: "cate226" }, { n: "神宮寺奈緒", v: "cate227" }, { n: "藤森里穗", v: "cate228" }, { n: "松本一香", v: "cate229" }, { n: "乙爱丽丝", v: "cate230" }, { n: "沙月芽衣", v: "cate231" }, { n: "姬咲華", v: "cate232" }, { n: "AliceOtsu", v: "cate233" }, { n: "佐山愛", v: "cate234" }, { n: "水果解說", v: "cate235" }] },
-  { id: "zone_west", name: "🗽欧美洋马", default: "cate237", subs: [{ n: "推荐观看", v: "cate237" }, { n: "颜值少女", v: "cate238" }, { n: "网红洋马", v: "cate239" }, { n: "CandyLove", v: "cate240" }, { n: "丝袜制服", v: "cate241" }, { n: "欧美剧情", v: "cate242" }, { n: "AngelX", v: "cate243" }, { n: "商场性交", v: "cate244" }, { n: "情色按摩", v: "cate245" }, { n: "捷克搭讪", v: "cate246" }, { n: "肤若凝脂", v: "cate247" }, { n: "SweetieFox", v: "cate248" }, { n: "Morgpie", v: "cate249" }, { n: "DianRider", v: "cate250" }, { n: "BadCuteGirl", v: "cate251" }, { n: "Ailish", v: "cate252" }, { n: "SamanthaFlair", v: "cate253" }, { n: "滥交群交", v: "cate254" }, { n: "巨乳少女", v: "cate255" }, { n: "黑人大屌", v: "cate256" }] },
-  { id: "zone_variety", name: "🎭综艺娱乐", default: "cate258", subs: [{ n: "深夜保健室", v: "cate258" }, { n: "王竹子教学", v: "cate259" }, { n: "中指通一下", v: "cate260" }, { n: "Misa米砂", v: "cate261" }, { n: "小哥哥艾理", v: "cate262" }, { n: "Dr.She", v: "cate263" }, { n: "1G老湿", v: "cate264" }, { n: "两性知识", v: "cate265" }, { n: "麻豆综艺", v: "cate266" }, { n: "户外搭讪", v: "cate267" }, { n: "性愛大秀", v: "cate268" }, { n: "女优训练营", v: "cate269" }, { n: "情趣k歌房", v: "cate270" }, { n: "小鹏奇啪行", v: "cate271" }, { n: "性爱自修室", v: "cate272" }, { n: "女神体育祭", v: "cate273" }, { n: "屁孩日记", v: "cate274" }, { n: "薇傲的性趣", v: "cate275" }, { n: "一三蜜桃说", v: "cate276" }, { n: "Carrie雨千", v: "cate277" }] },
-  { id: "zone_cinema", name: "📽️影视影院", default: "cate279", subs: [{ n: "喜剧片", v: "cate279" }, { n: "古装片", v: "cate280" }, { n: "武侠片", v: "cate281" }, { n: "枪战片", v: "cate282" }, { n: "灾难片", v: "cate283" }, { n: "冒险片", v: "cate284" }, { n: "犯罪片", v: "cate285" }, { n: "科幻片", v: "cate286" }, { n: "动作片", v: "cate287" }, { n: "恐怖片", v: "cate288" }] }
+  { id: "zone_featured", name: "🔥今日精选", default: "route_home_featured", subs: [{ n: "今日推荐", v: "route_home_featured" }, { n: "X映画原创热播", v: "cate3" }, { n: "X站免费精选内容", v: "cate4" }, { n: "观看热榜", v: "cate5" }, { n: "逆天乱伦", v: "cate6" }, { n: "绿帽龟奴", v: "cate7" }, { n: "走马探花", v: "cate8" }, { n: "网曝黑料大瓜", v: "cate9" }, { n: "明星 AI 换脸", v: "cate10" }, { n: "网红主播激情大秀", v: "cate11" }, { n: "爆款收藏", v: "cate12" }] },
+  { id: "zone_media", name: "🎬传媒原创", default: "cate14", subs: [{ n: "🎬素人自摄", v: "cate14" }, { n: "💿麻豆热剧", v: "cate15" }, { n: "🍬糖心系列", v: "cate16" }, { n: "🍮果冻精选", v: "cate17" }, { n: "👼天使映画", v: "cate18" }, { n: "🌈天美热作", v: "cate19" }, { n: "✨星空夜欲", v: "cate20" }, { n: "🍑蜜桃诱惑", v: "cate21" }] },
+  { id: "zone_creator", name: "💃网黄", default: "cate23", subs: [{ n: "综合网黄", v: "cate23" }, { n: "桥本香菜", v: "cate24" }, { n: "小水水", v: "cate25" }, { n: "刘玥", v: "cate26" }, { n: "Ellie", v: "cate27" }, { n: "米菲兔", v: "cate28" }, { n: "辛尤里", v: "cate29" }, { n: "唐伯虎", v: "cate30" }, { n: "饼干姐姐", v: "cate31" }, { n: "吴梦梦", v: "cate32" }, { n: "台北娜娜", v: "cate33" }, { n: "玩偶姐姐", v: "cate34" }, { n: "柚子猫", v: "cate35" }] },
+  { id: "zone_asia", name: "🌸日韩", default: "cate37", subs: [{ n: "精选推荐", v: "cate37" }, { n: "FC2  无码", v: "cate38" }, { n: "淫妻母狗", v: "cate39" }, { n: "中文字幕", v: "cate40" }, { n: "素人AV", v: "cate41" }, { n: "JK制服", v: "cate42" }, { n: "口爆内射", v: "cate43" }, { n: "师生乱欲", v: "cate44" }, { n: "御姐足交", v: "cate45" }, { n: "家庭禁忌", v: "cate46" }] },
+  { id: "zone_west", name: "🗽欧美", default: "cate48", subs: [{ n: "欧美综合", v: "cate48" }, { n: "欧美辣妹", v: "cate49" }, { n: "欧美巨乳", v: "cate50" }, { n: "欧美熟女", v: "cate51" }, { n: "欧美SM", v: "cate52" }, { n: "欧美足控", v: "cate53" }, { n: "捷克木屋", v: "cate54" }] },
+  { id: "zone_anime", name: "🎞️动漫", default: "cate56", subs: [{ n: "综合动漫", v: "cate56" }, { n: "MMD-热舞系列", v: "cate57" }, { n: "MMD-纯爱3D", v: "cate58" }] },
+  { id: "zone_teach", name: "📚性爱教学", default: "cate60", subs: [{ n: "王竹子的SM教学频道", v: "cate60" }, { n: "中指通一下", v: "cate61" }, { n: "Misa.米砂", v: "cate62" }, { n: "小哥哥艾理", v: "cate63" }, { n: "verzz 异物梗色", v: "cate64" }, { n: "薇傲的性趣", v: "cate65" }, { n: "一三蜜桃说 Dr.Yishan", v: "cate66" }, { n: "Carrie雨千", v: "cate67" }] }
 ];
 function filtersFor(zone) {
   if (!zone || !zone.subs || zone.subs.length <= 1) return [];
@@ -88,23 +83,24 @@ function absUrl(u, host) {
   return u;
 }
 
-// 站方 data-original 常写成 https:/dfdf...（单斜杠）且图与播单在 dfdf 与 cloudfront 两线内容逐字节相同；
-// 统一修成标准 https:// 并走 cloudfront 线，避开 dfdf 单域名故障面
+// 站方 data-original/data-src 常写成 https:/dfdf...（单斜杠）；图与播单在 dfdf 与 sxtmo
+// 两线内容逐字节相同，只修 scheme、不改域名（2026-11-07：d1uy7 cloudfront 分发已死，
+// 再改写过去封面与播单全断；分片域名以播单内为准，不由这里改写）
 function normUrl(u) {
   let s = String(u || '').trim();
   if (!s) return '';
-  // 站方 cdn_lines 常写 https:/dfdf（单斜杠）或 https:///cloudfront（三斜杠），一律压成标准 https://
+  // 站方 cdn_lines 常写 https:/dfdf（单斜杠）或 https:///（三斜杠），一律压成标准 https://
   s = s.replace(/^(https?:)\/*/, '$1//');
   s = s.replace(/^(https?:)\/([^/])/, '$1//$2');
   if (s.startsWith('dfdf.tjacq.com/')) s = 'https://' + s;
-  s = s.replace('dfdf.tjacq.com', 'd1uy7itup9paqh.cloudfront.net');
+  if (s.startsWith('mkdscvxr3w34.sxtmo.com/')) s = 'https://' + s;
   return s;
 }
 
 function pickPlayBase(bases) {
   const list = Array.isArray(bases) ? bases : [];
-  const cf = list.find((b) => b.includes('cloudfront'));
-  if (cf) return cf;
+  const dfdf = list.find((b) => b.includes('dfdf.tjacq.com'));
+  if (dfdf) return dfdf;
   return list[0] || ALT_CDN;
 }
 
@@ -491,7 +487,7 @@ function extractPic(inner) {
     if (m) {
       const cand = m[1].trim();
       if (cand && !['loading.jpg', 'loading.png', 'placeholder', 'default'].some((b) => cand.toLowerCase().includes(b))) {
-        if (cand.startsWith('/')) return ALT_CDN + cand;
+        if (cand.startsWith('/')) return CDN + cand;
         return cand;
       }
     }
@@ -576,7 +572,7 @@ function extractPlayStream(html) {
   if (m) {
     let cand = m[1].trim().replace(/\\u002F/g, '/').replace(/\\\//g, '/');
     if (cand.startsWith('//')) cand = 'https:' + cand;
-    else if (cand.startsWith('/')) cand = ALT_CDN + cand;
+    else if (cand.startsWith('/')) cand = CDN + cand;
     else if (!cand.startsWith('http')) cand = CDN + '/' + cand;
     return { url: cand, viaDataUrl: true };
   }
@@ -592,7 +588,7 @@ function extractPlayStream(html) {
 // 2026-11-05 站方详情页改版：#article-videos 已消失，播放器改由
 // window.__ARCHIVE_PLAYER__ = {"rawPath":"\/video\/<日期>\/<id>\/<hash>.m3u8",
 //   "vttFile":"","posterImg":"https:\/dfdf...\/image\/...","cdnLine":"https:\/dfdf.tjacq.com",...}
-// 提供播单相对路径；rawPath 接 CDN 基址（优先 cdn_lines 的 cloudfront 线）即为播单。
+// 提供播单相对路径；rawPath 接 CDN 基址（优先 cdn_lines 的 dfdf 线）即为播单。
 function unescJsonStr(s) {
   return String(s || '').replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/\\"/g, '"');
 }
@@ -622,7 +618,7 @@ function archivePlayUrl(html) {
   if (raw.startsWith('//')) return normUrl('https:' + raw);
   const bases = parseCdnLines(html);
   let base = pickPlayBase(bases);
-  if (ap.cdnLine && !bases.some((b) => b.includes('cloudfront'))) base = normUrl(ap.cdnLine);
+  if (ap.cdnLine) base = normUrl(ap.cdnLine);
   if (!base) base = ALT_CDN;
   return normUrl(base.replace(/\/+$/, '') + (raw.startsWith('/') ? raw : '/' + raw));
 }

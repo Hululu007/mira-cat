@@ -5,6 +5,18 @@ import req from '../../util/req.js';
 //   https://<mee18player.com|meeplayer.com>/hlsr2/<40位hex>/master（VM 实测 4 个标题均直接返回 1080p 单档 master 播单，
 //   无需调 player 的 /api/video + /api/resolve；该 API 在 VM 侧数次调用后回 403 Forbidden，属上游限流，
 //   master 直链不受影响）。播单 variant 段为 .jpg 后缀分片（站方自家播放器同样如此），属 HLS 正常形态。
+// 【2026-11-07 播放不可 seek 病因，已实证】播单本身是完整 VOD（#EXT-X-PLAYLIST-TYPE:VOD、#EXT-X-ENDLIST、
+//   MEDIA-SEQUENCE 0/1、从 seg0000/index0 起、无 #EXT-X-START 偏移），不是 live 窗口、不是起始地址问题；
+//   但每个分片都是 PNG 包裹的 TS：固定 545 字节 PNG 头（200x200 占位图）+ 188 对齐的真 TS（实测 4017/4017
+//   同步命中，剥掉 PNG 头后 ffprobe 得 h264+aac）。分片以 image/jpeg 下发、.jpg 后缀。严格 HLS 内核见分片首字节
+//   不是 TS 便建不起 VOD 时间轴：能播但不从头播、无法快进后退（Mira）；更严的内核直接播不了（REX 侧“貌似播放不了”）。
+//   ?x=.ts 后缀无用（字节不变、仍是 PNG 头，实测 200 同长同字节）。修法（仿 porncgw 字节透传代理）：
+//   detail/play 一律给本地 /proxy/ 地址，代理实时拉清单改写（master 的 variant 行与音频 URI、媒体清单的分片行
+//   全部指回代理），分片字节透传时剥掉 PNG 头、以 video/mp2t 回给播放器；分片仍直连 CDN 取数，只在本地去头，
+//   不经第三方中转。分片行末尾另加 .ts 后缀（过 ffmpeg 分片后缀白名单，代理入口先剥后缀再解码）。
+//   代理拉取失败 302 回源地址，不比旧行为更差。
+//   另：1080p 档音视频分离（master 含 EXT-X-MEDIA 音频轨，视频分片纯视频、音频分片纯 AAC），旧版 detail 只给
+//   variant 单链会丢音频；现 detail 一律给 master 链，由播放器自行取 variant + 音频轨。
 // 分类：首页实测 70 个 /genre/<slug>/ + 菜单/归档实测的 /category/subthai|uncensored|censored/
 //   （uncensored 即站方自有的“无码”分区；无码流出/无码破解/减码无独立 slug，不硬编，见 NOTES.md；
 //   大屁股无对应 genre，'back' 为背后位而非臀部向，不作近义顶替）
@@ -12,6 +24,7 @@ import req from '../../util/req.js';
 // 翻页：归档 /page/<N>/（首页 /page/<N>/、分类与 genre 同理）
 // 字幕：与模板同一套 Layer A（迅雷 > 迅雷看看 > SubtitleCat），仅番号条目接芯；单码率 1080p，不编假档位。
 const HOST = 'https://www4.24-jav.com';
+const KEY = 'py_24jav';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
 function unescapeHtml(s) {
@@ -131,6 +144,160 @@ function parseMasterVariants(masterText) {
     }
   }
   return out;
+}
+
+// ---------------- 播单/分片本地代理（2026-11-07：剥 PNG 头，修不可 seek） ----------------
+// 病因见文件头：分片 = 545 字节 PNG 头 + 真 TS。播放器直触原地址建不起时间轴。
+// 代理只做两件事：清单改写（子清单/音频轨/分片行全部指回代理）、分片字节透传时剥头。
+// 地址用 porncgw 同款无查询串路径段形式 {dynamic}{prefix}/proxy/{b64 目标}/{b64 referer}，
+// 改写后的行用路径绝对形式（沿用请求自身的 spider 前缀），播放器按播单 origin 解析即回代理。
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 avhub/missav/porncgw 先例）
+function proxyUrl(reqIn, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}/proxy/${b64url(targetUrl)}/${b64url(referer || '-')}`;
+  } catch (e) { return ''; }
+}
+
+async function fetchBytes(url, referer) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
+        timeout: 30000,
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+    } catch (e) { /* 重试，落空走 302 降级 */ }
+  }
+  return null;
+}
+
+// 剥掉分片开头的 PNG 占位头：找首个 188 对齐的 TS 同步点（0x47 连续三次隔 188 出现），
+// 其前全部字节丢弃；已是纯 TS（首字节 0x47）或找不到同步点时原样返回，不比旧行为更差。
+function stripPngPrefix(buf) {
+  if (!buf || !buf.length) return buf;
+  if (buf[0] === 0x47) return buf;
+  for (let off = 0; off + 376 < buf.length; off++) {
+    if (buf[off] === 0x47 && buf[off + 188] === 0x47 && buf[off + 376] === 0x47) {
+      return buf.subarray(off);
+    }
+  }
+  return buf;
+}
+
+// 改写清单正文：# 行的 URI="..."（音频轨）与非 # 行（variant/分片）一律改指回本地代理。
+// 注意：ffmpeg 系严格内核按分片 URL 的后缀白名单（allowed_segment_extensions）放行分片，
+// 代理地址本身无后缀会被拒（实测 "is not in allowed_segment_extensions"），故媒体清单的分片行
+// 末尾加 .ts 后缀（b64url 字母表无 '.'，后缀无歧义；代理入口先剥后缀再解码）；
+// master 的 variant 行与音频 URI 行是子播单、不进分片白名单检查，不加后缀（同 missav 先例）。
+function rewrite24javM3u8(raw, playlistUrl, selfBase, referer) {
+  const isMaster = String(raw).includes('#EXT-X-STREAM-INF');
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try {
+            const abs = new URL(uri, playlistUrl).toString();
+            return `URI="${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}"`;
+          } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    try {
+      const abs = new URL(s, playlistUrl).toString();
+      const suffix = isMaster ? '' : '.ts';
+      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}${suffix}`;
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
+}
+
+// 代理入口（两种地址格式都接受）：
+// 新格式：/proxy/{b64url 目标}/{b64url referer}，无查询串；
+// 旧格式（兼容）：/proxy/m3u8?u={b64url}&r={b64url}。
+// 取回的文本是 #EXTM3U 即按清单改写；否则按分片字节透传并剥 PNG 头（支持 Range，便于拖动）。
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    // 分片行带 .ts 后缀（过 ffmpeg 分片后缀白名单）；b64url 无 '.'，剥后缀无歧义。
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  try {
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  let selfBase = '/spider/' + KEY + '/3';
+  try {
+    const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+    const pi = rawPath.indexOf('/proxy/');
+    if (pi > 0) selfBase = rawPath.slice(0, pi);
+  } catch (e) { /* 用默认前缀 */ }
+  try {
+    const buf = await fetchBytes(target, referer);
+    if (!buf || !buf.length) { reply.redirect(target); return; }
+    const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+    if (head.trimStart().startsWith('#EXTM3U')) {
+      reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(rewrite24javM3u8(buf.toString('utf8'), target, selfBase, referer));
+      return;
+    }
+    const ts = stripPngPrefix(buf);
+    const range = request?.headers && request.headers.range;
+    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      const start = Math.min(parseInt(m[1], 10) || 0, ts.length);
+      const end = m[2] ? Math.min(parseInt(m[2], 10), ts.length - 1) : ts.length - 1;
+      if (start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', 'bytes ' + start + '-' + end + '/' + ts.length);
+        reply.send(ts.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(ts);
+  } catch (e) {
+    try { reply.redirect(target); } catch (e2) { /* 已发送则忽略 */ }
+  }
 }
 
 async function reqRaw(url, headers, timeoutMs) {
@@ -550,10 +717,13 @@ async function detail(reqIn) {
   const mee = extractMeeMd5(html);
   let playUrl = '';
   if (mee) {
-    // 优先读 master 播单拆真实档位（实测均为单档 1080p）；读不到则直接给 master 单档。
-    const variants = parseMasterVariants(await getText(masterUrl(mee)));
-    const opts = variants.length ? variants : [{ label: '正片', url: masterUrl(mee) }];
-    playUrl = opts.map((o) => o.label + '$' + durl + '@@' + o.url).join('#');
+    // 读 master 播单只为取档位名作标签；播放地址一律给 master 走本地代理（代理内再拆 variant + 音频轨，
+    // 1080p 音视频分离的片子才有声音；分片 PNG 头由代理剥掉，播放器才能建 VOD 时间轴、从头播、可拖动）。
+    const master = masterUrl(mee);
+    const variants = parseMasterVariants(await getText(master));
+    const label = variants.length ? variants[0].label : '正片';
+    const proxied = proxyUrl(reqIn, master, durl);
+    playUrl = label + '$' + durl + '@@' + (proxied || master);
   }
   return {
     list: [{
@@ -585,6 +755,11 @@ async function play(reqIn) {
     }
     if (!target) return { parse: 1, url: durl || HOST + '/' };
   }
+  // 旧缓存的详情可能仍带 mee 直链：统一包一层本地代理再出（已是代理地址的不重复包）。
+  if (target.indexOf('/proxy/') < 0 && /mee(18)?player\.com/i.test(target)) {
+    const proxied = proxyUrl(reqIn, target, durl || HOST + '/');
+    if (proxied) target = proxied;
+  }
   // 字幕按条目接：仅当标题或地址含番号才搜，否则不带 subs 键
   const title = subNameCache.get(durl) || '';
   const code = subExtractCode(title) || subExtractCode(durl);
@@ -604,6 +779,8 @@ export default function createSpider() {
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
+      fastify.get('/proxy/*', m3u8Proxy);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
       fastify.post('/search', search);
     },
   };

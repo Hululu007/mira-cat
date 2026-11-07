@@ -39,6 +39,12 @@ import req from '../../util/req.js';
 //       SW 在 Worker 不通时留蜘蛛内 hls3 直链作最后手段（手机住宅
 //       出口可能过 hls3 的 ASN 门禁，不探活、交播放器试）；详情页无
 //       播放器标记时换镜像再抓一次（防 DDoS 拦截页毒死整条链）。
+// 播放 (v6, 2026-11-07): (1) 转圈根因是 F4 分片伪装——seg_XXXXX.png
+//       文件名 + image/png 下发，HLS 内核拒收分片、建不起时间轴，
+//       Worker v2 已修（分片改写 /s/<名>.ts + 强制 video/MP2T），
+//       蜘蛛侧返回的 Worker 地址形态不变；(2) 点指定线路集时第一步
+//       不再抢先返回默认线：hint 与默认线不同先走借线（hint 排最先），
+//       借线全灭再回落默认线——此前点 SW/FL/DD 集永远播的是默认 F4。
 // 实测根因 (2026-10-20 VM 验证): f4 CDN 的 playlist、子列表、每个分片
 //       请求都必须带 Origin: https://f4scdn.com 才能 200（UA-only 403、
 //       Referer 403）。其官方 api/play?ab=0 能拿签名 src，但 src 的列表与
@@ -786,7 +792,11 @@ async function play(reqIn) {
   // —— 第一步: 默认线路（embed 已在详情页 HTML 里，零额外请求）——
   // v4 的教训: 默认线排在借线之后试，每条借线都含 ajax+探活，占 70% 的
   // 默认 F4 反而最后才轮到，慢且险（探活/超时误杀）。v5 默认线最先。
-  if (defEmbed) {
+  // v6: 用户点了指定线路集（hint）且与默认线不同时，第一步让路——
+  // 先走第二步借线（hint 排最先），借线全灭再回落默认线（见第三步前）。
+  const defLine = !defEmbed ? '' : (isF4HostName(hostOf(defEmbed)) ? 'F4' : (isSwHostName(hostOf(defEmbed)) ? 'SW' : ''));
+  async function tryDefaultEmbed() {
+    if (!defEmbed) return null;
     const dhost = hostOf(defEmbed);
     if (isF4HostName(dhost)) {
       // F4 默认: Worker /f4 全链已在真实部署上逐跳验通（api/play 收 CF
@@ -814,6 +824,11 @@ async function play(reqIn) {
         if (r && r.url) return subAttach(r, subsP);
       } catch (e) { /* 落到借线 */ }
     }
+    return null;
+  }
+  if (!hint || hint === defLine) {
+    const d0 = await tryDefaultEmbed();
+    if (d0) return d0;
   }
 
   // 会话态补强（best-effort）：直连详情页取 Set-Cookie 回带到 ajax POST，
@@ -882,6 +897,12 @@ async function play(reqIn) {
       const r = await resolveEmbed(embed, durl);
       if (r && r.url) return subAttach(r, subsP);
     } catch (e) { /* 换下一条线路 */ }
+  }
+
+  // 用户点了非默认线路且借线全灭：回落第一步为让路而跳过的默认线。
+  if (hint && hint !== defLine) {
+    const fb = await tryDefaultEmbed();
+    if (fb) return fb;
   }
 
   // —— 第三步: SW 最后手段（蜘蛛内 hls3 直链，不探活、交播放器试）——

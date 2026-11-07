@@ -2,7 +2,8 @@ import req from '../../util/req.js';
 
 // AV影社 https://www.0817hyjx.com/cn —— 日本 AV 聚合站（MissAV 系镜像站）
 // 列表：<article class="ms2-card">（img src 直链封面 + alt 标题 + 时长 span）；翻页 ?page=N
-// 详情：<h1> 标题 + iframe playdaili.com/api/public/missav-player/<id>，
+// 详情：<h1> 标题 + iframe /api/public/missav-player/<id>（2026-11-07 站方把绝对地址
+//   https://playdaili.com/api/public/missav-player/<id> 改为本站相对地址，两腿回同一页），
 //   该页内 <script id="missav-config"> JSON 含 poster 与 source（playorigincdn.com master.m3u8）
 // 播放：单码率（master 仅一条 media.m3u8，分片为 .jpeg 伪装的 ts，HEAD 200 video/mp2t）；
 //   站方不给多档，绝不编假清晰度。字幕按条目接（仅标题/地址含番号的条目才接芯）。
@@ -517,9 +518,14 @@ async function detail(reqIn) {
   subCacheName(durl, title);
   let playUrl = '';
   let posterPic = '';
-  const iframeM = html.match(/<iframe[^>]+src=["'](https:\/\/playdaili\.com\/api\/public\/missav-player\/\d+)["']/i);
+  // 2026-11-07: 详情页 iframe src 由绝对地址 https://playdaili.com/api/public/missav-player/<id>
+  //   改为本站相对地址 /api/public/missav-player/<id>（两腿均返回同一 missav-config）；
+  //   旧正则只认绝对地址，匹配失败导致 playUrl 为空、详情无播放地址、无法播放。
+  //   两种形态都认，相对地址补 HOST。
+  const iframeM = html.match(/<iframe[^>]+src=["']((?:https:\/\/playdaili\.com)?\/api\/public\/missav-player\/\d+)["']/i);
   if (iframeM) {
-    const playerHtml = await getHtml(iframeM[1]);
+    const playerUrl = iframeM[1].startsWith('http') ? iframeM[1] : HOST + iframeM[1];
+    const playerHtml = await getHtml(playerUrl);
     const cfgM = playerHtml.match(/id="missav-config">(\{[\s\S]*?\})<\/script>/);
     if (cfgM) {
       try {

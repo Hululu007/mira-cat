@@ -2,7 +2,7 @@ import req from '../../util/req.js';
 
 const KEY = 'py_sanjipian';
 const NAME = '蝴蝶影院';
-const DEFAULT_HOST = 'https://ptt01.com';
+const DEFAULT_HOST = 'https://ptt03.net';
 const NAV_URLS = ['https://x99dh.cc', 'https://x99dh.one'];
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko)';
 const BRAND = '蝴蝶影视';
@@ -152,7 +152,7 @@ async function refreshSiteUrl() {
 for (const nav of NAV_URLS) {
 let text = '';
 try {
-const { data} = await req.get(nav, { headers: headers(), timeout: 4000});
+const { data} = await req.get(nav, { headers: headers(), timeout: 4000, validateStatus: () => true});
 text = String(data || '');
 } catch (e) {
 continue;
@@ -173,7 +173,7 @@ if (!unquoted.includes(NAME) &&!unquoted.includes('稀缺资源')) continue;
 const siteList = JSON.parse(unquoted);
 for (const item of siteList) {
 const name = String(item.name || '').trim();
-if (name!== NAME && name!== '稀缺资源') continue;
+if (!name.includes(NAME) && !name.includes('稀缺资源')) continue;
 const cands = [];
 if (item.url) cands.push(item.url);
 for (const uo of item.urls || []) {
@@ -347,7 +347,20 @@ let playUrl = String(body.id || '').trim();
 if (playUrl &&!/^https?:\/\//i.test(playUrl) && (playUrl.startsWith('/v/') || playUrl.startsWith('/'))) {
 const res = await fetchText(playUrl, '', true);
 const mHls = (res.text || '').match(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/);
-if (mHls) playUrl = mHls[0].replace(/\\\//g, '/');
+if (mHls) {
+playUrl = mHls[0].replace(/\\\//g, '/');
+} else {
+// /v/ 页无内嵌直链（JS 播放器）：交 App 嗅探，别把 HTML 页当直链回 parse:0
+return {
+parse: 1,
+url: siteUrl + playUrl,
+header: {
+'User-Agent': UA,
+'Referer': siteUrl + '/',
+'Origin': siteUrl,
+},
+};
+}
 }
 
 return {

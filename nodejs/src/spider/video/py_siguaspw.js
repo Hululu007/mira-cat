@@ -3,7 +3,7 @@ import req from '../../util/req.js';
 // 丝瓜视频 https://siguaspw.cc —— 与桃花视频同 CMS（/video/<19位数字>/ + data-url 播单 + cdn_lines）
 // 分类：首页实测 228 个 /category/cateNN/（创作者/题材/厂牌/更多四组作分区 + 筛选卡片，分区按分类名语义归纳，cate ID 与名均取自首页）
 // 2026-11-04 新增 8 个顶级分类（题材标签区已证实 cate，名与 ID 均取自首页实测；现有 5 类与 filters 结构不动）
-// 列表翻页：/category/<cate>/<页码>/；详情 data-url 拼 cdn_lines 首选 cloudfront 线（d1uy7itup9paqh，VM 实测 200）
+// 列表翻页：/category/<cate>/<页码>/；详情 data-url 拼 cdn_lines 首条（站方默认，2026-11-07 实测 sxtmo 线播单/key/分片全链 200；旧首选 d1uy7itup9paqh 已不在 cdn_lines 里，d22 cloudfront 线分片 host 连不上）
 // 播放：单码率媒体播单（AES-128），不设假多档；字幕按条目接（仅标题含番号的条目才接芯，多数中文标题无番号则不接）
 const HOST = 'https://siguaspw.cc';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
@@ -125,12 +125,12 @@ function parseCdnLines(html) {
   return bases;
 }
 
+// 2026-11-07：站方 cdn_lines 已轮换，d1uy7itup9paqh.cloudfront.net 不再出现；
+// 实测：首条 sxtmo 线全链通（播单/key/分片均 200），d22 cloudfront 线播单 200 但其分片 host
+// d2ln4qgmi83wfi.cloudfront.net 连不上（VM 侧 fetch+curl 共 0/5，空回复/连接重置），故首选站方
+// 默认首条（站方 JS 同款默认 cdn_lines[0]），不再优先 cloudfront。
 function pickPlayBase(bases) {
   const list = Array.isArray(bases) ? bases : [];
-  const cf = list.find((b) => b.includes('d1uy7itup9paqh.cloudfront.net'));
-  if (cf) return cf;
-  const anyCf = list.find((b) => b.includes('cloudfront'));
-  if (anyCf) return anyCf;
   return list[0] || '';
 }
 
@@ -544,7 +544,7 @@ async function detail(reqIn) {
   const ogM = html.match(/property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
   if (ogM) posterPic = normUrl(ogM[1].trim());
   if (!posterPic) {
-    const cm = html.match(/https:\/\/d1uy7itup9paqh\.cloudfront\.net\/image\/[^\s"'<>]+/);
+    const cm = html.match(/https:\/\/[^\s"'<>]+\/image\/[^\s"'<>]+/);
     if (cm) posterPic = cm[0];
   }
   let playUrl = '';

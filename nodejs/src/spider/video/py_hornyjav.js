@@ -7,15 +7,24 @@
 //  - 分类（导航实测，仅 3 个视频分类）：Censored /category/censored/，
 //    English Subtitle /category/english-subtitle/，Reducing Mosaic
 //    /category/reducing-mosaic/（/actors/、/studios/ 是人物索引，不作分类）。
-//  - 播放（2026-10-30 破解）：详情 <div class="box-server"
+//  - 播放（2026-10-30 破解，2026-11-07 上游已变）：详情 <div class="box-server"
 //    data-server-urls="[&quot;token&quot;,…]">（每帖 4 个 token）；
 //    token 解码：反转字符串 → base64url 转 base64 补 '=' → 解码 →
 //    按字节与密钥 "KmzWa8awaallakclnu" 循环异或 → videplay 嵌页 URL
-//    （如 https://x.videplay.us/v/… 或 /x/…）；解出非 https:// 开头的
-//    视为密钥已换，该条作废。嵌页是 jwplayer8 页，内含 Dean Edwards
-//    打包块，解包后取 https://api.videplay.us/o/v-master.m3u8/{token}
-//    —— 即直链 master 清单。本站给的是服务器选择（4 条 videplay 线），
-//    不是分辨率档（master 内多码率由播放器自动选），故线名是服务器。
+//    （如 https://x.videplay.us/x/… 或 https://xx.streamhx.win/v/…）；
+//    解出非 https:// 开头的视为密钥已换，该条作废。嵌页是 jwplayer8 页，
+//    内含 Dean Edwards 打包块，解包后取 master 清单——上游已迁到
+//    streamhx（dual/api.streamhx.win，另有 /ved/ 与 f4-master 变体），
+//    master 形如 https://<host>/…/v-master.m3u8/<TOKEN>，TOKEN 段不可丢
+//    （旧正则只认 api.videplay.us/o/ 且回退在 .m3u8 后截断，返回的裸
+//    master 一律 404，就是“解析出来播不了”的主因）。本站给的是服务器
+//    选择（4 条线），不是分辨率档（master 内单 720p 码率），故线名是
+//    服务器。分片是真 TS 却伪装成图片下发：70 字节 1×1 PNG 头 +
+//    TS 体（100% 188 字节同步）、tiktokcdn .image 地址 + image/png
+//    类型；严格 HLS 内核按扩展名拒收，故播放地址改走本地 /proxy/m3u8
+//    改写清单（分片行尾加 &x=.ts，实测签名有效、字节不变；分片仍直连
+//    CDN），同 MissAV SQTE-727 / missav_xptv.js 先例。4 条嵌页并行解
+//    （串行实测 15–30 秒），字幕预热随详情取回即起、播放地址作别名。
 import req from '../../util/req.js';
 
 const KEY = 'py_hornyjav';
@@ -33,9 +42,9 @@ function H(referer) {
   };
 }
 
-async function getText(url, referer) {
+async function getText(url, referer, timeoutMs) {
   try {
-    const { data } = await req.get(url, { headers: H(referer), timeout: 15000 });
+    const { data } = await req.get(url, { headers: H(referer), timeout: timeoutMs || 15000 });
     return String(data || '');
   } catch { return ''; }
 }
@@ -180,10 +189,15 @@ async function resolveVideplay(embedUrl, durl) {
   const html = await getText(embedUrl, durl);
   if (!html) return '';
   const unpacked = unpackDeanEdwards(html);
-  const hay = unpacked || html;
-  const m = hay.match(/https:\/\/api\.videplay\.us\/o\/v-master\.m3u8\/[A-Za-z0-9_\-\.]+/i);
+  // 解包后的 JS 源码里 URL 写在转义引号里、token 内有 \/ 转义：先把 \/ 还原
+  // 成 /；token 段的字符类排除反斜杠，避免把尾部 \" 的反斜杠吞进 URL
+  const hay = (unpacked || html).replace(/\\\//g, '/');
+  // 2026-11-07：取“*.m3u8/<token>”全段（任意域名/路径，含 /ved/ 与
+  // f4-master 变体）；token 段不可丢，丢了就是 404。无 token 段的裸
+  // 清单只作次选。
+  const m = hay.match(/https?:\/\/[^\s"'<>\\]*\.m3u8\/[^\s"'<>\\]+/i);
   if (m) return m[0];
-  const m2 = hay.match(/https?:\/\/[^"'\s<>]+\.m3u8(?:\?[^"'\s<>]*)?/i);
+  const m2 = hay.match(/https?:\/\/[^\s"'<>\\]+\.m3u8(?:\?[^\s"'<>\\]*)?/i);
   return m2 ? m2[0] : '';
 }
 
@@ -198,30 +212,46 @@ async function detail(reqIn) {
     const title = hm ? stripTags(hm[1]) : 'HornyJav';
     const ogm = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i);
     const pic = ogm ? ogm[1] : '';
+    // 字幕预热提前（2026-11-07）：详情取回后立刻按详情 URL 起一趟搜索，
+    // 与下面 4 条嵌页解析并行；播放地址解出后登记别名，点播时复用同一趟，
+    // 不再另起一趟等 6 秒预算
+    subCacheName(durl, title);
+    subWarm(durl);
     const lines = [];
     const bm = html.replace(/&quot;/g, '"').match(/data-server-urls="\[([^\]]*)\]"/i);
     if (bm) {
       let tokens = [];
       try { tokens = JSON.parse('[' + bm[1] + ']'); } catch { tokens = []; }
-      let idx = 0;
-      for (const tok of tokens) {
-        idx++;
+      const embeds = [];
+      tokens.forEach((tok, t) => {
         const embed = decodeToken(tok);
-        if (!embed || !/^https:\/\//i.test(embed)) continue;
-        const master = await resolveVideplay(embed, durl);
-        if (master) lines.push('服务器' + idx + '$' + master);
-      }
+        if (embed && /^https:\/\//i.test(embed)) embeds.push({ idx: t + 1, embed });
+      });
+      // 4 条嵌页并行解（2026-11-07）：串行实测每条 2–10 秒、合计 15–30 秒，
+      // 并行后只剩最慢一条；线名仍按 token 原序（服务器 N），顺序不变
+      const masters = await Promise.all(embeds.map((e) =>
+        resolveVideplay(e.embed, durl).catch(() => '')));
+      // master 逐条验活（2026-11-07 probe15）：上游 token 按 (视频, 服务器)
+      // 固化，个别线 token 已死——源站回 502（dvdes-674 服务器1）或 200
+      // 空体（服务器4）；只把取到有效清单的线交给用户，死线不列出。
+      // 验活并行、10 秒上限，清单须以 #EXTM3U 开头才算活。
+      const live = await Promise.all(masters.map((master, k) =>
+        master
+          ? getText(master, embeds[k].embed, 10000).then((txt) => (txt && txt.indexOf('#EXTM3U') === 0 ? k : -1)).catch(() => -1)
+          : Promise.resolve(-1)));
+      live.forEach((k) => {
+        if (k < 0) return;
+        const master = masters[k];
+        // 播放地址改走本地 /proxy/m3u8（改写分片后缀，见文件尾代理段注释）；
+        // 代理地址构造失败时降级回原始直链（旧行为）
+        const playUrl = proxyUrl(reqIn, '/proxy/m3u8', master, embeds[k].embed) || master;
+        lines.push('服务器' + embeds[k].idx + '$' + playUrl);
+        // 字幕别名：播放地址 -> 详情 URL（subSearchAll 命中别名即复用预热）
+        subAlias.set(playUrl, durl);
+        if (subAlias.size > 200) subAlias.delete(subAlias.keys().next().value);
+      });
     }
     if (!lines.length) lines.push('网页播放$' + durl);
-    // 字幕预热：按每条播放地址登记片名（key 须与 play() 传给 subSearchAll
-    // 的字符串完全一致——本源 play 直接取 $ 后的 master m3u8 地址，兜底线
-    // 的地址即详情 URL）；后台逐条串行找字幕（不 await，不一拥而上）
-    for (const l of lines) subCacheName(l.includes('$') ? l.split('$').pop() : l, title);
-    (async () => {
-      for (const l of lines) {
-        try { await subSearchAll(l.includes('$') ? l.split('$').pop() : l); } catch (e) {}
-      }
-    })().catch(() => {});
     list.push({ vod_id: raw, vod_name: title, vod_pic: pic, vod_play_from: NAME, vod_play_url: lines.join('#') });
   }
   return { list };
@@ -230,7 +260,7 @@ async function detail(reqIn) {
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
-  const isVideo = /\.(m3u8|mp4)/i.test(id);
+  const isVideo = /\.(m3u8|mp4)/i.test(id) || id.includes('/proxy/m3u8');
   const result = {
     parse: isVideo ? 0 : 1,
     url: id,
@@ -282,6 +312,7 @@ async function reqRaw(url, headers, timeoutMs) {
 const SUB_TTL = 10 * 60 * 1000;
 const subNameCache = new Map();   // durl -> 片名 (detail 时 best-effort 写入)
 const subResultCache = new Map(); // durl -> {ts, subs}
+const subAlias = new Map(); // 播放地址 -> 详情 URL（字幕预热别名，2026-11-07）
 
 function subCacheName(durl, name) {
   if (!durl || !name) return;
@@ -586,6 +617,17 @@ function subMerge(items) {
 const subInflight = new Map(); // durl -> Promise<subs> (detail 预热与 play 共用同一趟)
 
 async function subSearchAll(durl) {
+  // 别名（2026-11-07）：detail 预热以详情 URL 为 key，play 以播放地址
+  // 来查时复用同一趟搜索（不另起一趟）；结果同时记到播放地址名下
+  const alias = subAlias.get(durl);
+  if (alias && alias !== durl) {
+    const subs = await subSearchAll(alias).catch(() => []);
+    if (subs && subs.length) {
+      subResultCache.set(durl, { ts: Date.now(), subs });
+      if (subResultCache.size > 200) subResultCache.delete(subResultCache.keys().next().value);
+    }
+    return subs || [];
+  }
   const hit = subResultCache.get(durl);
   if (hit && Date.now() - hit.ts < SUB_TTL) return hit.subs;
   if (subInflight.has(durl)) return subInflight.get(durl);
@@ -632,6 +674,105 @@ function subWarm(durl) {
   subSearchAll(durl).catch(() => {});
 }
 
+
+// ---------- m3u8 本地代理（修复分片伪装成图片导致的“视频加载失败”） ----------
+// 病因（2026-11-07 实证，huntb-277-rm）：master/variant 清单本身 200 正常，
+// 但 1440 个分片全是 tiktokcdn 的 .image 地址 + image/png 类型，且每片
+// 前 70 字节是 1×1 PNG 头、之后才是 100% 同步的真 TS 体。严格 HLS 内核
+// 按分片扩展名白名单拒收，播放器转圈后报“视频加载失败”（与 MissAV
+// SQTE-727 的 .jpeg 伪装同类病因）。实测分片 URL 尾加 &x=.ts 后 CDN 仍
+// 回 200 且字节完全相同（签名不校验多余参数），故沿用 missav_xptv.js
+// 的 /proxy/m3u8 先例：detail 的播放地址改为本地代理地址，代理实时拉
+// 清单并改写——主清单的 variant 行改指回代理，媒体清单的分片行改成 CDN
+// 绝对地址 + &x=.ts 后缀（分片仍直连 CDN，不经代理）；代理拉取失败时
+// 302 回源清单，不比旧行为更差。
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  } catch (e) { return ''; }
+}
+
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 missav_xptv 先例）
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+
+async function fetchPlaylistText(url, referer) {
+  try {
+    const { data, status } = await req.get(url, {
+      headers: H(referer),
+      timeout: 20000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+    });
+    if (status >= 200 && status < 300 && data) return String(data);
+  } catch (e) { /* 落空走 302 降级 */ }
+  return '';
+}
+
+// 改写清单正文：selfBase 为代理自身地址（由进来的请求 Host 拼出，
+// 清单正文里必须是真实 http 地址，不能嵌 js2p）。
+// - 主清单（含 EXT-X-STREAM-INF）：variant 行 -> 指回代理；
+// - 媒体清单：分片行 -> CDN 绝对地址 + &x=.ts 后缀（已有查询串用 &，
+//   否则用 ?；tiktokcdn 签名不校验多余参数，实测字节不变）；
+// - # 行 URI="..." 属性 absolutize（本站无密钥，仅兜底）。
+function rewriteHornyjavM3u8(raw, playlistUrl, selfBase, referer) {
+  const isMaster = raw.includes('#EXT-X-STREAM-INF');
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try { return `URI="${new URL(uri, playlistUrl).toString()}"`; } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    let abs;
+    try { abs = new URL(s, playlistUrl).toString(); } catch (e) { return line; }
+    if (isMaster) {
+      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+    }
+    return abs + (abs.includes('?') ? '&' : '?') + 'x=.ts';
+  });
+  return out.join('\n');
+}
+
+// GET /proxy/m3u8?u={b64url 清单地址}&r={b64url referer}
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const raw = await fetchPlaylistText(target, referer);
+  if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(rewriteHornyjavM3u8(raw, target, selfBase, referer));
+}
+
 export default function createSpider() {
   return {
     meta: { key: KEY, name: NAME, type: 3 },
@@ -642,6 +783,8 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      // m3u8 代理 (GET)：播放时实时改写清单的分片后缀（见文件尾代理段注释）
+      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
