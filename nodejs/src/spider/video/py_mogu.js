@@ -28,6 +28,21 @@ import req from '../../util/req.js';
 //   密钥（16 字节）同样走代理取回；播放器不再直连 dfdf / cloudfront。
 //   mogu-fetch Worker 的 /f 只放行 moguds.cc（实测 dfdf 回 400 bad target），
 //   代理取数只能走直连 req.get（同 24JAV）。
+// 2026-11-07 第三轮（列表时有时无）：用户 21:33 真机——猫源蘑菇能加载列表分类，
+//   7 大区仍全是“暂无数据”，有时个别分类有内容，多刷新几次又全没内容。
+//   VM 重复取样坐实（probe_list / probe_v2 / probe_burst 日志）：站方不空回、不挑战、
+//   不 429——每个 200 响应字节稳定、满卡（首页 12/12 + 10 轮对照 9/10 均 103 卡，
+//   cate37 12/12 + 10/10 均 20 卡，Worker 腿首页/分类各 16/16、详情 3/3、搜索有/无
+//   结果均正常，无结果搜索页 75KB 0 卡是站方真空）；病因是“慢腿 + 顺序 + 静默空”：
+//   直连腿健康时 1～8 秒、偶发长 stall（cate23 9.5→18.2→20 秒超时，cate60 连续
+//   20 秒超时，v2 第 10 轮直连首页 8 秒超时），而旧 getHtml 先直连 20 秒、再 Worker
+//   20 秒，直连一 stall 就吃掉 App 超时预算、Worker 兜底够不着；且 home/category/
+//   search 取页失败全部静默回 []，失败与真空分不出来，App 只能显示“暂无数据”。
+//   修法：getHtml 改 Worker 优先（mogu-fetch /f 只放行 moguds.cc，正好覆盖列表/
+//   详情/搜索全部文字页；实测分类重复请求多 <1 秒、CF 缓存命中，最稳最快）、直连
+//   8 秒回落、内容校验（>2000 字节且无挑战页才算真 HTML）；取页全失败时 category/
+//   search/home 带 msg 回空列表（av123 同款先例），失败不再伪装成真空。
+//   播放代理 v2（/proxy/* 全程字节代理）本轮一字不动——列表不走它，已证伪无关。
 // 分类：7 大区作顶级分类，各区细分走筛选卡片 filters.sub；6 个分组父类
 //   （cate13/22/36/47/55/59）站方本身无内容，不列为细分，默认取各组首个有内容的子类。
 // 列表：<a href="/video/\d+/"> 卡片，封面 data-src 走 dfdf.tjacq.com（实测 200）
@@ -38,8 +53,9 @@ const KEY = 'py_mogu';
 const HOST = 'https://moguds.cc';
 const CDN = 'https://dfdf.tjacq.com';
 const ALT_CDN = 'https://mkdscvxr3w34.sxtmo.com'; // 站方 cdn_lines 第二线；d1uy7 cloudfront 分发已死（2026-11-07 实测 TLS 断），不再使用
-// 取数 Worker（2026-11-05 待用户部署：https://mogu-fetch.li768435813.workers.dev，根回 mogu fetch ok；
-// 未部署前 Worker 腿取数失败即回落，行为与现在一致）。直连优先，Worker 只作 CF 挑战/拦截时的兜底。
+// 取数 Worker（2026-11-05 用户已部署：https://mogu-fetch.li768435813.workers.dev，根回 mogu fetch ok；
+// /f 只放行 moguds.cc，列表/详情/搜索文字页全覆盖，dfdf 媒体不在其放行范围——播放仍走本地 /proxy/*）。
+// 本轮起 Worker 优先、直连回落（见 getHtml）：Worker 腿实测最稳（分类 16/16、重复请求多 <1 秒）。
 const FETCH_WORKER = 'https://mogu-fetch.li768435813.workers.dev';
 // 纯 JS b64url（与 REX 版同一实现；App 内 Buffer 可用，但与 REX 共用一份更稳）
 const B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -134,11 +150,18 @@ function isChallengeHtml(html) {
     || s.includes('developers.cloudflare.com');
 }
 
+function looksRealHtml(html) {
+  const s = String(html || '');
+  // 真页最小也是 75KB 级模板（无结果搜索页实测 75055 字节）；短回包/挑战页一律不算
+  if (s.length <= 2000) return false;
+  return !isChallengeHtml(s);
+}
+
 async function fetchHtmlOnce(url, timeoutMs) {
   try {
     const r = await req.get(url, {
       headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' },
-      timeout: timeoutMs || 20000,
+      timeout: timeoutMs || 8000,
     });
     if (r.status && r.status !== 200) return '';
     return typeof r.data === 'string' ? r.data : '';
@@ -149,12 +172,15 @@ async function getHtml(path) {
   let url = String(path || '');
   if (url.startsWith('//')) url = 'https:' + url;
   else if (url.startsWith('/')) url = HOST + url;
-  const direct = await fetchHtmlOnce(url, 20000);
-  if (direct && !isChallengeHtml(direct)) return direct;
-  // 直连空回或被 CF 挑战页拦截时走 Worker 兜底（Worker 未部署则仍为空，与现在一致）
-  const via = await fetchHtmlOnce(viaWorker(url), 20000);
-  if (via && !isChallengeHtml(via)) return via;
-  return direct && !isChallengeHtml(direct) ? direct : '';
+  // Worker 优先：直连腿慢且偶发长 stall（健康 1～8 秒、偶发 >8 秒甚至 20 秒超时），
+  // 旧顺序先直连 20 秒会把 App 超时预算吃光、Worker 兜底够不着；Worker 腿实测最稳
+  // （分类 16/16、重复请求多 <1 秒、CF 缓存命中）。两腿各 8 秒，总预算 ≤16 秒。
+  // Worker 未部署/回 400 时自动落到直连，不比旧行为更差。
+  const via = await fetchHtmlOnce(viaWorker(url), 8000);
+  if (looksRealHtml(via)) return via;
+  const direct = await fetchHtmlOnce(url, 8000);
+  if (looksRealHtml(direct)) return direct;
+  return '';
 }
 
 // 字幕聚合芯的取数原语：统一回 {status, body}；设备 axios 走配置调用
@@ -789,10 +815,15 @@ async function home() {
     if (f.length) filters[z.id] = f;
   }
   let list = [];
+  let loadErr = false;
   try {
-    list = parseCards(await getHtml('/'), HOST).slice(0, 20);
-  } catch (e) { list = []; }
-  return { class: classes, filters, list };
+    const html = await getHtml('/');
+    if (!html) loadErr = true;
+    else list = parseCards(html, HOST).slice(0, 20);
+  } catch (e) { list = []; loadErr = true; }
+  const out = { class: classes, filters, list };
+  if (loadErr) out.msg = '加载失败，请下拉刷新重试';
+  return out;
 }
 
 async function category(reqIn) {
@@ -811,6 +842,8 @@ async function category(reqIn) {
     path = page === 1 ? ('/category/' + target + '/') : ('/category/' + target + '/' + page + '/');
   }
   const html = await getHtml(path);
+  // 取页全失败时带 msg 回空列表（av123 同款先例）：失败不再伪装成“暂无数据”的真空
+  if (!html) return { page, pagecount: page, list: [], msg: '加载失败，请下拉刷新重试' };
   const list = parseCards(html, HOST);
   let next = false;
   if (target === 'route_home_featured') next = html.includes('/page/' + (page + 1) + '/');
@@ -829,6 +862,7 @@ async function search(reqIn) {
   if (!kw) return { list: [] };
   const path = page === 1 ? ('/search/' + encodeURIComponent(kw) + '/') : ('/search/' + encodeURIComponent(kw) + '/' + page + '/');
   const html = await getHtml(path);
+  if (!html) return { page, pagecount: page, list: [], msg: '加载失败，请下拉刷新重试' };
   return { page, list: parseCards(html, HOST) };
 }
 
