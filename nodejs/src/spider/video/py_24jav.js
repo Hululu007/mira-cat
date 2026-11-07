@@ -14,6 +14,16 @@ import req from '../../util/req.js';
 //   detail/play 一律给本地 /proxy/ 地址，代理实时拉清单改写（master 的 variant 行与音频 URI、媒体清单的分片行
 //   全部指回代理），分片字节透传时剥掉 PNG 头、以 video/mp2t 回给播放器；分片仍直连 CDN 取数，只在本地去头，
 //   不经第三方中转。分片行末尾另加 .ts 后缀（过 ffmpeg 分片后缀白名单，代理入口先剥后缀再解码）。
+//   【2026-11-07 19:45 真机回归】上一版推上后用户真机仍“播放时解析不出地址、无法播放”——旧版直链
+//   （https://mee18player.com/.../master 或 .../480/index）此前在 Mira 上能播，回归点在代理地址形态，
+//   不是前缀：实测 request.server.prefix=/spider/py_24jav/3、address().dynamic=js2p://_WEB_，前缀无错。
+//   上一版两处偏离 Ero/JavFeed/ffm3u8 先例：①播单地址是路径段形式 /proxy/<b64>/<b64>，不含 m3u8 标记
+//   （先例一律 /proxy/m3u8?u=&r= 或 /proxy/hls/<id>/.m3u8）；②改写后的清单行是无 scheme 的裸路径
+//   /spider/py_24jav/3/proxy/...，播放器须以 js2p://_WEB_ 为基址解析，严格内核解析不出地址。
+//   本版照 Ero/JavFeed 先例改：播放地址改查询串形式 /proxy/m3u8?u=&r=；清单改写行一律用请求 Host 拼
+//   完整 http://127.0.0.1:<port>/spider/py_24jav/3/... 绝对地址，不再依赖播放器解析基址。
+//   路径段形式 /proxy/<b64>/<b64>[.ts] 的路由保留兼容（已发出的旧播放地址仍能进代理，且同样受益于新 selfBase）。
+//   代理拉取失败 302 回源地址，不比旧行为更差。
 //   代理拉取失败 302 回源地址，不比旧行为更差。
 //   另：1080p 档音视频分离（master 含 EXT-X-MEDIA 音频轨，视频分片纯视频、音频分片纯 AAC），旧版 detail 只给
 //   variant 单链会丢音频；现 detail 一律给 master 链，由播放器自行取 variant + 音频轨。
@@ -146,11 +156,11 @@ function parseMasterVariants(masterText) {
   return out;
 }
 
-// ---------------- 播单/分片本地代理（2026-11-07：剥 PNG 头，修不可 seek） ----------------
+// ---------------- 播单/分片本地代理（2026-11-07：剥 PNG 头，修不可 seek；2026-11-07 晚：照 Ero/JavFeed 先例改地址形态） ----------------
 // 病因见文件头：分片 = 545 字节 PNG 头 + 真 TS。播放器直触原地址建不起时间轴。
 // 代理只做两件事：清单改写（子清单/音频轨/分片行全部指回代理）、分片字节透传时剥头。
-// 地址用 porncgw 同款无查询串路径段形式 {dynamic}{prefix}/proxy/{b64 目标}/{b64 referer}，
-// 改写后的行用路径绝对形式（沿用请求自身的 spider 前缀），播放器按播单 origin 解析即回代理。
+// 地址用 Ero/JavFeed 同款查询串形式 {dynamic}{prefix}/proxy/m3u8?u={b64 目标}&r={b64 referer}，
+// 改写后的行用请求 Host 拼完整 http:// 绝对地址（同 Ero/JavFeed 的 m3u8Proxy），播放器无需以 js2p:// 为基址解析。
 function b64url(s) {
   try {
     return Buffer.from(String(s), 'utf8').toString('base64')
@@ -162,13 +172,13 @@ function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
 
-// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 avhub/missav/porncgw 先例）
-function proxyUrl(reqIn, targetUrl, referer) {
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 Ero/JavFeed 先例：查询串形式 /proxy/m3u8?u=&r=）
+function proxyUrl(reqIn, path, targetUrl, referer) {
   try {
     const server = reqIn?.server;
     const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
     const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}/proxy/${b64url(targetUrl)}/${b64url(referer || '-')}`;
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
   } catch (e) { return ''; }
 }
 
@@ -201,10 +211,12 @@ function stripPngPrefix(buf) {
 }
 
 // 改写清单正文：# 行的 URI="..."（音频轨）与非 # 行（variant/分片）一律改指回本地代理。
+// selfBase 是完整 http:// 绝对基址（同 Ero/JavFeed：取请求 Host 拼 http://<host>/spider/py_24jav/3），
+// 改写后的行不再是裸 /spider/... 路径，播放器无需以 js2p:// 为基址解析。
 // 注意：ffmpeg 系严格内核按分片 URL 的后缀白名单（allowed_segment_extensions）放行分片，
 // 代理地址本身无后缀会被拒（实测 "is not in allowed_segment_extensions"），故媒体清单的分片行
-// 末尾加 .ts 后缀（b64url 字母表无 '.'，后缀无歧义；代理入口先剥后缀再解码）；
-// master 的 variant 行与音频 URI 行是子播单、不进分片白名单检查，不加后缀（同 missav 先例）。
+// 走路径段形式并在末尾加 .ts 后缀（b64url 字母表无 '.'，后缀无歧义；代理入口先剥后缀再解码）；
+// master 的 variant 行与音频 URI 行是子播单、不进分片白名单检查，走查询串形式 /proxy/m3u8?u=&r=（同 Ero 先例）。
 function rewrite24javM3u8(raw, playlistUrl, selfBase, referer) {
   const isMaster = String(raw).includes('#EXT-X-STREAM-INF');
   const lines = String(raw).split(/\r?\n/);
@@ -216,7 +228,7 @@ function rewrite24javM3u8(raw, playlistUrl, selfBase, referer) {
         return line.replace(/URI="([^"]+)"/g, (all, uri) => {
           try {
             const abs = new URL(uri, playlistUrl).toString();
-            return `URI="${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}"`;
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}"`;
           } catch (e) { return all; }
         });
       }
@@ -224,16 +236,16 @@ function rewrite24javM3u8(raw, playlistUrl, selfBase, referer) {
     }
     try {
       const abs = new URL(s, playlistUrl).toString();
-      const suffix = isMaster ? '' : '.ts';
-      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}${suffix}`;
+      if (isMaster) return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}.ts`;
     } catch (e) { return line; }
   });
   return out.join('\n');
 }
 
 // 代理入口（两种地址格式都接受）：
-// 新格式：/proxy/{b64url 目标}/{b64url referer}，无查询串；
-// 旧格式（兼容）：/proxy/m3u8?u={b64url}&r={b64url}。
+// 主格式（本版 detail/play 发出）：/proxy/m3u8?u={b64url}&r={b64url}，同 Ero/JavFeed 先例；
+// 兼容格式（上一版已发出的播放地址）：/proxy/{b64url 目标}/{b64url referer}，无查询串，分片行另带 .ts 后缀。
 // 取回的文本是 #EXTM3U 即按清单改写；否则按分片字节透传并剥 PNG 头（支持 Range，便于拖动）。
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
@@ -262,12 +274,13 @@ async function m3u8Proxy(request, reply) {
     if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
   } catch (e) { reply.code(400).send('bad u'); return; }
   if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  let selfBase = '/spider/' + KEY + '/3';
-  try {
-    const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
-    const pi = rawPath.indexOf('/proxy/');
-    if (pi > 0) selfBase = rawPath.slice(0, pi);
-  } catch (e) { /* 用默认前缀 */ }
+  // 改写基址：同 Ero/JavFeed，用请求 Host 拼完整 http:// 绝对地址；上一版用裸 /spider/... 路径是
+  // 2026-11-07 19:45 真机“解析不出地址”的病根（播放器须以 js2p:// 为基址解析裸路径）。
+  // 无 Host 时退回 proxyUrl 拼出的 js2p:// 形式（与上一版行为一致，不比旧行为更差）。
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
   try {
     const buf = await fetchBytes(target, referer);
     if (!buf || !buf.length) { reply.redirect(target); return; }
@@ -722,7 +735,7 @@ async function detail(reqIn) {
     const master = masterUrl(mee);
     const variants = parseMasterVariants(await getText(master));
     const label = variants.length ? variants[0].label : '正片';
-    const proxied = proxyUrl(reqIn, master, durl);
+    const proxied = proxyUrl(reqIn, '/proxy/m3u8', master, durl);
     playUrl = label + '$' + durl + '@@' + (proxied || master);
   }
   return {
@@ -757,7 +770,7 @@ async function play(reqIn) {
   }
   // 旧缓存的详情可能仍带 mee 直链：统一包一层本地代理再出（已是代理地址的不重复包）。
   if (target.indexOf('/proxy/') < 0 && /mee(18)?player\.com/i.test(target)) {
-    const proxied = proxyUrl(reqIn, target, durl || HOST + '/');
+    const proxied = proxyUrl(reqIn, '/proxy/m3u8', target, durl || HOST + '/');
     if (proxied) target = proxied;
   }
   // 字幕按条目接：仅当标题或地址含番号才搜，否则不带 subs 键

@@ -8,12 +8,26 @@ import req from '../../util/req.js';
 //   封面与播单改回 dfdf 主线、sxtmo 备选，不再改写为 cloudfront；
 //   播单内分片走 d3s00p19cjdhyv.cloudfront.net（实测 206 通），播单本身只负责指路；
 //   详情页仍走 window.__ARCHIVE_PLAYER__.rawPath + CDN 基址。
+// 2026-11-07 返工（播放断点）：用户真机 19:45 复测——列表/分类/封面全通（均走
+//   moguds.cc + dfdf.tjacq.com），唯独播放不行。VM 实测定性：播单、分片、密钥三腿
+//   在 VM 上全通（任意头组合均 200），且 openssl 以播单内 key+IV 解密首分片得
+//   到合法 TS（188 对齐 0x47 同步 10918/10919），内容本身无问题；断点在播单把
+//   播放器指到第三个域 d3s00p19cjdhyv.cloudfront.net 取分片——该腿在手机上从
+//   未验证过，而本站自己的 d1uy7 cloudfront 分发已死在先，同类腿不可信。
+//   实测 dfdf / sxtmo 两线与 cloudfront 分片逐字节相同（同一 .ts 路径三域
+//   同内容）、密钥三域相同且全片共用同一 key+IV，故改写播单即可：分片改指
+//   播单自身 origin（dfdf），相对密钥 URI 补成绝对地址，播放器全程只跟
+//   已验证的 dfdf 说话；分片不经过代理透传（字节无需改动，与 24JAV 剥 PNG
+//   头不同），代理只改写 7KB 清单文本。play() 给本地 /proxy/m3u8 地址
+//   （Ero/JavFeed 同款，前缀取 reqIn?.server 动态值，绝不写死），取不到
+//   时回落原直链；代理拉不到有效清单时 302 回原地址，不比旧行为更差。
 // 分类：7 大区作顶级分类，各区细分走筛选卡片 filters.sub；6 个分组父类
 //   （cate13/22/36/47/55/59）站方本身无内容，不列为细分，默认取各组首个有内容的子类。
 // 列表：<a href="/video/\d+/"> 卡片，封面 data-src 走 dfdf.tjacq.com（实测 200）
 // 详情：__ARCHIVE_PLAYER__.rawPath 组直链（首选 dfdf，备选 sxtmo）；播放直链 parse:0
 // 字幕：详情预热 + 播放带 subs（与 32 个带芯猫源同一套聚合芯：迅雷/迅雷看看/SubtitleCat 三槽，带时长显示与名字+时长去重）
 // 清晰度：站方每片只给一条单码率播单（实测无多档切换机制），故不设假清晰度选单
+const KEY = 'py_mogu';
 const HOST = 'https://moguds.cc';
 const CDN = 'https://dfdf.tjacq.com';
 const ALT_CDN = 'https://mkdscvxr3w34.sxtmo.com'; // 站方 cdn_lines 第二线；d1uy7 cloudfront 分发已死（2026-11-07 实测 TLS 断），不再使用
@@ -623,6 +637,83 @@ function archivePlayUrl(html) {
   return normUrl(base.replace(/\/+$/, '') + (raw.startsWith('/') ? raw : '/' + raw));
 }
 
+// ---------- 播放清单代理（同 Ero/JavFeed 先例；2026-11-07 返工新增） ----------
+// play() 不再直接交 dfdf 原播单：原播单分片行指向 d3s00 cloudfront，手机上该腿
+// 未验证且同类分发已死过；代理实时拉清单改写——分片/密钥行一律改指播单自身
+// origin（dfdf；sxtmo 播单则改指 sxtmo，两线分片逐字节相同已实测），相对
+// URI（如 /keyhome/video.key）补成绝对地址（改写后播单由蜘蛛 origin 发出，
+// 相对 URI 若不补会错解析到蜘蛛 host）。分片本身不透传，播放器直接向 dfdf
+// 取分片（封面已证手机到 dfdf 通）；取不到有效清单时 302 回原地址。
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 Ero 先例；
+// 前缀取 reqIn?.server 动态值，绝不写死）
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+async function fetchPlaylistText(url, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
+      timeout: 15000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+    });
+    const text = typeof r.data === 'string' ? r.data : '';
+    if (r.status >= 200 && r.status < 300 && text) return text;
+  } catch (e) { /* 落空走 302 降级 */ }
+  return '';
+}
+function rewriteM3u8(raw, playlistUrl) {
+  let originHost = '';
+  try { originHost = new URL(playlistUrl).hostname; } catch (e) { originHost = ''; }
+  function sameOrigin(u) {
+    try {
+      const abs = new URL(u, playlistUrl).toString();
+      if (!originHost) return abs;
+      const parsed = new URL(abs);
+      if (parsed.hostname.endsWith('.cloudfront.net')) parsed.hostname = originHost;
+      return parsed.toString();
+    } catch (e) { return u; }
+  }
+  const lines = String(raw).split(/\r?\n/);
+  return lines.map((line) => {
+    const str = line.trim();
+    if (!str) return line;
+    if (str.startsWith('#')) {
+      if (str.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => 'URI="' + sameOrigin(uri) + '"');
+      }
+      return line;
+    }
+    return sameOrigin(str);
+  }).join('\n');
+}
+// GET /proxy/m3u8?u={b64url 清单地址}&r={b64url referer}
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const raw = await fetchPlaylistText(target, referer);
+  if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
+  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  reply.header('Cache-Control', 'no-cache');
+  reply.send(rewriteM3u8(raw, target));
+}
+
 async function home() {
   const classes = ZONES.map((z) => ({ type_id: z.id, type_name: z.name }));
   const filters = {};
@@ -746,7 +837,10 @@ async function play(reqIn) {
   if (at >= 0) { durl = id.slice(0, at); target = id.slice(at + 2); }
   if (!target) return { parse: 0, url: '' };
   const subsP = durl ? subSearchAll(durl).catch(() => []) : Promise.resolve([]);
-  const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+  // 播单走本地代理改写（分片改指 dfdf，见文件头 2026-11-07 返工注）；代理地址
+  // 取不到时回落原直链，不比旧行为更差
+  const proxied = proxyUrl(reqIn, '/proxy/m3u8', target, durl);
+  const result = { parse: 0, url: proxied || target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   const subs = await subsP;
   if (subs && subs.length) result.subs = subs; // 无字幕命中时不带此键，返回与接入前逐字段一致
   return result;
@@ -754,7 +848,7 @@ async function play(reqIn) {
 
 export default function createSpider() {
   return {
-    meta: { key: 'py_mogu', name: '蘑菇视频', type: 3 },
+    meta: { key: KEY, name: '蘑菇视频', type: 3 },
     api: async (fastify) => {
       fastify.post('/init', async () => ({}));
       fastify.post('/home', home);
@@ -762,6 +856,7 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
