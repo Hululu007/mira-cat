@@ -36,6 +36,17 @@ import req from '../../util/req.js';
 // token 由代理按 payload 现铸现贴、过期前重铸，解决 30 秒签名 + 播放器不透传 token；
 // ③ 直连腿 3s→8s（竞速先到先赢，抬上限不增加等待；300KB 首页手机 VPN 下 3s 太紧）。
 // 播放不走 Railway（Rule 23）。Worker 不用动。
+// v6（2026-11-08，基于线上 v5 blob b1679a2d 手术式修改；CATS 与字幕芯除定时器外一字未动）：
+// 三路合成病因：① jina 是有毒的快腿——竞速总被它抢赢，但它剥 script/iframe、无 payload；
+// ② 新主路 POST /api/bunnytoken/generate（直连活体验通）：入参只有 {"m3u8Url": 裸清单地址}
+// （详情 HTML JSON-LD 的 contentUrl；guid != 详情 uuid，故集内须带 contentUrl），
+// 无签名/Referer/Cookie；Worker POST 405、jina 转 GET 也 405，铸 token 只能直连 POST；
+// ③ v5“回诊断、不转圈”在设备侧是假的——play() 回 {parse:0,url:''} 时 App 不显示诊断、
+// 一直转圈；且定时器兜底依赖两条未经设备证实的前提（setTimeout 触发、axios timeout 生效）。
+// 故 v6：详情 HTML 腿先行、jina 只作展示兜底；主路 bunnytoken 直连铸 master，
+// 回落现行 /player/v2 老路；全链 withTimeout 硬定时器 + play() 20s 总预算 +
+// jrProxy 25s 总预算 + mintInflight 10s 超时去毒；全失败回 parse:1 + 详情页 url +
+// 中文诊断（仓内先例：91duanju/javhdporn/javgg/brazz），绝不再回 {parse:0,url:''}。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const RELAY = 'https://javrate.li768435813.workers.dev';
@@ -57,6 +68,15 @@ function isChallengeHtml(html) {
 }
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+// v6：硬定时器包装（hang-audit §5.1）——不依赖 axios timeout 是否生效；
+// 超时即结算为 fallback。注意：若 App 的 req 是同步阻塞实现，setTimeout 同样
+// 无法触发，此时本包装无效（减腿方案见 hang-audit §5.5，需另定）。
+function withTimeout(p, ms, fallback) {
+  let t;
+  const to = new Promise((resolve) => { t = setTimeout(() => resolve(fallback), ms); });
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(t)), to]);
 }
 
 function unescapeHtml(s) {
@@ -132,8 +152,8 @@ async function getPage(path, opts) {
   else if (url.startsWith('/')) url = HOST + url;
   const headers = { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
   const legs = [
-    { via: 'worker', ms: 8000, kind: 'html', u: viaWorker(url), transport: 'req' },
-    { via: 'direct', ms: 8000, kind: 'html', u: url, transport: 'req' },
+    { via: 'worker', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'req' },
+    { via: 'direct', ms: 15000, kind: 'html', u: url, transport: 'req' },
     { via: 'jina-req', ms: 20000, kind: 'md', u: JINA + url, transport: 'req' },
   ];
   // jina 双通道（2026-11-08 VM 实测）：仓库 req.js 是 axios.create 配自定义 https.Agent，
@@ -145,21 +165,28 @@ async function getPage(path, opts) {
   if (typeof fetch === 'function') {
     legs.push({ via: 'jina-fetch', ms: 20000, kind: 'md', u: JINA + url, transport: 'fetch' });
   }
-  const useLegs = (opts && opts.htmlOnly) ? legs.filter((l) => l.kind === 'html') : legs;
+  // v6：htmlOnly（详情/铸 master）与 mdOnly（详情展示兜底）分流；jina 永不作为 payload 来源。
+  const useLegs = (opts && opts.htmlOnly) ? legs.filter((l) => l.kind === 'html')
+    : (opts && opts.mdOnly) ? legs.filter((l) => l.kind === 'md') : legs;
   const jobs = useLegs.map((leg) => (async () => {
     try {
       let body = '';
       let status = 0;
       if (leg.transport === 'fetch') {
+        // v6：fetch 腿的硬定时器 = 中止定时器 + race（超时即结算 null，不等系统默认）。
         const ctrl = new AbortController();
-        const to = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* ignore */ } }, leg.ms);
+        let abortTimer;
+        const aborted = new Promise((resolve) => { abortTimer = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* ignore */ } resolve(null); }, leg.ms); });
         try {
-          const r = await fetch(leg.u, { headers, signal: ctrl.signal });
+          const r = await Promise.race([fetch(leg.u, { headers, signal: ctrl.signal }), aborted]);
+          if (!r) return null;
           status = r.status;
-          body = await r.text();
-        } finally { clearTimeout(to); }
+          body = await withTimeout(r.text(), leg.ms, '');
+        } finally { clearTimeout(abortTimer); }
       } else {
-        const r = await req.get(leg.u, { headers, timeout: leg.ms });
+        // v6：每条 req 腿包 withTimeout 硬定时器（axios timeout 在 App 内是否生效未经证实）。
+        const r = await withTimeout(req.get(leg.u, { headers, timeout: leg.ms }), leg.ms, null);
+        if (!r) return null;
         status = r.status || 0;
         body = (r && r.data != null) ? String(r.data) : '';
       }
@@ -181,24 +208,35 @@ async function getHtml(path) {
 
 // 只走 HTML 腿（Worker + 直连，不走 jina）：铸 master 与提 payload 专用——
 // jina 的 player 页是 500 Markdown，抽不到 master；详情 Markdown 也无 payload。
+// v6：默认 15s（各腿超时放宽到 15s；详情 HTML 先行预算与腿超时一致）。
 async function getHtmlOnly(path, ms) {
-  return getPage(path, { htmlOnly: true, ms: ms || 8000 });
+  return getPage(path, { htmlOnly: true, ms: ms || 15000 });
+}
+
+// v6：只走 jina 腿（详情展示兜底）：HTML 腿先行失败后才走，不再与 HTML 腿竞速。
+async function getMdOnly(path, ms) {
+  return getPage(path, { mdOnly: true, ms: ms || 20500 });
 }
 
 // 字幕芯取数原语（与 py_mogu 一致）：统一回 {status, body}
 async function reqRaw(url, headers, timeoutMs) {
-  try {
-    let r;
-    if (typeof req === 'function') {
-      r = await req({ method: 'GET', url, headers: headers || {}, timeout: timeoutMs || 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5 });
-    } else {
-      r = await req.get(url, { headers: headers || {}, timeout: timeoutMs || 10000 });
+  // v6：内包 withTimeout 硬定时器（超时 +1000ms），字幕三槽与 play 回落的 reqRaw
+  // 不再只依赖 axios timeout（hang-audit §5.6）。
+  const inner = (async () => {
+    try {
+      let r;
+      if (typeof req === 'function') {
+        r = await req({ method: 'GET', url, headers: headers || {}, timeout: timeoutMs || 10000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5 });
+      } else {
+        r = await req.get(url, { headers: headers || {}, timeout: timeoutMs || 10000 });
+      }
+      const body = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
+      return { status: r.status || 0, body, headers: r.headers || {}, err: null };
+    } catch (e) {
+      return { status: 0, body: '', headers: {}, err: e };
     }
-    const body = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
-    return { status: r.status || 0, body, headers: r.headers || {}, err: null };
-  } catch (e) {
-    return { status: 0, body: '', headers: {}, err: e };
-  }
+  })();
+  return withTimeout(inner, (timeoutMs || 10000) + 1000, { status: 0, body: '', headers: {}, err: new Error('reqRaw timeout') });
 }
 
 // 本站卡片是“图链 + 文链”多个 <a> 共用同一 /movie/detail/<uuid>.html，按 URL 合并图与标题
@@ -771,10 +809,14 @@ async function detail(reqIn) {
   const rawId = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (!rawId) return { list: [] };
   const durl = rawId.startsWith('http') ? rawId : HOST + rawId;
-  const html = await getHtml(rawId);
-  if (!html) {
-    // v5：全腿落败也回一集懒解析，详情永不空手（play() 内重取详情 HTML 提 payload；
-    // 提不到回诊断、不转圈）。无 HTML 时无标题/封面，集名即“正片”。
+  // v6 P0：HTML 腿先行（getHtmlOnly 15s 在竞速之前，追补预算 = 腿超时，修掉 v5
+  // “6s 追补 < 腿 8s 超时”的必败）；jina 只留作展示兜底，永不作为 payload 来源。
+  const htmlFirst = await withTimeout(getHtmlOnly(rawId, 15000), 15000, '');
+  if (htmlFirst) { lastFetch.kind = 'html'; lastFetch.via = 'html-first'; return detailHtml(htmlFirst, rawId, durl); }
+  const md = await getMdOnly(rawId);
+  if (!md) {
+    // v5：全腿落败也回一集懒解析，详情永不空手（play() 内重取详情 HTML 提 payload
+    // 与 contentUrl；提不到回诊断、不转圈）。无 HTML 时无标题/封面，集名即“正片”。
     return {
       list: [{
         vod_id: rawId,
@@ -787,14 +829,7 @@ async function detail(reqIn) {
       }],
     };
   }
-  if (lastFetch.kind === 'md') {
-    // jina 赢了竞速：只有展示信息、无 payload；再给 HTML 腿一次 6s 短预算——
-    // 拿到 HTML 就按 HTML 详情走（出双清晰度集），拿不到才回 jina 展示 + 懒解析集。
-    const htmlOnly = await getHtmlOnly(rawId, 6000);
-    if (htmlOnly) { lastFetch.kind = 'html'; lastFetch.via = 'html-retry'; return detailHtml(htmlOnly, rawId, durl); }
-    return parseDetailMd(html, rawId, durl);
-  }
-  return detailHtml(html, rawId, durl);
+  return parseDetailMd(md, rawId, durl);
 }
 
 async function detailHtml(html, rawId, durl) {
@@ -817,13 +852,21 @@ async function detailHtml(html, rawId, durl) {
   const desc = extractLd(html, 'description');
   const code = extractLd(html, 'value');
   const payload = extractPayload(html);
+  // v6：guid 来源结论（api-probe 实测 + 复核）：JSON-LD contentUrl 里的 guid
+  // （UMAN-017：9bb29374-bdfe-40f2-b0f4-b82dee4717ab）!= 详情页 URL 的 uuid
+  // （7dd38275-386b-4eb3-8bca-737b9bbe9d63）；/api/hot 的 movies[].cloudPlayList[0]
+  // .m3U8Url 同样含该 guid，但 hot 只是搜索联想 POST 接口、不能替代详情。
+  // 故 play 全程不能由 durl 零 HTML 构造裸清单——集内须带 contentUrl（第 4 段 @@
+  // 裸地址），play() 凭它直连 POST bunnytoken 铸 master。
+  const contentUrl = extractLd(html, 'contentUrl');
   // 播单不在详情时固化：play() 凭 payload 现取 player v2（token 仅 30 秒有效，详情时取必过期，
   // 故详情只存 payload，不存签名 URL）；有 payload 出 1080p/720p/自适应三集（play() 内现铸现包代理），
   // 无 payload 只留一集懒解析（play() 内重取详情 HTML 提 payload，提不到回诊断、不转圈）。
   // v4：再加一条“自适应”线（master 本身走代理出线，代理改写 master 的 variant 行，
   // 播放器按带宽自选档位；三条线都是真实存在的地址，不编造）。
+  const bareSeg = contentUrl ? '@@' + contentUrl : '';
   const playUrl = payload
-    ? ('1080p$' + durl + '@@' + payload + '@@1080p#720p$' + durl + '@@' + payload + '@@720p#自适应$' + durl + '@@' + payload + '@@auto')
+    ? ('1080p$' + durl + '@@' + payload + '@@1080p' + bareSeg + '#720p$' + durl + '@@' + payload + '@@720p' + bareSeg + '#自适应$' + durl + '@@' + payload + '@@auto' + bareSeg)
     : ('正片$' + durl);
   return {
     list: [{
@@ -863,61 +906,106 @@ function unb64url(s) {
   return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
 }
 
-function proxyUrl(reqIn, path, targetUrl, referer, payload) {
+function proxyUrl(reqIn, path, targetUrl, referer, payload, bare) {
   try {
     const server = reqIn?.server;
     const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
     const prefix = server?.prefix || ('/spider/' + KEY + '/3');
     let u = `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
     if (payload) u += '&p=' + b64url(payload);
+    if (bare) u += '&b=' + b64url(bare);
     return u;
   } catch (e) { return ''; }
 }
 
-async function fetchBytes(url, referer, timeoutMs) {
-  const to = timeoutMs || 15000;
+async function fetchBytes(url, referer, timeoutMs, deadlineMs) {
+  // v6：每次取数包 withTimeout 10s 硬定时器（hang-audit §5.5：全链唯一零定时器
+  // 兜底的 await 在此）；循环仍 2 次，总 ≤20s；有 deadline 时单次不超过剩余时间。
+  const to = timeoutMs || 10000;
   for (let attempt = 0; attempt < 2; attempt++) {
+    if (deadlineMs && Date.now() >= deadlineMs) break;
+    const attemptMs = deadlineMs ? Math.max(1000, Math.min(to, deadlineMs - Date.now())) : to;
     try {
-      const r = await req.get(url, {
+      const r = await withTimeout(req.get(url, {
         headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
-        timeout: to,
+        timeout: attemptMs,
         responseType: 'arraybuffer',
         validateStatus: () => true,
-      });
-      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+      }), attemptMs, null);
+      if (r && r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
     } catch (e) { /* 重试，落空走 302 降级 */ }
   }
   return null;
 }
 
-// token 缓存：payload -> {master, q, exp}；exp 为 token 的 expires（秒），
+// token 缓存：cacheKey -> {master, q, exp}；exp 为 token 的 expires（秒），
 // 用前剩 5 秒以上才复用，否则重铸。只在模块内存里，不落盘、不跨 App 重启。
+// v6：cacheKey = 有 bare 时 'bunny:' + bare，否则 'payload:' + payload（两路
+// 铸出的 master 宿主不同——videocdn vs cloud-hot，不可混用缓存）。
 const tokenCache = new Map();
 // v5：并发现铸去重——同一 payload 同一时刻只铸一次（后台刷新与分片阻塞铸不再重复取 /player/v2）。
 const mintInflight = new Map();
 
-async function mintMaster(durl, payload) {
+function jrCacheKey(payload, bare) {
+  return bare ? 'bunny:' + bare : 'payload:' + (payload || '');
+}
+
+// v6 新主路——POST /api/bunnytoken/generate 直连铸 token（api-probe 活体验通，
+// 直连 200/247B/0.27–1.8s，全链验通到首分片 0x47）：入参只有 {"m3u8Url": 裸清单地址}，
+// 无签名、无 Referer、无 Cookie；路径必须全小写。Worker POST 405、jina 会把 POST
+// 转 GET 也 405，故只走直连 req POST，8 秒超时、重试 1 次。
+async function mintBunny(bareUrl) {
+  const url = HOST + '/api/bunnytoken/generate';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await withTimeout(req({
+        method: 'POST', url,
+        data: JSON.stringify({ m3u8Url: bareUrl }),
+        headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        timeout: 8000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5,
+      }), 8000, null);
+      if (!r) continue;
+      let j = null;
+      const raw = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
+      try { j = JSON.parse(raw); } catch (e) { j = null; }
+      const signed = j && j.success && j.data && j.data.signedUrl;
+      if (signed) return String(signed);
+    } catch (e) { /* 重试一次 */ }
+  }
+  return '';
+}
+
+async function mintMaster(durl, payload, bare) {
   const nowS = Math.floor(Date.now() / 1000);
-  const hit = tokenCache.get(payload);
+  const cacheKey = jrCacheKey(payload, bare);
+  const hit = tokenCache.get(cacheKey);
   if (hit && hit.exp - 5 > nowS) return hit;
-  if (mintInflight.has(payload)) return mintInflight.get(payload);
-  const p = (async () => {
-    const master = await resolveSignedMaster(durl, payload);
+  if (mintInflight.has(cacheKey)) return mintInflight.get(cacheKey);
+  const pRaw = (async () => {
+    let master = '';
+    // v6 主路：bunnytoken 直连 POST（只需裸清单地址，不依赖 payload/HTML 腿）。
+    if (bare) master = await mintBunny(bare);
+    // 回落：现行 /player/v2 HTML 老路（需 payload；无 bare 或 bunny 失败时）。
+    if (!master && payload) master = await resolveSignedMaster(durl, payload);
     if (!master) return hit || null;
     const q = (master.split('?')[1] || '');
     const expM = q.match(/expires=(\d+)/);
     const exp = expM ? parseInt(expM[1], 10) : nowS + 30;
     const rec = { master, q, exp };
-    tokenCache.set(payload, rec);
+    tokenCache.set(cacheKey, rec);
     if (tokenCache.size > 50) tokenCache.delete(tokenCache.keys().next().value);
     return rec;
   })();
-  mintInflight.set(payload, p);
-  try { return await p; } finally { mintInflight.delete(payload); }
+  // v6：inflight 包 10 秒硬超时、超时去毒——超时结算后 finally 删表项，下一次调用
+  // 重新发请求，不再共享死 promise（hang-audit §2.3/§5.4：一次挂住毒死同 payload
+  // 全部后续播放，直到 App 重启）。
+  const p = withTimeout(pRaw.catch(() => null), 10000, null);
+  mintInflight.set(cacheKey, p);
+  try { return await p; } finally { mintInflight.delete(cacheKey); }
 }
 
-async function mintFreshToken(durl, payload) {
-  const rec = await mintMaster(durl, payload);
+async function mintFreshToken(durl, payload, bare) {
+  const rec = await mintMaster(durl, payload, bare);
   return rec ? rec.q : '';
 }
 
@@ -930,10 +1018,13 @@ function withToken(url, q) {
 
 // 改写清单正文：# 行的 URI="..."（密钥/音频轨）与非 # 行（variant/分片）一律改指回本地代理。
 // 分片行走路径段形式 + .ts 后缀（b64url 字母表无 '.'，后缀无歧义；代理入口先剥后缀再解码）。
-function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload) {
+function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload, bare) {
   const isMaster = String(raw).includes('#EXT-X-STREAM-INF');
   const lines = String(raw).split(/\r?\n/);
   const pEnc = payload ? b64url(payload) : '';
+  // v6：播单/分片地址同时带 bare（&b= / 第 3 路径段），代理过期重铸时可走 bunnytoken
+  // 直连主路，不再只依赖 /player/v2 HTML 腿；旧两段式分片地址仍兼容（bare 缺省）。
+  const bEnc = bare ? b64url(bare) : '';
   const out = lines.map((line) => {
     const s = line.trim();
     if (!s) return line;
@@ -942,7 +1033,7 @@ function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload) {
         return line.replace(/URI="([^"]+)"/g, (all, uri) => {
           try {
             const abs = new URL(uri, playlistUrl).toString();
-            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}${pEnc ? '&p=' + pEnc : ''}"`;
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}${pEnc ? '&p=' + pEnc : ''}${bEnc ? '&b=' + bEnc : ''}"`;
           } catch (e) { return all; }
         });
       }
@@ -950,9 +1041,9 @@ function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload) {
     }
     try {
       const abs = new URL(s, playlistUrl).toString();
-      const bare = abs.split('?')[0];
-      if (isMaster) return `${selfBase}/proxy/m3u8?u=${b64url(bare)}&r=${b64url(referer || '')}${pEnc ? '&p=' + pEnc : ''}`;
-      return `${selfBase}/proxy/${b64url(bare)}/${b64url(payload || '-')}.ts`;
+      const bareAddr = abs.split('?')[0];
+      if (isMaster) return `${selfBase}/proxy/m3u8?u=${b64url(bareAddr)}&r=${b64url(referer || '')}${pEnc ? '&p=' + pEnc : ''}${bEnc ? '&b=' + bEnc : ''}`;
+      return `${selfBase}/proxy/${b64url(bareAddr)}/${b64url(payload || '-')}/${b64url(bare || '-')}.ts`;
     } catch (e) { return line; }
   });
   return out.join('\n');
@@ -963,6 +1054,9 @@ function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload) {
 // 分片格式：/proxy/{b64url 目标}/{b64url payload}.ts（分片行改写用）。
 // 有 payload 时现铸现贴 token（缓存 25 秒）；无 payload 时按原地址直取（兼容旧地址）。
 async function jrProxy(request, reply) {
+  // v6：代理总预算 25s（hang-audit §5.5）——mint ≤8s、fetchBytes 每次 ≤10s 总 ≤20s，
+  // 超了立即 502（分片）/302（播单），不再让播放器等 76s 或无界。
+  const deadline = Date.now() + 25000;
   const q = request?.query || {};
   // v4：分片一级（/proxy/* 路径段形，无查询串 u）与播单一级（/proxy/m3u8?u=…）分开处理。
   // 分片行 u 是去查询串的 bare 地址，302 回它必 403，故分片失败不再 302，改走强制重铸重试 + 502 快败；
@@ -971,6 +1065,7 @@ async function jrProxy(request, reply) {
   let uEnc = q.u || '';
   let rEnc = q.r || '';
   let pEnc = q.p || '';
+  let bEnc = q.b || '';
   if (!uEnc) {
     const wild = request?.params && request.params['*'];
     let segs = [];
@@ -983,16 +1078,19 @@ async function jrProxy(request, reply) {
     if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
       segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
     }
-    if (segs.length) { uEnc = segs[0]; pEnc = segs[1] || ''; }
+    // v6：分片三段式 /proxy/{目标}/{payload}/{bare}.ts；旧两段式仍兼容（bare 缺省）。
+    if (segs.length) { uEnc = segs[0]; pEnc = segs[1] || ''; bEnc = segs[2] || ''; }
   }
   if (!uEnc) { reply.code(400).send('missing u'); return; }
   let target = '';
   let referer = HOST + '/';
   let payload = '';
+  let bare = '';
   try {
     target = unb64url(uEnc);
     if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
     if (pEnc && pEnc !== '-') payload = unb64url(pEnc) || '';
+    if (bEnc && bEnc !== '-') bare = unb64url(bEnc) || '';
   } catch (e) { reply.code(400).send('bad u'); return; }
   if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
   const host = request.headers && request.headers.host;
@@ -1003,29 +1101,32 @@ async function jrProxy(request, reply) {
   // v5：令牌剩 0-10 秒时用现令牌立即出分片、后台现铸刷新缓存，不再让重铸堵住本次分片；
   // 令牌已过期或无缓存才同步现铸（不可避免的一次等待）。
   let fetchUrl = target;
-  if (payload) {
+  if (payload || bare) {
     try {
       const nowS = Math.floor(Date.now() / 1000);
-      const cached = tokenCache.get(payload);
+      const cached = tokenCache.get(jrCacheKey(payload, bare));
       if (cached && cached.exp > nowS && cached.exp - nowS <= 10) {
         fetchUrl = withToken(target, cached.q);
-        mintMaster(referer, payload).catch(() => {});
+        mintMaster(referer, payload, bare).catch(() => {});
       } else {
-        const tk = await mintFreshToken(referer, payload);
+        // v6：同步现铸包 8s 硬上限（hang-audit §5.5），超时即 tk='' 用原地址直取。
+        const tk = await withTimeout(mintFreshToken(referer, payload, bare), 8000, '');
         if (tk) fetchUrl = withToken(target, tk);
       }
     } catch (e) { /* 退回原地址 */ }
   }
   try {
-    let buf = await fetchBytes(fetchUrl, referer);
-    if ((!buf || !buf.length) && isSegment && payload) {
+    let buf = await fetchBytes(fetchUrl, referer, 10000, deadline);
+    if ((!buf || !buf.length) && isSegment && (payload || bare) && Date.now() < deadline - 2000) {
       // v4 分片取失败：先强制重铸一次（绕过 tokenCache）再试一次——旧 token 可能刚过期，
       // 缓存复用窗口（exp-5）未必覆盖本次失败；仍失败再 502 快败，不 302 到无 token 裸地址。
+      // v6：重铸与重试均不得超过 25s 总预算，超了立即 502。
       try {
-        tokenCache.delete(payload);
-        const tk2 = await mintFreshToken(referer, payload);
+        tokenCache.delete(jrCacheKey(payload, bare));
+        const leftMs = Math.max(1000, Math.min(8000, deadline - Date.now()));
+        const tk2 = await withTimeout(mintFreshToken(referer, payload, bare), leftMs, '');
         if (tk2) fetchUrl = withToken(target, tk2);
-        buf = await fetchBytes(fetchUrl, referer);
+        buf = await fetchBytes(fetchUrl, referer, 10000, deadline);
       } catch (e) { /* 重铸失败即走下面的 502 */ }
     }
     if (!buf || !buf.length) {
@@ -1036,7 +1137,7 @@ async function jrProxy(request, reply) {
     if (head.trimStart().startsWith('#EXTM3U')) {
       reply.header('Content-Type', 'application/vnd.apple.mpegurl');
       reply.header('Cache-Control', 'no-cache');
-      reply.send(rewriteJrM3u8(buf.toString('utf8'), fetchUrl, selfBase, referer, payload));
+      reply.send(rewriteJrM3u8(buf.toString('utf8'), fetchUrl, selfBase, referer, payload, bare));
       return;
     }
     const range = request?.headers && request.headers.range;
@@ -1068,7 +1169,8 @@ async function resolveSignedMaster(durl, payload) {
   // （懒解析 play 实测：jina 抢赢 -> 铸不出 master；紧接着 720p 走 HTML 腿即铸成）。
   // /player/v2 在 v1 里就是 GET，不走 POST（POST 透传 11-08 实测：
   // Worker /f POST 同样 403 验证页、直连 POST 20s 超时，两腿在到达站方前就死，无法验证）。
-  const playerHtml = await getHtmlOnly('/player/v2?payload=' + encodeURIComponent(payload), 8000);
+  // v6：腿超时放宽到 15s（与 getPage 腿一致）；外层 mintMaster 另有 10s 硬上限兜底。
+  const playerHtml = await getHtmlOnly('/player/v2?payload=' + encodeURIComponent(payload), 15000);
   if (!playerHtml) return '';
   const found = [];
   const re = /https:\/\/cloud-[a-z0-9-]+\.avking\.xyz[^"'\s<>]+?playlist\.m3u8[^"'\s<>]*/g;
@@ -1114,39 +1216,72 @@ function parseMasterVariants(masterText, masterUrl) {
 }
 
 const PLAY_DIAG_NO_PAYLOAD = 'JavRate 播放失败：详情页里没有播放参数（jina 会剥掉播放器脚本，直连与 Worker 腿又被站方验证墙拦住），铸不出签名播单。列表与详情可看，播放需等墙松。';
-const PLAY_DIAG_NO_MASTER = 'JavRate 播放失败：拿到播放参数但铸不出签名播单（/player/v2 被站方验证墙拦住），请稍后再试，不要反复点播。';
+const PLAY_DIAG_NO_MASTER = 'JavRate 播放失败：拿到播放参数但铸不出签名播单（直连铸 token 与 /player/v2 都被站方验证墙拦住），请稍后再试，不要反复点播。';
+const PLAY_DIAG_TIMEOUT = 'JavRate 播放失败：点播 20 秒内没有回音（取数腿挂住），请稍后再试，不要反复点播。';
 
+// v6：集链接解析——1080p$durl@@payload@@1080p@@<contentUrl 裸清单>
+// （第 4 段为 v6 新增；旧三段与懒解析裸 durl 仍兼容）。
+function parsePlayId(rawId) {
+  let id = String(rawId || '');
+  if (id.includes('$')) id = id.split('$').pop();
+  const parts = id.split('@@');
+  if (parts.length >= 2) {
+    const suf = parts[2] || '';
+    return {
+      durl: parts[0], payload: parts[1] || '', bare: parts[3] || '',
+      wantHeight: suf === '720p' ? 720 : 1080,
+      wantAdaptive: suf === 'auto',
+    };
+  }
+  if (id.startsWith('http') || id.startsWith('/')) {
+    return { durl: id, payload: '', bare: '', wantHeight: 1080, wantAdaptive: false };
+  }
+  return { durl: '', payload: id, bare: '', wantHeight: 1080, wantAdaptive: false };
+}
+
+// v6：永不回空 url——全失败回仓内先例形态 {parse:1, jx:0, url:详情页, msg:中文诊断}
+// （91duanju/javhdporn/javgg/brazz 同款：App 拿非空 url + 诊断，不再无限转圈；
+// v5 的 {parse:0, url:''} 在设备侧不显示诊断、即转圈，已证实为假快败）。
+function playFail(durl, msg) {
+  if (durl) return { parse: 1, jx: 0, url: durl, header: { 'User-Agent': UA, 'Referer': HOST + '/' }, msg };
+  return { parse: 0, url: '', msg };
+}
+
+// v6：play() 总预算 20s（hang-audit §5.3）——任何分段挂起都最多 20s 即回诊断
+// （parse:1 + 详情页 url + 中文诊断），不再无限转圈。
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
-  if (id.includes('$')) id = id.split('$').pop();
-  if (!id) return { parse: 0, url: '', msg: PLAY_DIAG_NO_PAYLOAD };
-  let durl = '';
-  let payload = id;
-  const at = id.indexOf('@@');
-  if (at >= 0) { durl = id.slice(0, at); payload = id.slice(at + 2); }
-  else if (id.startsWith('http') || id.startsWith('/')) { durl = id; payload = ''; }
+  const rawId = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
+  const { durl } = parsePlayId(rawId);
+  const res = await Promise.race([
+    playInner(reqIn).catch(() => null),
+    sleep(20000).then(() => null),
+  ]);
+  if (res) return res;
+  return playFail(durl, PLAY_DIAG_TIMEOUT);
+}
+
+async function playInner(reqIn) {
+  const body = reqIn?.body || {};
+  const rawId = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
+  if (!rawId) return { parse: 0, url: '', msg: PLAY_DIAG_NO_PAYLOAD };
+  // 集名里带档位：1080p$durl@@payload@@1080p@@bare / 720p$… / 自适应$…；
   // 裸详情地址（懒解析集）即 durl 本身，payload 为空、走下面的重取；v2 从未收到裸地址，
   // 沿用“无 @@ 即 payload 本身”的旧解析会把整条 durl 当 payload、铸 master 必然失败。
-  // 集名里带档位：1080p$durl@@payload@@1080p / 720p$durl@@payload@@720p / 自适应$durl@@payload@@auto。
-  let wantHeight = 1080;
-  let wantAdaptive = false;
-  const at2 = payload.indexOf('@@');
-  if (at2 >= 0) {
-    const suffix = payload.slice(at2 + 2);
-    if (suffix === '720p') wantHeight = 720;
-    else if (suffix === 'auto') wantAdaptive = true;
-    payload = payload.slice(0, at2);
-  }
-  if (!payload && durl) {
-    // 懒解析集：详情走 jina 时无 payload，play 时重取详情 HTML（只走 HTML 腿）再提一次。
+  let { durl, payload, bare, wantHeight, wantAdaptive } = parsePlayId(rawId);
+  if (!payload && !bare && durl) {
+    // 懒解析集：详情走 jina 时无 payload，play 时重取详情 HTML（只走 HTML 腿）
+    // 再提一次 payload 与 contentUrl（v6：追补预算 = 腿超时 15s）。
     try {
       const path = durl.startsWith('http') ? durl.slice(HOST.length) : durl;
-      const htmlOnly = await getHtmlOnly(path, 8000);
-      if (htmlOnly) payload = extractPayload(htmlOnly);
+      const htmlOnly = await withTimeout(getHtmlOnly(path, 15000), 15000, '');
+      if (htmlOnly) {
+        payload = extractPayload(htmlOnly);
+        if (!bare) bare = extractLd(htmlOnly, 'contentUrl');
+      }
     } catch (e) { /* ignore */ }
   }
-  if (!payload) return { parse: 0, url: '', msg: PLAY_DIAG_NO_PAYLOAD };
+  if (!payload && !bare) return playFail(durl, PLAY_DIAG_NO_PAYLOAD);
   // 字幕按条目接：仅当标题含番号才搜，否则不带 subs 键（与模板同一口径）
   const title = subNameCache.get(durl) || '';
   const code = subExtractCode(title) || subExtractCode(durl);
@@ -1158,7 +1293,9 @@ async function play(reqIn) {
   let target = '';
   let variants = [];
   try {
-    const rec = await mintMaster(durl, payload);
+    // v6：mint 包 10s 硬上限（mintMaster 内另有 10s 去毒，见 §9）；主路 bunnytoken
+    // 只需 bare，不依赖 HTML 腿；无 bare 时回落 /player/v2 老路。
+    const rec = await withTimeout(mintMaster(durl, payload, bare), 10000, null);
     if (rec && rec.master) {
       variants = constructVariants(rec.master) || [];
       if (!variants.length) {
@@ -1182,7 +1319,7 @@ async function play(reqIn) {
         // parseMasterVariants 解析相对 URI 时会丢查询串（RFC 3986）：变体地址若无 token，补上 master 的查询串。
         if (signedVariant.indexOf('?') < 0 && rec.q) signedVariant += '?' + rec.q;
       }
-      const proxied = proxyUrl(reqIn, '/proxy/m3u8', signedVariant, durl || (HOST + '/'), payload);
+      const proxied = proxyUrl(reqIn, '/proxy/m3u8', signedVariant, durl || (HOST + '/'), payload, bare);
       if (proxied) target = proxied;
       // v4 修 variants：v3 返回的是 parseMasterVariants 解析出的无 token 裸 CDN 地址
       // （相对 URI 丢查询串、又没补 rec.q），直接取双双 403，且是全仓唯一把 variants
@@ -1195,7 +1332,7 @@ async function play(reqIn) {
           .map((v) => {
             let sv = v.url;
             if (sv.indexOf('?') < 0 && rec.q) sv += '?' + rec.q;
-            const pu = proxyUrl(reqIn, '/proxy/m3u8', sv, durl || (HOST + '/'), payload);
+            const pu = proxyUrl(reqIn, '/proxy/m3u8', sv, durl || (HOST + '/'), payload, bare);
             return pu ? { height: v.height, label: v.label, url: pu } : null;
           })
           .filter(Boolean);
@@ -1204,9 +1341,10 @@ async function play(reqIn) {
       }
     }
   } catch (e) { target = ''; }
+  // v6：铸不出 master 即快败回诊断（parse:1 + 详情页），不再等字幕 race。
+  if (!target) return playFail(durl, PLAY_DIAG_NO_MASTER);
   const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   if (variants.length) result.variants = variants;
-  if (!target) result.msg = PLAY_DIAG_NO_MASTER;
   // v5：字幕不再 await——1.5 秒 race，超时即不要字幕、先回地址（字幕是加分项，播放地址是主线；
   // subsP 后台继续跑，结果进 subResultCache 供后续点播用）。
   const subs = await Promise.race([subsP, sleep(1500).then(() => null)]);
