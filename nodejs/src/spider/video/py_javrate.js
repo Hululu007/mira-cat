@@ -772,7 +772,21 @@ async function detail(reqIn) {
   if (!rawId) return { list: [] };
   const durl = rawId.startsWith('http') ? rawId : HOST + rawId;
   const html = await getHtml(rawId);
-  if (!html) return { list: [] };
+  if (!html) {
+    // v5：全腿落败也回一集懒解析，详情永不空手（play() 内重取详情 HTML 提 payload；
+    // 提不到回诊断、不转圈）。无 HTML 时无标题/封面，集名即“正片”。
+    return {
+      list: [{
+        vod_id: rawId,
+        vod_name: '精彩视频',
+        vod_pic: '',
+        vod_remarks: 'HD',
+        vod_content: 'JavRate',
+        vod_play_from: 'JavRate',
+        vod_play_url: '正片$' + durl,
+      }],
+    };
+  }
   if (lastFetch.kind === 'md') {
     // jina 赢了竞速：只有展示信息、无 payload；再给 HTML 腿一次 6s 短预算——
     // 拿到 HTML 就按 HTML 详情走（出双清晰度集），拿不到才回 jina 展示 + 懒解析集。
@@ -833,6 +847,16 @@ async function detailHtml(html, rawId, durl) {
 // 清单改写（分片行指回代理）、分片字节透传（支持 Range，便于拖动）。
 // v4（2026-11-08）：play() 的 variants 改走本地代理地址（v3 是无 token 裸 CDN，双双 403）；
 // 分片取失败先强制重铸重试、仍失败回 502，不再 302 到无 token 裸地址；详情加“自适应”线。
+// v5（2026-11-08，基于线上 v4 blob 13070850 手术式修改；CATS 与字幕芯一字未动）：
+// 用户 20:25 真机：重导后详情一集都没出（全腿落败时 detail() 回 {list: []}，懒解析集只在
+// getHtml 有回包时才出）；用户 20:23 真机：点播依旧转圈。VM 计时（v5 诊断，curl 同步桩会
+// 串行放大耗时，绝对值仅供同桩对比）：play() 冷 17.8-23.9s、温 14.4-14.8s，其中 master
+// 取回 1.9-11.6s、mint 冷 11.9-15.5s；代理播单/分片本身 2.0-2.6s、35 秒后重铸 3.1s 均通。
+// 故 v5：① 详情全腿落败也回一集懒解析，永不空手；② play() 不再取 master——变体地址按
+// 实测形态（master 目录 + 720p|1080p/video.m3u8 + master 查询串）直接构造，两部片实测
+// 构造地址经代理取回 200/ENDLIST（2106/1692 分片），形态不符才回落旧路现取 master 拆档；
+// ③ 字幕不再 await（1.5 秒 race，超时即不要字幕、先回地址）；④ 代理令牌剩 0-10 秒时
+// 用现令牌立即出分片、后台现铸刷新缓存，不再让重铸堵住分片；⑤ fetchBytes 超时 30s→15s。
 // 地址形态与 24jav 同款：播放地址查询串 /proxy/m3u8?u=&r=&p=；改写后的分片行用请求 Host
 // 拼完整 http:// 绝对地址、路径段形式 + .ts 后缀（过 ffmpeg 分片后缀白名单）。
 function unb64url(s) {
@@ -850,12 +874,13 @@ function proxyUrl(reqIn, path, targetUrl, referer, payload) {
   } catch (e) { return ''; }
 }
 
-async function fetchBytes(url, referer) {
+async function fetchBytes(url, referer, timeoutMs) {
+  const to = timeoutMs || 15000;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       const r = await req.get(url, {
         headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
-        timeout: 30000,
+        timeout: to,
         responseType: 'arraybuffer',
         validateStatus: () => true,
       });
@@ -868,20 +893,27 @@ async function fetchBytes(url, referer) {
 // token 缓存：payload -> {master, q, exp}；exp 为 token 的 expires（秒），
 // 用前剩 5 秒以上才复用，否则重铸。只在模块内存里，不落盘、不跨 App 重启。
 const tokenCache = new Map();
+// v5：并发现铸去重——同一 payload 同一时刻只铸一次（后台刷新与分片阻塞铸不再重复取 /player/v2）。
+const mintInflight = new Map();
 
 async function mintMaster(durl, payload) {
   const nowS = Math.floor(Date.now() / 1000);
   const hit = tokenCache.get(payload);
   if (hit && hit.exp - 5 > nowS) return hit;
-  const master = await resolveSignedMaster(durl, payload);
-  if (!master) return hit || null;
-  const q = (master.split('?')[1] || '');
-  const expM = q.match(/expires=(\d+)/);
-  const exp = expM ? parseInt(expM[1], 10) : nowS + 30;
-  const rec = { master, q, exp };
-  tokenCache.set(payload, rec);
-  if (tokenCache.size > 50) tokenCache.delete(tokenCache.keys().next().value);
-  return rec;
+  if (mintInflight.has(payload)) return mintInflight.get(payload);
+  const p = (async () => {
+    const master = await resolveSignedMaster(durl, payload);
+    if (!master) return hit || null;
+    const q = (master.split('?')[1] || '');
+    const expM = q.match(/expires=(\d+)/);
+    const exp = expM ? parseInt(expM[1], 10) : nowS + 30;
+    const rec = { master, q, exp };
+    tokenCache.set(payload, rec);
+    if (tokenCache.size > 50) tokenCache.delete(tokenCache.keys().next().value);
+    return rec;
+  })();
+  mintInflight.set(payload, p);
+  try { return await p; } finally { mintInflight.delete(payload); }
 }
 
 async function mintFreshToken(durl, payload) {
@@ -968,11 +1000,20 @@ async function jrProxy(request, reply) {
     ? `http://${host}/spider/${KEY}/3`
     : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
   // 有 payload：现铸现贴 token；铸不出时退回原地址直取（token 未过期时仍可能通）。
+  // v5：令牌剩 0-10 秒时用现令牌立即出分片、后台现铸刷新缓存，不再让重铸堵住本次分片；
+  // 令牌已过期或无缓存才同步现铸（不可避免的一次等待）。
   let fetchUrl = target;
   if (payload) {
     try {
-      const tk = await mintFreshToken(referer, payload);
-      if (tk) fetchUrl = withToken(target, tk);
+      const nowS = Math.floor(Date.now() / 1000);
+      const cached = tokenCache.get(payload);
+      if (cached && cached.exp > nowS && cached.exp - nowS <= 10) {
+        fetchUrl = withToken(target, cached.q);
+        mintMaster(referer, payload).catch(() => {});
+      } else {
+        const tk = await mintFreshToken(referer, payload);
+        if (tk) fetchUrl = withToken(target, tk);
+      }
     } catch (e) { /* 退回原地址 */ }
   }
   try {
@@ -1039,6 +1080,22 @@ async function resolveSignedMaster(durl, payload) {
   return found.length ? found[0] : '';
 }
 
+// v5：变体地址直接构造——实测两部片 master 文本的变体 URI 均为相对路径
+// `<dir>/720p/video.m3u8` 与 `<dir>/1080p/video.m3u8`（2026-11-08 VM 实测，
+// 构造地址经代理取回 200/ENDLIST：UMAN-017 2106 分片、MIUM-1451 1692 分片）。
+// 构造 = master 目录 + `<h>p/video.m3u8` + master 查询串（token 由代理取数时现铸替换，
+// 故构造地址的查询串新旧不影响播放）。master URL 形态不符时回 null，调用处回落旧路。
+function constructVariants(masterUrl) {
+  const m = String(masterUrl || '').match(/^(https:\/\/[^?]+\/)playlist\.m3u8(\?.*)?$/);
+  if (!m) return null;
+  const base = m[1];
+  const qs = m[2] || '';
+  return [
+    { height: 1080, label: '1080p', url: base + '1080p/video.m3u8' + qs },
+    { height: 720, label: '720p', url: base + '720p/video.m3u8' + qs },
+  ];
+}
+
 // 自适应 master 播单拆两档：#EXT-X-STREAM-INF 的 RESOLUTION 行 + 下一行 URI。
 // URI 可能是相对路径（带 token 查询串），按 master URL 解析成绝对地址。
 function parseMasterVariants(masterText, masterUrl) {
@@ -1096,17 +1153,22 @@ async function play(reqIn) {
   const subsP = code ? subSearchAll(durl).catch(() => []) : Promise.resolve([]);
   // 现铸签名 master（token 30 秒，payload 可重复铸），拆档后包一层本地代理再出线；
   // 分片由代理现铸现贴 token，播放器只跟本地代理说话。
+  // v5：不再取 master 拆档——变体地址按实测形态直接构造（省一次 2-12 秒的 master 取回）；
+  // 构造失败（master URL 形态不符）才回落旧路现取 master 拆档。
   let target = '';
   let variants = [];
   try {
     const rec = await mintMaster(durl, payload);
     if (rec && rec.master) {
-      try {
-        const mr = await reqRaw(rec.master, { 'User-Agent': UA, 'Referer': durl || (HOST + '/') }, 8000);
-        if (mr.status === 200 && mr.body && mr.body.indexOf('#EXTM3U') >= 0) {
-          variants = parseMasterVariants(mr.body, rec.master);
-        }
-      } catch (e) { /* 分档失败不致命，回自适应 master */ }
+      variants = constructVariants(rec.master) || [];
+      if (!variants.length) {
+        try {
+          const mr = await reqRaw(rec.master, { 'User-Agent': UA, 'Referer': durl || (HOST + '/') }, 8000);
+          if (mr.status === 200 && mr.body && mr.body.indexOf('#EXTM3U') >= 0) {
+            variants = parseMasterVariants(mr.body, rec.master);
+          }
+        } catch (e) { /* 分档失败不致命，回自适应 master */ }
+      }
       // v4 自适应集：直接取 master 走代理（master 本身带 token；代理改写其 variant 行，
       // 播放器按带宽自选档位），不拆档。
       let signedVariant;
@@ -1145,7 +1207,9 @@ async function play(reqIn) {
   const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   if (variants.length) result.variants = variants;
   if (!target) result.msg = PLAY_DIAG_NO_MASTER;
-  const subs = await subsP;
+  // v5：字幕不再 await——1.5 秒 race，超时即不要字幕、先回地址（字幕是加分项，播放地址是主线；
+  // subsP 后台继续跑，结果进 subResultCache 供后续点播用）。
+  const subs = await Promise.race([subsP, sleep(1500).then(() => null)]);
   if (subs && subs.length) result.subs = subs;
   return result;
 }
