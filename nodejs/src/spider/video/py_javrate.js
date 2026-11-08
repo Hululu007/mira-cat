@@ -70,6 +70,15 @@ import req from '../../util/req.js';
 // 在 b-cdn.net 上，bunnytoken 签名地址拉了 404；站方真链是 payload → /player/v2 →
 // POST /api/token/generate（需每会话轮换的 apiSecret，见 probe/），HTML 腿全死故暂无解。
 // videocdn.avking.xyz 的片（UMAN-017 等）bunnytoken 能通，v8 应能播。
+// v9（2026-11-09，基于 v8 blob 7400f47f；CATS 与字幕芯除 subExtractCode 外一字未动）：
+// 用户 02:19 真机：UMAN-017 能播（v8 生效）、SSNI-229 仍失败（Bunny 墙未解）；另报两问题：
+// ① 无码A片下大量只显示「正片」无分辨率；② 无码破解翻页加载不出更多。
+// ① 根因：subExtractCode 的旧 pattern 只抓到日期段（CARIB-110726）丢序号，且正规化吃掉底线
+// （1PON-110726_001 变 1PON-110726-001），apiHot 严格比对故查不到、无 bare、只剩正片。
+// 修法：先抓无码日期码 PREFIX-YYMMDD-NNN/_NNN 并保留原始分隔符（放最前，有码不会误抓）。
+// ② 根因：关键词翻页 URL 带 &moviesort=3，把排序从「最新更新」改成「大家都喜欢」，
+// 第 2 页起与第 1 页不同排序、翻页出重复（无码破解 p2 与 p1 重 5/20）。修法：翻页只留 ?page=，
+// 实测 p2 与 p1 重 0/20、巨乳同样 0 重。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const RELAY = 'https://javrate.li768435813.workers.dev';
@@ -441,7 +450,15 @@ function subSlugTitle(durl) {
 }
 
 function subExtractCode(text) {
-  const s = String(text || '').toUpperCase().replace(/[._]/g, ' ').replace(/\s+/g, ' ');
+  const raw = String(text || '');
+  // v9 無碼日期碼：PREFIX-YYMMDD-NNN / PREFIX-YYMMDD_NNN（CARIB/10MU/1PON/PACO 等），
+  // 須在正規化前先抓、保留原始分隔符——1PON 用底線（1PON-110726_001），apiHot 嚴格比對，
+  // 轉連字號就查不到（實測：連字號版 0 條、底線版 1 條）。舊正規化會把底線吃掉、
+  // 且 CARIB/1PONDO 等舊 pattern 只抓到日期段（CARIB-110726）丟序號，apiHot 亦查不到，
+  // 故無碼A片大量只剩「正片」。放最前；有碼（SSNI-229 等）無日期+序號格式，不會誤抓。
+  const unc = raw.match(/\b[A-Z0-9]{2,6}[-_]\d{6}[-_]\d{2,3}\b/i);
+  if (unc) return unc[0].toUpperCase();
+  const s = raw.toUpperCase().replace(/[._]/g, ' ').replace(/\s+/g, ' ');
   const pats = [
     /\bFC2(?:[- ]?PPV)?[- ]?\d{5,8}\b/,
     /\bCARIB(?:PR)?[- ]?\d{6,8}\b/,
@@ -774,7 +791,10 @@ function catUrl(cat, page) {
     return page <= 1 ? ('/menu/' + cat.path) : ('/menu/' + cat.path + '/5-2-' + page);
   }
   const base = '/keywords/movie/' + encodeURIComponent(cat.path);
-  return page <= 1 ? base : (base + '?page=' + page + '&moviesort=3');
+  // v9：翻頁去掉 &moviesort=3——它把排序從「最新更新」改成「大家都喜歡」，第 2 頁起與第 1 頁
+  // 不是同一排序，翻頁會出重複（實測無碼破解 p2 與 p1 重 5/20）；去掉後 p2 與 p1 重 0/20，
+  // 巨乳同樣 0 重。只留 ?page=<頁>，與第 1 頁同排序。
+  return page <= 1 ? base : (base + '?page=' + page);
 }
 
 async function home() {
