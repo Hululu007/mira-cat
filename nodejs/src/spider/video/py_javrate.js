@@ -69,6 +69,14 @@ import req from '../../util/req.js';
 // 注意：v8 只修计时，不解决 Bunny Stream 片（SSNI-229/RAS-067）的 404——那类片的裸地址
 // 在 b-cdn.net 上，bunnytoken 签名地址拉了 404；站方真链是 payload → /player/v2 →
 // POST /api/token/generate（需每会话轮换的 apiSecret，见 probe/），HTML 腿全死故暂无解。
+// v9（2026-11-09，基于 v8 blob 7400f47f）：修無碼A片只剩正片（subExtractCode 先抓無碼
+// 日期碼并保留分隔符）与無碼破解翻頁（去掉 &moviesort=3）；用户 02:28 确认都好了。
+// v10（2026-11-09，基于 v9 blob 6abc4107；CATS 与字幕芯一字未动）：攻 Bunny 墙——
+// 用户 03:16 报 lailai-rex 的 JavRate（REX 1.0.5）無碼破解下 ROYD-187/SSNI-229/SSNI-295
+// 都能播，而猫源同分类同片播不了。根因：REX 用 Widget.http.get 在设备上能直接拉详情页与
+// /player/v2（走原生栈、能过站方验证），猫源 req（axios 沙箱）被指纹拦。修法：HTML 腿
+// （htmlOnly）加两条全局 fetch 通道（直连 + Worker），赌 App 的 fetch 走与 Widget.http
+// 相近的原生栈；App 内无 fetch 时不加、行为与 v9 一致。成败待真机（SSNI-229）。
 // videocdn.avking.xyz 的片（UMAN-017 等）bunnytoken 能通，v8 应能播。
 // v9（2026-11-09，基于 v8 blob 7400f47f；CATS 与字幕芯除 subExtractCode 外一字未动）：
 // 用户 02:19 真机：UMAN-017 能播（v8 生效）、SSNI-229 仍失败（Bunny 墙未解）；另报两问题：
@@ -194,8 +202,18 @@ async function getPage(path, opts) {
   // 不带自定义 Agent 的 axios 4/4 全通。故 jina 腿再加一条 fetch 通道（有 fetch 的运行
   // 时才发），与 req 通道并行竞速，先到先赢；App 内无 fetch 时只剩 req 通道（手机直连，
   // 无 VM 代理问题，行为待真机看）。Worker/直连腿仍走 req，与 v1 一致。
+  // v10（2026-11-09，Bunny 墙）：lailai-rex 的 JavRate 用 Widget.http.get 在设备上能
+  // 直接拉详情页与 /player/v2（SSNI-229 可播），而猫源 req 腿全死——两边 HTTP 实现不同，
+  // REX 的走原生栈、能过站方验证，猫源 req（axios 沙箱）被指纹拦。猫源 App 若有全局 fetch，
+  // 它可能走与 Widget.http 相近的原生栈；故 HTML 腿（htmlOnly：详情 payload 与 /player/v2）
+  // 加两条 fetch 通道（直连 + Worker），与 req 腿并行竞速。App 内无 fetch 时不加，
+  // 行为与 v9 一致；fetch 腿拿不到/被挑战页时只算失败、不影响 req 腿。
   if (typeof fetch === 'function') {
     legs.push({ via: 'jina-fetch', ms: 20000, kind: 'md', u: JINA + url, transport: 'fetch' });
+    if (opts && opts.htmlOnly) {
+      legs.push({ via: 'direct-fetch', ms: 15000, kind: 'html', u: url, transport: 'fetch' });
+      legs.push({ via: 'worker-fetch', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'fetch' });
+    }
   }
   // v6：htmlOnly（详情/铸 master）与 mdOnly（详情展示兜底）分流；jina 永不作为 payload 来源。
   const useLegs = (opts && opts.htmlOnly) ? legs.filter((l) => l.kind === 'html')
