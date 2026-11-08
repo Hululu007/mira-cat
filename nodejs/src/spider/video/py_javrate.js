@@ -47,6 +47,20 @@ import req from '../../util/req.js';
 // 回落现行 /player/v2 老路；全链 withTimeout 硬定时器 + play() 20s 总预算 +
 // jrProxy 25s 总预算 + mintInflight 10s 超时去毒；全失败回 parse:1 + 详情页 url +
 // 中文诊断（仓内先例：91duanju/javhdporn/javgg/brazz），绝不再回 {parse:0,url:''}。
+// v7（2026-11-08，基于线上 v6 blob 2c538938 手术式修改；CATS 与字幕芯一字未动）：
+// 用户 23:14 真机：v6 仍无 1080p/720p、无法播放，症状由一直转圈变为直接“视频加载失败”。
+// 根因坐实：详情 HTML 腿在手机上全死（Worker /f 取 HTML 回 403 验证页、直连也被拦），
+// 故无 payload、无 contentUrl，详情只剩一集“正片”；play() 内重取 HTML 同样落败，
+// playFail 回 {parse:1, url:详情页}，播放器拿 HTML 页当视频加载即“视频加载失败”。
+// 修法：绕开详情 HTML——POST /api/hot?q=<番号> 直接取裸清单（子代理 2026-11-08 实测格式：
+// 关键字放查询串 ?q=、无请求体、Content-Type: application/json；响应 data.movies[].cloudPlayList[0].m3U8Url
+// 才是裸地址，movie 级 m3U8Url 可能为空；每部片只 1 条 cloudPlayList，分档由铸 token 后的 master 解析）。
+// Worker 实测能通 /api/（GET 打 /api/bunnytoken/generate 与 /api/hot 均回 405，
+// 即 API 本身通了、只是 GET 不被接受；HTML 才回 403），故 Worker 同步升 v2
+// （加 POST /api/hot 与 POST /api/bunnytoken/generate 代取路由，/f/ 与根路径一字未动）。
+// v7：详情无 payload 且无 contentUrl 时凭番号调 apiHot 取 bare，出 1080p/720p/自适应三集
+// （payload 为空、只带 @@bare，mintBunny 主路只凭 bare）；mintBunny 直连失败时回落 Worker POST；
+// play() 懒解析集点播时同样先试 apiHot 再重取 HTML。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const RELAY = 'https://javrate.li768435813.workers.dev';
@@ -829,7 +843,23 @@ async function detail(reqIn) {
       }],
     };
   }
-  return parseDetailMd(md, rawId, durl);
+  const base = parseDetailMd(md, rawId, durl);
+  // v7：jina 详情无 payload，凭番号调 /api/hot 取 bare，出 1080p/720p/自适应三集
+  // （绕开已死的详情 HTML 腿；apiHot 直连先行、失败走 Worker v2）。
+  try {
+    const it = base && base.list && base.list[0];
+    if (it && String(it.vod_play_url || '') === '正片$' + durl) {
+      const hotCode = subExtractCode(it.vod_name) || subExtractCode(it.vod_remarks) || subExtractCode(durl);
+      if (hotCode) {
+        const bare = await apiHotBare(hotCode);
+        if (bare) {
+          const bareSeg = '@@' + bare;
+          it.vod_play_url = '1080p$' + durl + '@@' + '' + '@@1080p' + bareSeg + '#720p$' + durl + '@@' + '' + '@@720p' + bareSeg + '#自适应$' + durl + '@@' + '' + '@@auto' + bareSeg;
+        }
+      }
+    }
+  } catch (e) { /* 保持正片，play() 内再试 */ }
+  return base;
 }
 
 async function detailHtml(html, rawId, durl) {
@@ -858,15 +888,24 @@ async function detailHtml(html, rawId, durl) {
   // .m3U8Url 同样含该 guid，但 hot 只是搜索联想 POST 接口、不能替代详情。
   // 故 play 全程不能由 durl 零 HTML 构造裸清单——集内须带 contentUrl（第 4 段 @@
   // 裸地址），play() 凭它直连 POST bunnytoken 铸 master。
-  const contentUrl = extractLd(html, 'contentUrl');
+  let contentUrl = extractLd(html, 'contentUrl');
+  // v7：HTML 里无 payload 且无 contentUrl 时，凭番号调 /api/hot 取 bare
+  // （绕开已死的详情 HTML 腿；apiHot 直连先行、失败走 Worker v2）。
+  if (!payload && !contentUrl) {
+    const hotCode = code || subExtractCode(mainTitle) || subExtractCode(durl);
+    if (hotCode) {
+      try { contentUrl = await apiHotBare(hotCode) || ''; } catch (e) { contentUrl = ''; }
+    }
+  }
   // 播单不在详情时固化：play() 凭 payload 现取 player v2（token 仅 30 秒有效，详情时取必过期，
   // 故详情只存 payload，不存签名 URL）；有 payload 出 1080p/720p/自适应三集（play() 内现铸现包代理），
   // 无 payload 只留一集懒解析（play() 内重取详情 HTML 提 payload，提不到回诊断、不转圈）。
   // v4：再加一条“自适应”线（master 本身走代理出线，代理改写 master 的 variant 行，
   // 播放器按带宽自选档位；三条线都是真实存在的地址，不编造）。
+  // v7：有 bare 无 payload 也出三集（payload 段留空，只带 @@bare，mintBunny 主路只凭 bare）。
   const bareSeg = contentUrl ? '@@' + contentUrl : '';
-  const playUrl = payload
-    ? ('1080p$' + durl + '@@' + payload + '@@1080p' + bareSeg + '#720p$' + durl + '@@' + payload + '@@720p' + bareSeg + '#自适应$' + durl + '@@' + payload + '@@auto' + bareSeg)
+  const playUrl = (payload || contentUrl)
+    ? ('1080p$' + durl + '@@' + (payload || '') + '@@1080p' + bareSeg + '#720p$' + durl + '@@' + (payload || '') + '@@720p' + bareSeg + '#自适应$' + durl + '@@' + (payload || '') + '@@auto' + bareSeg)
     : ('正片$' + durl);
   return {
     list: [{
@@ -950,6 +989,49 @@ function jrCacheKey(payload, bare) {
   return bare ? 'bunny:' + bare : 'payload:' + (payload || '');
 }
 
+// v7 新腿——POST /api/hot?q=<番号> 取裸清单地址（子代理 2026-11-08 实测格式）：
+//   请求：POST https://www.javrate.com/api/hot?q=<番号>，Content-Type: application/json，无请求体；
+//   响应：{"code":200,"data":{"movies":[{id, code, m3U8Url, cloudPlayList:[{m3U8Url, guidId, isDefault}]}]}}；
+//   必须读 cloudPlayList[0].m3U8Url（UMAN-017 的 movie 级 m3U8Url 为空串，cloudPlayList 里才有值）；
+//   每部片只 1 条 cloudPlayList（isDefault=1），不分 1080p/720p——分档由铸 token 后的 master 清单解析。
+//   直连先行（6s），失败再走 Worker v2 的 POST /api/hot（Worker 实测能通 /api/，HTML 才被拦）。
+//   用途：详情 HTML 腿死时（无 payload、无 contentUrl），凭番号直接拿 bare，走 mintBunny 主路。
+async function apiHotBare(keyword) {
+  const kw = String(keyword || '').trim();
+  if (!kw) return '';
+  const q = encodeURIComponent(kw);
+  const legs = [
+    { name: 'direct', url: HOST + '/api/hot?q=' + q, ms: 6000 },
+    { name: 'worker', url: RELAY + '/api/hot?q=' + q, ms: 8000 },
+  ];
+  for (const leg of legs) {
+    try {
+      const r = await withTimeout(req({
+        method: 'POST', url: leg.url,
+        data: '',
+        headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Content-Type': 'application/json', 'Accept': 'application/json' },
+        timeout: leg.ms, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5,
+      }), leg.ms + 1000, null);
+      if (!r) continue;
+      const raw = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
+      let j = null;
+      try { j = JSON.parse(raw); } catch (e) { j = null; }
+      const movies = (j && j.data && Array.isArray(j.data.movies)) ? j.data.movies : [];
+      if (!movies.length) continue;
+      const upKw = kw.toUpperCase();
+      const hit = movies.find((mv) => String(mv.code || '').toUpperCase() === upKw)
+        || movies.find((mv) => String(mv.id || '') === kw)
+        || movies[0];
+      if (!hit) continue;
+      const cps = Array.isArray(hit.cloudPlayList) ? hit.cloudPlayList : [];
+      const cp = cps.find((c) => c && c.m3U8Url) || cps[0];
+      const bare = (cp && cp.m3U8Url) || hit.m3U8Url || '';
+      if (bare && String(bare).indexOf('.m3u8') >= 0) return String(bare);
+    } catch (e) { /* 下一条腿 */ }
+  }
+  return '';
+}
+
 // v6 新主路——POST /api/bunnytoken/generate 直连铸 token（api-probe 活体验通，
 // 直连 200/247B/0.27–1.8s，全链验通到首分片 0x47）：入参只有 {"m3u8Url": 裸清单地址}，
 // 无签名、无 Referer、无 Cookie；路径必须全小写。Worker POST 405、jina 会把 POST
@@ -972,6 +1054,23 @@ async function mintBunny(bareUrl) {
       if (signed) return String(signed);
     } catch (e) { /* 重试一次 */ }
   }
+  // v7：直连铸不出时走 Worker v2 的 POST /api/bunnytoken/generate（Worker 实测能通 /api/，
+  // 直连在手机上也可能被拦；Worker 未部署 v2 时这条回 400，mintMaster 再回落 /player/v2）。
+  try {
+    const r = await withTimeout(req({
+      method: 'POST', url: RELAY + '/api/bunnytoken/generate',
+      data: JSON.stringify({ m3u8Url: bareUrl }),
+      headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      timeout: 8000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5,
+    }), 8000, null);
+    if (r) {
+      let j = null;
+      const raw = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
+      try { j = JSON.parse(raw); } catch (e) { j = null; }
+      const signed = j && j.success && j.data && j.data.signedUrl;
+      if (signed) return String(signed);
+    }
+  } catch (e) { /* 回落 */ }
   return '';
 }
 
@@ -1215,7 +1314,7 @@ function parseMasterVariants(masterText, masterUrl) {
   return out;
 }
 
-const PLAY_DIAG_NO_PAYLOAD = 'JavRate 播放失败：详情页里没有播放参数（jina 会剥掉播放器脚本，直连与 Worker 腿又被站方验证墙拦住），铸不出签名播单。列表与详情可看，播放需等墙松。';
+const PLAY_DIAG_NO_PAYLOAD = 'JavRate 播放失败：详情页里没有播放参数（/api/hot 也没取到裸清单，直连与 Worker 腿又被站方验证墙拦住），铸不出签名播单。列表与详情可看，播放需等墙松。';
 const PLAY_DIAG_NO_MASTER = 'JavRate 播放失败：拿到播放参数但铸不出签名播单（直连铸 token 与 /player/v2 都被站方验证墙拦住），请稍后再试，不要反复点播。';
 const PLAY_DIAG_TIMEOUT = 'JavRate 播放失败：点播 20 秒内没有回音（取数腿挂住），请稍后再试，不要反复点播。';
 
@@ -1270,16 +1369,24 @@ async function playInner(reqIn) {
   // 沿用“无 @@ 即 payload 本身”的旧解析会把整条 durl 当 payload、铸 master 必然失败。
   let { durl, payload, bare, wantHeight, wantAdaptive } = parsePlayId(rawId);
   if (!payload && !bare && durl) {
-    // 懒解析集：详情走 jina 时无 payload，play 时重取详情 HTML（只走 HTML 腿）
-    // 再提一次 payload 与 contentUrl（v6：追补预算 = 腿超时 15s）。
+    // v7：懒解析集先凭番号调 /api/hot 取 bare（绕开已死的详情 HTML 腿；直连先行、失败走 Worker v2）。
     try {
-      const path = durl.startsWith('http') ? durl.slice(HOST.length) : durl;
-      const htmlOnly = await withTimeout(getHtmlOnly(path, 15000), 15000, '');
-      if (htmlOnly) {
-        payload = extractPayload(htmlOnly);
-        if (!bare) bare = extractLd(htmlOnly, 'contentUrl');
-      }
-    } catch (e) { /* ignore */ }
+      const title = subNameCache.get(durl) || '';
+      const hotCode = subExtractCode(title) || subExtractCode(durl);
+      if (hotCode) bare = await apiHotBare(hotCode) || '';
+    } catch (e) { /* 再试 HTML */ }
+    if (!payload && !bare) {
+      // 懒解析集：详情走 jina 时无 payload，play 时重取详情 HTML（只走 HTML 腿）
+      // 再提一次 payload 与 contentUrl（v6：追补预算 = 腿超时 15s）。
+      try {
+        const path = durl.startsWith('http') ? durl.slice(HOST.length) : durl;
+        const htmlOnly = await withTimeout(getHtmlOnly(path, 15000), 15000, '');
+        if (htmlOnly) {
+          payload = extractPayload(htmlOnly);
+          if (!bare) bare = extractLd(htmlOnly, 'contentUrl');
+        }
+      } catch (e) { /* ignore */ }
+    }
   }
   if (!payload && !bare) return playFail(durl, PLAY_DIAG_NO_PAYLOAD);
   // 字幕按条目接：仅当标题含番号才搜，否则不带 subs 键（与模板同一口径）
