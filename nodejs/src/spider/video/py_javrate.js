@@ -3,12 +3,12 @@ import req from '../../util/req.js';
 // JavRate https://www.javrate.com/ —— 鑑黃師（站方自称 Javrate；标题“正妹AV,日本A片,國產AV,免費在綫看 - Javrate”）
 // *** 2026-11-04 用户点名先写这 8 个，故本源已导入（原协调员 HELD 意见被用户指令取代）。
 // 播放仍受限：见下文播放链路说明——列表/分类/详情/搜索/封面/字幕均实测可用，
-// 唯播放需播单改写代理（token 30 秒 + 逐分片签名），代理未建前 App 内播单播一半会死，属已知限制、非新 bug。
+// 唯播放需播单改写代理（token 30 秒 + 逐分片签名）——v3 已接蜘蛛本地字节代理 /proxy/m3u8（见 v3 注）。
 // 播放链路（2026-11-04 VM 实测）：详情页 JSON-LD contentUrl 是未签名裸清单（videocdn.avking.xyz，
 // 直接取 403）；真流须走详情页 iframe /player/v2?payload=… 取签名 master（cloud-*.avking.xyz，
 // token 有效期仅 30 秒，过期即 403）；且每条分片请求都必须单独带 token 查询串（裸分片 403 实测），
 // 站方自带播放器靠自定义 loader 给每个请求注入并刷新 token，App 播放器不会这样做，
-// 故蜘蛛只能返回新鲜签名 master，无法保证 App 内播通、更无法撑过 30 秒后的分片。
+// v3：play() 返回本地代理地址，分片由代理现铸现贴 token，30 秒窗口不再卡播放器。
 // 除播放外全部实测可用：首页/菜单/关键词分类/详情/搜索/封面均为直链。
 // 分类：菜单 3 个（censored/uncensored/chinese）+ 关键词分类（名与路径均取自站方 /keywords/movie 索引页实测）
 // 列表翻页：菜单 /menu/<m>/5-2-<页>；关键词 /keywords/movie/<词>?page=<页>&moviesort=3（第 2 页标题实测“第2頁”）
@@ -26,9 +26,20 @@ import req from '../../util/req.js';
 // master，master 到手拆 720p/1080p 两档，铸不出回空地址 + msg 诊断）。
 // 播单改写代理不写进蜘蛛（B 路 11-08 已判死：/f 取详情 6 次全 403，铸不出新鲜 master），
 // 等墙松了再接独立 javrate-hls Worker。
+// v3（2026-11-08，基于 v2 blob c71929da 手术式修改；CATS 与字幕芯一字未动）：
+// 用户 13:50 真机：v2 列表已确认能出（jina 腿 App 内通）；播放仍死——详情一集都没有
+// （UMAN-017 播放键灰掉），病因即 jina 详情无 payload 故不出集。v3 只攻播放：
+// ① 详情 HTML 腿优先拿 payload（jina 赢了竞速也再给 HTML 腿 6s 追一次，拿到就出双集；
+// 拿不到也留一集懒解析，点播时 play() 内重取详情 HTML 提 payload）；
+// ② 播放改走蜘蛛本地字节代理 /proxy/m3u8（24jav/mogu/丝瓜同款）：play() 现铸签名 master
+// （token 精确 30 秒、payload 可重复铸，11-08 VM 实测），分片走代理现取现传，
+// token 由代理按 payload 现铸现贴、过期前重铸，解决 30 秒签名 + 播放器不透传 token；
+// ③ 直连腿 3s→8s（竞速先到先赢，抬上限不增加等待；300KB 首页手机 VPN 下 3s 太紧）。
+// 播放不走 Railway（Rule 23）。Worker 不用动。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const RELAY = 'https://javrate.li768435813.workers.dev';
+const KEY = 'py_javrate';
 // 2026-11-05: 手机直连 javrate.com 拿不到内容（VM 全通），取数改走 Worker 优先、
 // 直连兜底；Worker 未部署时 Worker 腿速败、行为与原来一致，部署后无需重推即生效。
 function b64url(str) {
@@ -84,7 +95,7 @@ function normUrl(u) {
 }
 
 // ---------------- 取数：三腿并行竞速（v2） ----------------
-// Worker 8s / 直连 3s / jina 20s 同时发，先成功者赢；挑战页/空页/报错的腿只算失败，
+// Worker 8s / 直连 8s / jina 20s 同时发，先成功者赢；挑战页/空页/报错的腿只算失败，
 // 不抢赢。lastFetch 记录赢腿的 kind（'html' | 'md'）与 via，供解析分支选用。
 // jina 腿：https://r.jina.ai/<目标 URL>，回 Markdown（头含 Title:/URL Source:/Markdown Content:）。
 const JINA = 'https://r.jina.ai/';
@@ -115,14 +126,14 @@ function firstSuccess(jobs, ms) {
   });
 }
 
-async function getPage(path) {
+async function getPage(path, opts) {
   let url = String(path || '');
   if (url.startsWith('//')) url = 'https:' + url;
   else if (url.startsWith('/')) url = HOST + url;
   const headers = { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
   const legs = [
     { via: 'worker', ms: 8000, kind: 'html', u: viaWorker(url), transport: 'req' },
-    { via: 'direct', ms: 3000, kind: 'html', u: url, transport: 'req' },
+    { via: 'direct', ms: 8000, kind: 'html', u: url, transport: 'req' },
     { via: 'jina-req', ms: 20000, kind: 'md', u: JINA + url, transport: 'req' },
   ];
   // jina 双通道（2026-11-08 VM 实测）：仓库 req.js 是 axios.create 配自定义 https.Agent，
@@ -134,7 +145,8 @@ async function getPage(path) {
   if (typeof fetch === 'function') {
     legs.push({ via: 'jina-fetch', ms: 20000, kind: 'md', u: JINA + url, transport: 'fetch' });
   }
-  const jobs = legs.map((leg) => (async () => {
+  const useLegs = (opts && opts.htmlOnly) ? legs.filter((l) => l.kind === 'html') : legs;
+  const jobs = useLegs.map((leg) => (async () => {
     try {
       let body = '';
       let status = 0;
@@ -157,7 +169,7 @@ async function getPage(path) {
     } catch (e) { /* ignore, other legs race on */ }
     return null;
   })());
-  const won = await firstSuccess(jobs, 20500);
+  const won = await firstSuccess(jobs, (opts && opts.ms) || 20500);
   if (won) { lastFetch.kind = won.kind; lastFetch.via = won.via; return won.body; }
   lastFetch.kind = 'html'; lastFetch.via = '';
   return '';
@@ -165,6 +177,12 @@ async function getPage(path) {
 
 async function getHtml(path) {
   return getPage(path);
+}
+
+// 只走 HTML 腿（Worker + 直连，不走 jina）：铸 master 与提 payload 专用——
+// jina 的 player 页是 500 Markdown，抽不到 master；详情 Markdown 也无 payload。
+async function getHtmlOnly(path, ms) {
+  return getPage(path, { htmlOnly: true, ms: ms || 8000 });
 }
 
 // 字幕芯取数原语（与 py_mogu 一致）：统一回 {status, body}
@@ -323,7 +341,8 @@ function parseDetailMd(md, rawId, durl) {
     desc = clean(descM[1].replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/^【在綫觀看】[^\n]*\n?/, ''));
   }
   // jina 剥 script/iframe：详情 Markdown 里没有 /player/v2?payload=，也没有 JSON-LD
-  // contentUrl，故不出播单（play_url 为空，App 不会进 play，也就不会转圈）。
+  // contentUrl，故只留一集懒解析（play() 内重取详情 HTML 提 payload；提不到回诊断、不转圈）。
+  // v3 之前这里 play_url 为空，详情一集都没有（UMAN-017 真机播放键灰掉即此病）。
   return {
     list: [{
       vod_id: rawId,
@@ -332,7 +351,7 @@ function parseDetailMd(md, rawId, durl) {
       vod_remarks: code ? (code + (dur ? ' · ' + dur : '')) : 'HD',
       vod_content: desc || 'JavRate',
       vod_play_from: 'JavRate',
-      vod_play_url: '',
+      vod_play_url: '正片$' + durl,
     }],
   };
 }
@@ -754,7 +773,17 @@ async function detail(reqIn) {
   const durl = rawId.startsWith('http') ? rawId : HOST + rawId;
   const html = await getHtml(rawId);
   if (!html) return { list: [] };
-  if (lastFetch.kind === 'md') return parseDetailMd(html, rawId, durl);
+  if (lastFetch.kind === 'md') {
+    // jina 赢了竞速：只有展示信息、无 payload；再给 HTML 腿一次 6s 短预算——
+    // 拿到 HTML 就按 HTML 详情走（出双清晰度集），拿不到才回 jina 展示 + 懒解析集。
+    const htmlOnly = await getHtmlOnly(rawId, 6000);
+    if (htmlOnly) { lastFetch.kind = 'html'; lastFetch.via = 'html-retry'; return detailHtml(htmlOnly, rawId, durl); }
+    return parseDetailMd(html, rawId, durl);
+  }
+  return detailHtml(html, rawId, durl);
+}
+
+async function detailHtml(html, rawId, durl) {
   let mainTitle = extractLd(html, 'name');
   if (!mainTitle) {
     const tM = html.match(/<title>(.*?)<\/title>/i);
@@ -775,8 +804,11 @@ async function detail(reqIn) {
   const code = extractLd(html, 'value');
   const payload = extractPayload(html);
   // 播单不在详情时固化：play() 凭 payload 现取 player v2（token 仅 30 秒有效，详情时取必过期，
-  // 故详情只存 payload，不存签名 URL）；无 payload 时不给播单，避免 parse:0 空 url 转圈。
-  const playUrl = payload ? ('正片$' + durl + '@@' + payload) : '';
+  // 故详情只存 payload，不存签名 URL）；有 payload 出 1080p/720p 双集（play() 内现铸现包代理），
+  // 无 payload 只留一集懒解析（play() 内重取详情 HTML 提 payload，提不到回诊断、不转圈）。
+  const playUrl = payload
+    ? ('1080p$' + durl + '@@' + payload + '@@1080p#720p$' + durl + '@@' + payload + '@@720p')
+    : ('正片$' + durl);
   return {
     list: [{
       vod_id: rawId,
@@ -790,12 +822,190 @@ async function detail(reqIn) {
   };
 }
 
+
+// ---------------- 播单/分片本地代理（v3，24jav/mogu/丝瓜同款形态） ----------------
+// 病因（11-08 VM 实测）：签名 master 的 token 精确 30 秒有效、payload 可重复铸；
+// 变体/分片裸取 403、带 token 200；分片是纯 TS、无 AES 密钥（两档各 950 分片，
+// #EXT-X-KEY 0 条）。App 播放器不透传 token，详情给的直链 30 秒后必死。
+// 解法：play() 只出本地代理地址；代理按 payload 现铸现贴 token（缓存 25 秒，过期前重铸），
+// 清单改写（分片行指回代理）、分片字节透传（支持 Range，便于拖动）。
+// 地址形态与 24jav 同款：播放地址查询串 /proxy/m3u8?u=&r=&p=；改写后的分片行用请求 Host
+// 拼完整 http:// 绝对地址、路径段形式 + .ts 后缀（过 ffmpeg 分片后缀白名单）。
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+function proxyUrl(reqIn, path, targetUrl, referer, payload) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    let u = `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+    if (payload) u += '&p=' + b64url(payload);
+    return u;
+  } catch (e) { return ''; }
+}
+
+async function fetchBytes(url, referer) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
+        timeout: 30000,
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+    } catch (e) { /* 重试，落空走 302 降级 */ }
+  }
+  return null;
+}
+
+// token 缓存：payload -> {master, q, exp}；exp 为 token 的 expires（秒），
+// 用前剩 5 秒以上才复用，否则重铸。只在模块内存里，不落盘、不跨 App 重启。
+const tokenCache = new Map();
+
+async function mintMaster(durl, payload) {
+  const nowS = Math.floor(Date.now() / 1000);
+  const hit = tokenCache.get(payload);
+  if (hit && hit.exp - 5 > nowS) return hit;
+  const master = await resolveSignedMaster(durl, payload);
+  if (!master) return hit || null;
+  const q = (master.split('?')[1] || '');
+  const expM = q.match(/expires=(\d+)/);
+  const exp = expM ? parseInt(expM[1], 10) : nowS + 30;
+  const rec = { master, q, exp };
+  tokenCache.set(payload, rec);
+  if (tokenCache.size > 50) tokenCache.delete(tokenCache.keys().next().value);
+  return rec;
+}
+
+async function mintFreshToken(durl, payload) {
+  const rec = await mintMaster(durl, payload);
+  return rec ? rec.q : '';
+}
+
+// 给目标 URL 贴上新鲜 token 查询串（替换旧查询串；相对地址已在调用处解成绝对地址）。
+function withToken(url, q) {
+  if (!q) return url;
+  const i = String(url).indexOf('?');
+  return (i >= 0 ? String(url).slice(0, i) : String(url)) + '?' + q;
+}
+
+// 改写清单正文：# 行的 URI="..."（密钥/音频轨）与非 # 行（variant/分片）一律改指回本地代理。
+// 分片行走路径段形式 + .ts 后缀（b64url 字母表无 '.'，后缀无歧义；代理入口先剥后缀再解码）。
+function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload) {
+  const isMaster = String(raw).includes('#EXT-X-STREAM-INF');
+  const lines = String(raw).split(/\r?\n/);
+  const pEnc = payload ? b64url(payload) : '';
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try {
+            const abs = new URL(uri, playlistUrl).toString();
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}${pEnc ? '&p=' + pEnc : ''}"`;
+          } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    try {
+      const abs = new URL(s, playlistUrl).toString();
+      const bare = abs.split('?')[0];
+      if (isMaster) return `${selfBase}/proxy/m3u8?u=${b64url(bare)}&r=${b64url(referer || '')}${pEnc ? '&p=' + pEnc : ''}`;
+      return `${selfBase}/proxy/${b64url(bare)}/${b64url(payload || '-')}.ts`;
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
+}
+
+// 代理入口（两种地址格式都接受）：
+// 主格式：/proxy/m3u8?u={b64url 目标}&r={b64url referer}&p={b64url payload}；
+// 分片格式：/proxy/{b64url 目标}/{b64url payload}.ts（分片行改写用）。
+// 有 payload 时现铸现贴 token（缓存 25 秒）；无 payload 时按原地址直取（兼容旧地址）。
+async function jrProxy(request, reply) {
+  const q = request?.query || {};
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  let pEnc = q.p || '';
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; pEnc = segs[1] || ''; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  let payload = '';
+  try {
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
+    if (pEnc && pEnc !== '-') payload = unb64url(pEnc) || '';
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+  // 有 payload：现铸现贴 token；铸不出时退回原地址直取（token 未过期时仍可能通）。
+  let fetchUrl = target;
+  if (payload) {
+    try {
+      const tk = await mintFreshToken(referer, payload);
+      if (tk) fetchUrl = withToken(target, tk);
+    } catch (e) { /* 退回原地址 */ }
+  }
+  try {
+    const buf = await fetchBytes(fetchUrl, referer);
+    if (!buf || !buf.length) { reply.redirect(target); return; }
+    const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+    if (head.trimStart().startsWith('#EXTM3U')) {
+      reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(rewriteJrM3u8(buf.toString('utf8'), fetchUrl, selfBase, referer, payload));
+      return;
+    }
+    const range = request?.headers && request.headers.range;
+    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      const start = Math.min(parseInt(m[1], 10) || 0, buf.length);
+      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
+      if (start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', 'bytes ' + start + '-' + end + '/' + buf.length);
+        reply.send(buf.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(buf);
+  } catch (e) {
+    try { reply.redirect(target); } catch (e2) { /* 已发送则忽略 */ }
+  }
+}
+
 async function resolveSignedMaster(durl, payload) {
   // 现取 player v2（Referer 必须为详情页），抽签名 master；master 内含 720p/1080p 两档（首个样本实测）。
-  // 注意：jina 腿取 player 页会剥 script，master 链接大概率不在 Markdown 里；HTML 腿活着时
-  // 竞速会先赢，仍走老路。/player/v2 在 v1 里就是 GET，不走 POST（POST 透传 11-08 实测：
+  // v3：只走 HTML 腿（getHtmlOnly）——11-08 实测 jina 的 player 页 Markdown 仅 858B 外壳，
+  // master 由站方 JS 运行时才铸，jina 静态转码永远拿不到；竞速里 jina 一旦抢赢就是假赢
+  // （懒解析 play 实测：jina 抢赢 -> 铸不出 master；紧接着 720p 走 HTML 腿即铸成）。
+  // /player/v2 在 v1 里就是 GET，不走 POST（POST 透传 11-08 实测：
   // Worker /f POST 同样 403 验证页、直连 POST 20s 超时，两腿在到达站方前就死，无法验证）。
-  const playerHtml = await getHtml('/player/v2?payload=' + encodeURIComponent(payload));
+  const playerHtml = await getHtmlOnly('/player/v2?payload=' + encodeURIComponent(payload), 8000);
   if (!playerHtml) return '';
   const found = [];
   const re = /https:\/\/cloud-[a-z0-9-]+\.avking\.xyz[^"'\s<>]+?playlist\.m3u8[^"'\s<>]*/g;
@@ -836,43 +1046,49 @@ async function play(reqIn) {
   let payload = id;
   const at = id.indexOf('@@');
   if (at >= 0) { durl = id.slice(0, at); payload = id.slice(at + 2); }
+  else if (id.startsWith('http') || id.startsWith('/')) { durl = id; payload = ''; }
+  // 裸详情地址（懒解析集）即 durl 本身，payload 为空、走下面的重取；v2 从未收到裸地址，
+  // 沿用“无 @@ 即 payload 本身”的旧解析会把整条 durl 当 payload、铸 master 必然失败。
+  // 集名里带档位：1080p$durl@@payload@@1080p / 720p$durl@@payload@@720p。
+  let wantHeight = 1080;
+  const at2 = payload.indexOf('@@');
+  if (at2 >= 0) { if (payload.slice(at2 + 2) === '720p') wantHeight = 720; payload = payload.slice(0, at2); }
+  if (!payload && durl) {
+    // 懒解析集：详情走 jina 时无 payload，play 时重取详情 HTML（只走 HTML 腿）再提一次。
+    try {
+      const path = durl.startsWith('http') ? durl.slice(HOST.length) : durl;
+      const htmlOnly = await getHtmlOnly(path, 8000);
+      if (htmlOnly) payload = extractPayload(htmlOnly);
+    } catch (e) { /* ignore */ }
+  }
   if (!payload) return { parse: 0, url: '', msg: PLAY_DIAG_NO_PAYLOAD };
   // 字幕按条目接：仅当标题含番号才搜，否则不带 subs 键（与模板同一口径）
   const title = subNameCache.get(durl) || '';
   const code = subExtractCode(title) || subExtractCode(durl);
   const subsP = code ? subSearchAll(durl).catch(() => []) : Promise.resolve([]);
+  // 现铸签名 master（token 30 秒，payload 可重复铸），拆档后包一层本地代理再出线；
+  // 分片由代理现铸现贴 token，播放器只跟本地代理说话。
   let target = '';
   let variants = [];
-  let playerKind = 'html';
   try {
-    const master = await resolveSignedMaster(durl, payload);
-    playerKind = lastFetch.kind;
-    if (master) {
-      target = master;
-      // master 到手拆两档：取 master 播单文本，1080p 优先、720p 其次、都无则回自适应 master。
-      // 分片仍需 token（见文件头），App 内播通与否未经证实——此步只解决“出哪档”，不保证播通。
+    const rec = await mintMaster(durl, payload);
+    if (rec && rec.master) {
       try {
-        const mr = await reqRaw(master, { 'User-Agent': UA, 'Referer': durl || (HOST + '/') }, 8000);
+        const mr = await reqRaw(rec.master, { 'User-Agent': UA, 'Referer': durl || (HOST + '/') }, 8000);
         if (mr.status === 200 && mr.body && mr.body.indexOf('#EXTM3U') >= 0) {
-          variants = parseMasterVariants(mr.body, master);
-          const v1080 = variants.find((v) => v.height === 1080);
-          const v720 = variants.find((v) => v.height === 720);
-          if (v1080) target = v1080.url;
-          else if (v720) target = v720.url;
+          variants = parseMasterVariants(mr.body, rec.master);
         }
       } catch (e) { /* 分档失败不致命，回自适应 master */ }
+      const want = variants.find((v) => v.height === wantHeight)
+        || variants.find((v) => v.height === 1080)
+        || variants.find((v) => v.height === 720);
+      let signedVariant = want ? want.url : rec.master;
+      // parseMasterVariants 解析相对 URI 时会丢查询串（RFC 3986）：变体地址若无 token，补上 master 的查询串。
+      if (signedVariant.indexOf('?') < 0 && rec.q) signedVariant += '?' + rec.q;
+      const proxied = proxyUrl(reqIn, '/proxy/m3u8', signedVariant, durl || (HOST + '/'), payload);
+      if (proxied) target = proxied;
     }
   } catch (e) { target = ''; }
-  if (!target && playerKind === 'html') {
-    // 兜底只在 HTML 腿时尝试：jina Markdown 里没有 JSON-LD contentUrl，再取一次详情
-    // 也拿不到裸清单，只会白白多等一轮 jina（最长 20s），直接跳过。
-    // 兜底：详情 JSON-LD 的裸清单（已知取数 403，仅作“非空”保底，不宣称可播）
-    try {
-      const html = await getHtml(durl.startsWith('http') ? durl : durl);
-      const bare = extractLd(html, 'contentUrl');
-      if (bare) target = bare;
-    } catch (e) { /* ignore */ }
-  }
   const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   if (variants.length) result.variants = variants;
   if (!target) result.msg = PLAY_DIAG_NO_MASTER;
@@ -890,6 +1106,8 @@ export default function createSpider() {
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
+      fastify.get('/proxy/*', jrProxy);
+      fastify.get('/proxy/m3u8', jrProxy);
       fastify.post('/search', search);
     },
   };
