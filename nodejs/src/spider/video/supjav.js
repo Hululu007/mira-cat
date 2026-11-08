@@ -22,7 +22,6 @@ const CATS = [
   ['censored-jav', '有码 Censored'],
   ['uncensored-jav', '无码 Uncensored'],
   ['amateur', '素人 Amateur'],
-  ['chinese-subtitles', '中文字幕 Chn Sub'],
   ['reducing-mosaic', '破解 Reducing Mosaic'],
   ['english-subtitles', '英文字幕 Eng Sub'],
   ['tag:big-tits', '巨乳'],
