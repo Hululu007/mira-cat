@@ -5,6 +5,10 @@ import req from '../../util/req.js';
 // 2026-11-04 新增 8 个顶级分类（题材标签区已证实 cate，名与 ID 均取自首页实测；现有 5 类与 filters 结构不动）
 // 列表翻页：/category/<cate>/<页码>/；详情 data-url 拼 cdn_lines 首条（站方默认，2026-11-07 实测 sxtmo 线播单/key/分片全链 200；旧首选 d1uy7itup9paqh 已不在 cdn_lines 里，d22 cloudfront 线分片 host 连不上）
 // 播放：单码率媒体播单（AES-128），不设假多档；字幕按条目接（仅标题含番号的条目才接芯，多数中文标题无番号则不接）
+// 2026-11-08 全分类核查（用户 15:23 点名）：228 分类 p1/p2/p3 逐页核对——翻页零重叠、单页/双页分类与站方下一页链接一致，
+//   唯独“首页推荐”翻页断（见 category()）；432 部抽查：351 部正片播单全为标准 VOD（ENDLIST 齐全、Range 206），
+//   81 部是站方 _preview 播单（1 分片、约 10 秒，无正片可换，见 detail()）；27 部详情无播单（站方 500 / 直播占位页，标“已失效”）。
+//   “无码破解”抽查 4 部全为正片 VOD（580/540 分片、ENDLIST、首分片 PTS 1.42s，与正常分类无差别），VM 侧无病因可修。
 // 2026-11-07 取页改走自家 site-fetch Worker 腿优先（用户手机网络到 siguaspw.cc 的 TLS 直接失败，
 //   Safari 打不开、蜘蛛直连拿不到内容；Worker v4 白名单已加 siguaspw.cc，用户已部署）。
 //   Worker 失败再回落直连；取页 Worker 只回文本。
@@ -744,8 +748,13 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const extend = body.filters || body.extend || {};
   if (zoneId === 'home' || !zoneId) {
-    const html = await getHtml('/');
-    return { page: 1, pagecount: 1, list: parseCards(html, HOST) };
+    // 2026-11-08：首页翻页修——站方首页分页在 /page/<N>/（p1~p5 实测各 20 条新片、页间零重叠），
+    // 但首页 HTML 里没有任何下一页链接/总页数（只有 #pageNum 跳页框，且无 data-uri、点不了），
+    // 且实测出现过一次 p3 只回 16 条的短页（随即复测又回 20 条、p4/p5 均满页），故短页不能当到底：
+    // 只有空页才到底（page），非空页一律报 page+1，由 App 翻到空页为止。
+    const html = await getHtml(page === 1 ? '/' : '/page/' + page + '/');
+    const list = parseCards(html, HOST);
+    return { page, pagecount: list.length ? page + 1 : page, list };
   }
   const z = ZONE_META.find((x) => x.id === zoneId);
   const list0 = z ? (ZONES[z.key] || []) : [];
@@ -831,16 +840,22 @@ async function detail(reqIn) {
       lines.push({ name: '丝瓜视频', url });
     }
   }
+  // 2026-11-08：预览片标注——站方对部分片只给 _preview.m3u8 播单（全站抽查 432 部：81 部是预览，均为 1 分片、0.9~16.7 秒，
+  // 多数约 10 秒；页内明写“预览已结束，下载 APP 可观看完整视频”，去掉 _preview 后缀取正片播单站方回 502，
+  // 全页无第二个播单地址可换）。故不改播放地址，只在详情里标明：集名改“预览”、备注标时长，免得用户当正片点开只看 10 秒。
+  // 无播单时（详情页站方 500、或“直播线常驻”占位页无 data-url）备注标“已失效”。
+  const isPreview = dataUrl.includes('_preview');
+  const epName = isPreview ? '预览' : '正片';
   const from = lines.length ? lines.map((l) => l.name).join('$$$') : '丝瓜视频';
   const url = lines.length
-    ? lines.map((l) => '正片$' + durl + '@@' + l.url).join('$$$')
+    ? lines.map((l) => epName + '$' + durl + '@@' + l.url).join('$$$')
     : '';
   return {
     list: [{
       vod_id: rawId,
       vod_name: mainTitle,
       vod_pic: posterPic,
-      vod_remarks: 'HD',
+      vod_remarks: !lines.length ? '已失效' : (isPreview ? '预览·约10秒' : 'HD'),
       vod_content: '丝瓜视频',
       vod_play_from: from,
       vod_play_url: url,
