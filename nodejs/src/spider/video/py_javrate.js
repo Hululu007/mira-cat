@@ -61,6 +61,15 @@ import req from '../../util/req.js';
 // v7：详情无 payload 且无 contentUrl 时凭番号调 apiHot 取 bare，出 1080p/720p/自适应三集
 // （payload 为空、只带 @@bare，mintBunny 主路只凭 bare）；mintBunny 直连失败时回落 Worker POST；
 // play() 懒解析集点播时同样先试 apiHot 再重取 HTML。
+// v8（2026-11-09，基于 v7 blob 007d74f8；CATS 与字幕芯一字未动）：
+// 用户 01:22 真机：v7 详情已能选分辨率，但点播仍“视频加载失败”。
+// 计时 bug：mintBunny 直连先行 2 次 × 8 秒会耗光 mintMaster 的 10 秒预算，Worker 回落
+// 根本跑不到；apiHot 直连先行同样在手机上挂 6 秒。改 Worker 先行（实测 1.3–1.4 秒）、
+// 直连只作回落；mintMaster 与 playInner 的铸 token 预算 10 秒放宽到 15 秒。
+// 注意：v8 只修计时，不解决 Bunny Stream 片（SSNI-229/RAS-067）的 404——那类片的裸地址
+// 在 b-cdn.net 上，bunnytoken 签名地址拉了 404；站方真链是 payload → /player/v2 →
+// POST /api/token/generate（需每会话轮换的 apiSecret，见 probe/），HTML 腿全死故暂无解。
+// videocdn.avking.xyz 的片（UMAN-017 等）bunnytoken 能通，v8 应能播。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const RELAY = 'https://javrate.li768435813.workers.dev';
@@ -994,15 +1003,15 @@ function jrCacheKey(payload, bare) {
 //   响应：{"code":200,"data":{"movies":[{id, code, m3U8Url, cloudPlayList:[{m3U8Url, guidId, isDefault}]}]}}；
 //   必须读 cloudPlayList[0].m3U8Url（UMAN-017 的 movie 级 m3U8Url 为空串，cloudPlayList 里才有值）；
 //   每部片只 1 条 cloudPlayList（isDefault=1），不分 1080p/720p——分档由铸 token 后的 master 清单解析。
-//   直连先行（6s），失败再走 Worker v2 的 POST /api/hot（Worker 实测能通 /api/，HTML 才被拦）。
+//   v8：Worker 先行（实测 1.3 秒回，稳定）；直连在手机上常挂住 6 秒，白白拖慢详情。
 //   用途：详情 HTML 腿死时（无 payload、无 contentUrl），凭番号直接拿 bare，走 mintBunny 主路。
 async function apiHotBare(keyword) {
   const kw = String(keyword || '').trim();
   if (!kw) return '';
   const q = encodeURIComponent(kw);
   const legs = [
-    { name: 'direct', url: HOST + '/api/hot?q=' + q, ms: 6000 },
     { name: 'worker', url: RELAY + '/api/hot?q=' + q, ms: 8000 },
+    { name: 'direct', url: HOST + '/api/hot?q=' + q, ms: 6000 },
   ];
   for (const leg of legs) {
     try {
@@ -1032,44 +1041,39 @@ async function apiHotBare(keyword) {
   return '';
 }
 
-// v6 新主路——POST /api/bunnytoken/generate 直连铸 token（api-probe 活体验通，
-// 直连 200/247B/0.27–1.8s，全链验通到首分片 0x47）：入参只有 {"m3u8Url": 裸清单地址}，
-// 无签名、无 Referer、无 Cookie；路径必须全小写。Worker POST 405、jina 会把 POST
-// 转 GET 也 405，故只走直连 req POST，8 秒超时、重试 1 次。
+// v8：铸 token 改 Worker 先行——Worker v2 的 POST /api/bunnytoken/generate 实测 1.4 秒
+// 出签名地址且稳定；直连在手机上常挂住（2 次 × 8 秒会耗光 mintMaster 的 10 秒预算，
+// Worker 回落根本跑不到，点播直接失败）。Worker 先行、直连只作回落。
 async function mintBunny(bareUrl) {
-  const url = HOST + '/api/bunnytoken/generate';
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await withTimeout(req({
-        method: 'POST', url,
-        data: JSON.stringify({ m3u8Url: bareUrl }),
-        headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        timeout: 8000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5,
-      }), 8000, null);
-      if (!r) continue;
-      let j = null;
-      const raw = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
-      try { j = JSON.parse(raw); } catch (e) { j = null; }
-      const signed = j && j.success && j.data && j.data.signedUrl;
-      if (signed) return String(signed);
-    } catch (e) { /* 重试一次 */ }
-  }
-  // v7：直连铸不出时走 Worker v2 的 POST /api/bunnytoken/generate（Worker 实测能通 /api/，
-  // 直连在手机上也可能被拦；Worker 未部署 v2 时这条回 400，mintMaster 再回落 /player/v2）。
+  const body = JSON.stringify({ m3u8Url: bareUrl });
+  const hdrs = { 'User-Agent': UA, 'Referer': HOST + '/', 'Content-Type': 'application/json', 'Accept': 'application/json' };
+  const parseSigned = (r) => {
+    if (!r) return '';
+    let j = null;
+    const raw = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
+    try { j = JSON.parse(raw); } catch (e) { j = null; }
+    const signed = j && j.success && j.data && j.data.signedUrl;
+    return signed ? String(signed) : '';
+  };
+  // ① Worker 先行（v2 已部署；未部署时回 400，继续直连）。
   try {
     const r = await withTimeout(req({
       method: 'POST', url: RELAY + '/api/bunnytoken/generate',
-      data: JSON.stringify({ m3u8Url: bareUrl }),
-      headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      data: body, headers: hdrs,
       timeout: 8000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5,
     }), 8000, null);
-    if (r) {
-      let j = null;
-      const raw = typeof r.data === 'string' ? r.data : (r.data ? JSON.stringify(r.data) : '');
-      try { j = JSON.parse(raw); } catch (e) { j = null; }
-      const signed = j && j.success && j.data && j.data.signedUrl;
-      if (signed) return String(signed);
-    }
+    const signed = parseSigned(r);
+    if (signed) return signed;
+  } catch (e) { /* 回落直连 */ }
+  // ② 直连回落（1 次，8 秒）。
+  try {
+    const r = await withTimeout(req({
+      method: 'POST', url: HOST + '/api/bunnytoken/generate',
+      data: body, headers: hdrs,
+      timeout: 8000, responseType: 'text', transformResponse: [(d) => d], validateStatus: () => true, maxRedirects: 5,
+    }), 8000, null);
+    const signed = parseSigned(r);
+    if (signed) return signed;
   } catch (e) { /* 回落 */ }
   return '';
 }
@@ -1098,7 +1102,7 @@ async function mintMaster(durl, payload, bare) {
   // v6：inflight 包 10 秒硬超时、超时去毒——超时结算后 finally 删表项，下一次调用
   // 重新发请求，不再共享死 promise（hang-audit §2.3/§5.4：一次挂住毒死同 payload
   // 全部后续播放，直到 App 重启）。
-  const p = withTimeout(pRaw.catch(() => null), 10000, null);
+  const p = withTimeout(pRaw.catch(() => null), 15000, null);
   mintInflight.set(cacheKey, p);
   try { return await p; } finally { mintInflight.delete(cacheKey); }
 }
@@ -1402,7 +1406,7 @@ async function playInner(reqIn) {
   try {
     // v6：mint 包 10s 硬上限（mintMaster 内另有 10s 去毒，见 §9）；主路 bunnytoken
     // 只需 bare，不依赖 HTML 腿；无 bare 时回落 /player/v2 老路。
-    const rec = await withTimeout(mintMaster(durl, payload, bare), 10000, null);
+    const rec = await withTimeout(mintMaster(durl, payload, bare), 15000, null);
     if (rec && rec.master) {
       variants = constructVariants(rec.master) || [];
       if (!variants.length) {
