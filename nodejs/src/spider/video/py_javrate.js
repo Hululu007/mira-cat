@@ -77,6 +77,11 @@ import req from '../../util/req.js';
 // /player/v2（走原生栈、能过站方验证），猫源 req（axios 沙箱）被指纹拦。修法：HTML 腿
 // （htmlOnly）加两条全局 fetch 通道（直连 + Worker），赌 App 的 fetch 走与 Widget.http
 // 相近的原生栈；App 内无 fetch 时不加、行为与 v9 一致。成败待真机（SSNI-229）。
+// v11（2026-11-09，基于 v10 blob 23f8b84b）：用户 03:31 报详情已出 1080p/720p/自适应三集、
+// 点播仍“视频加载失败”。根因不在详情（详情直接调 resolveSignedMaster，走 /player/v2 的
+// cloud-warm-N 真链，故三集正常），在 play：mintMaster 先走 mintBunny，bunnytoken API 对
+// 已迁移的 Bunny 片照常返回签名地址、实拉却 404，mintMaster 见非空即认、不回落 /player/v2。
+// 修法：b-cdn.net 签名地址实拉探活（200 + #EXTM3U 才认），死链回落 /player/v2。
 // videocdn.avking.xyz 的片（UMAN-017 等）bunnytoken 能通，v8 应能播。
 // v9（2026-11-09，基于 v8 blob 7400f47f；CATS 与字幕芯除 subExtractCode 外一字未动）：
 // 用户 02:19 真机：UMAN-017 能播（v8 生效）、SSNI-229 仍失败（Bunny 墙未解）；另报两问题：
@@ -1125,8 +1130,26 @@ async function mintMaster(durl, payload, bare) {
   const pRaw = (async () => {
     let master = '';
     // v6 主路：bunnytoken 直连 POST（只需裸清单地址，不依赖 payload/HTML 腿）。
-    if (bare) master = await mintBunny(bare);
-    // 回落：现行 /player/v2 HTML 老路（需 payload；无 bare 或 bunny 失败时）。
+    // v11 修（2026-11-09）：SSNI-229 详情出三集、点播却“视频加载失败”。根因：mintBunny
+    // 对 b-cdn.net 的签名地址只认 API 返回、不验实拉——Bunny 片已迁到 cloud-warm-N，
+    // API 照常返回签名地址、实拉 404；mintMaster 见 mintBunny 非空即认，不再回落
+    // /player/v2（详情直接调 resolveSignedMaster，故三集正常）。修法：b-cdn.net 签名地址
+    // 必须实拉探活（200 + #EXTM3U 才认），否则回落 /player/v2；videocdn 等非 b-cdn.net
+    // 地址照旧直接认（UMAN-017 靠此路）。
+    if (bare) {
+      const cand = await mintBunny(bare);
+      if (cand) {
+        if (cand.indexOf('b-cdn.net') >= 0) {
+          try {
+            const probe = await reqRaw(cand, { 'User-Agent': UA, 'Referer': durl || (HOST + '/') }, 5000);
+            if (probe.status === 200 && probe.body && probe.body.indexOf('#EXTM3U') >= 0) master = cand;
+          } catch (e) { /* 回落 /player/v2 */ }
+        } else {
+          master = cand;
+        }
+      }
+    }
+    // 回落：现行 /player/v2 HTML 老路（需 payload；无 bare 或 bunny 失败/死链时）。
     if (!master && payload) master = await resolveSignedMaster(durl, payload);
     if (!master) return hit || null;
     const q = (master.split('?')[1] || '');
