@@ -7,7 +7,27 @@ import req from '../../util/req.js';
 // 播放：单码率媒体播单（AES-128），不设假多档；字幕按条目接（仅标题含番号的条目才接芯，多数中文标题无番号则不接）
 // 2026-11-07 取页改走自家 site-fetch Worker 腿优先（用户手机网络到 siguaspw.cc 的 TLS 直接失败，
 //   Safari 打不开、蜘蛛直连拿不到内容；Worker v4 白名单已加 siguaspw.cc，用户已部署）。
-//   Worker 失败再回落直连；取页 Worker 只回文本，播放不经过它（播放走下面本地代理）。
+//   Worker 失败再回落直连；取页 Worker 只回文本。
+// 2026-11-08 14:08 用户真机：列表/分类/内容/封面全能加载，就是无法播放；
+//   同期 REX 丝瓜 1.0.5 正常（走 siguaspw-hls Worker）。
+//   2026-11-08 VM 复测同一片 /video/2044751266562465792/：站方没变——data-url、
+//   cdn_lines、播单 36432B/319 分片、KEY 16B（73646a336e78757577336b6f756b7673）、
+//   首分片 3,325,168B、Range 206，与 11-07 实测逐字节一致；分片宿主仍是
+//   d3s00p19cjdhyv.cloudfront.net；代码没变（main blob 仍是 5be1a5e6，线上
+//   dist 包内也是这版代理代码）。故断点不在站方、不在代码版本，而在 App 内
+//   本地代理这一腿：播单/分片须经 App 的 req 栈逐片拉取（VM 里 axios 到站方
+//   直接 ECONNRESET、只能用 fetch 垫片，App 内 req 行为与 VM 不同，无法复现），
+//   而 Worker 腿是 Cloudflare 服务端 fetch，实测播单 1.5-2.9s、分片 1.3-1.5s，
+//   比直连（播单 3.0-6.1s、分片 4.4-5.0s）更快，且 REX 侧已在用户手机上证实能播。
+//   修法（与 REX 1.0.5 / 猫源 javcc 同款）：detail/play 一律走 siguaspw-hls
+//   Worker（/m3u8 播单改写 + /seg 分片透传 + KEY 经 /m3u8 原样回传，AES 密文
+//   不改字节，支持 Range）；本地字节代理只留作 Worker 不通时的兜底（detail 取
+//   页时并发探活 Worker 根路径，探活失败才出 js2p 代理线；旧缓存的 js2p 代理
+//   地址与 CDN 直链仍由 play() 接住），不再两套并存互相打架。
+//   线路：cdn_lines 有三条——dfdf（播放线路01）、sxtmo（播放线路05）、d22
+//   备用线路01；d22 分片宿主 d2ln4qgmi83wfi.cloudfront.net 直连与经 Worker
+//   均拉不到分片（2026-11-08 实测 fetch failed），故只出 dfdf/sxtmo 两条可播线
+//   （有其他可播线时跳过 d22；若只剩 d22 则仍出它，不留空详情）。
 // 2026-11-07 21:33 用户真机：列表/分类/内容/封面都出，就是无法播放。VM 实测播放链全通——
 //   播单 200（319 分片）、KEY 200（16B）、首分片 200（3,325,168B，Range 206）；分片是 AES-128
 //   密文（播单 KEY+IV 解密后为纯 TS，17686/17687 同步命中），字节本身无问题；dfdf 与 sxtmo
@@ -19,6 +39,9 @@ import req from '../../util/req.js';
 const HOST = 'https://siguaspw.cc';
 const KEY = 'py_siguaspw';
 const SITE_FETCH = 'https://site-fetch.li768435813.workers.dev';
+const WORKER = 'https://siguaspw-hls.li768435813.workers.dev';
+// d22 备用线分片宿主已死（2026-11-08 直连与经 Worker 均拉不到分片）；有其他可播线时跳过它。
+const DEAD_LINE_HOSTS = ['d22m1nnedmviq9.cloudfront.net'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const ZONES = {"creator": [{"v": "cate4", "n": "精选Vlog"}, {"v": "cate5", "n": "SweetieYico-亦可姐姐"}, {"v": "cate6", "n": "Silky Suki 丝琪"}, {"v": "cate7", "n": "桃桃学姐（樱空桃桃）"}, {"v": "cate8", "n": "萌崽儿"}, {"v": "cate9", "n": "小水水"}, {"v": "cate10", "n": "Nicolove 妮可"}, {"v": "cate11", "n": "桥本香菜"}, {"v": "cate12", "n": "狐不妖"}, {"v": "cate13", "n": "辛尤里"}, {"v": "cate14", "n": "小欣奈"}, {"v": "cate15", "n": "饼干姐姐"}, {"v": "cate16", "n": "Nana_taipei"}, {"v": "cate17", "n": "玩偶姐姐"}, {"v": "cate18", "n": "苏小涵"}, {"v": "cate19", "n": "情深叉喔"}, {"v": "cate20", "n": "多亿"}, {"v": "cate21", "n": "御梦子"}, {"v": "cate22", "n": "退役御姐-林夕"}, {"v": "cate23", "n": "91兔兔"}, {"v": "cate24", "n": "Naomiii hub"}, {"v": "cate25", "n": "yuukoo"}, {"v": "cate26", "n": "Elle Lee"}, {"v": "cate27", "n": "Make性专家"}, {"v": "cate28", "n": "Yui"}, {"v": "cate29", "n": "小母狗优咪"}, {"v": "cate30", "n": "love姐"}, {"v": "cate31", "n": "苏畅"}, {"v": "cate32", "n": "小敏儿"}, {"v": "cate33", "n": "锅锅酱"}, {"v": "cate34", "n": "丝丝女神"}, {"v": "cate35", "n": "cola酱 唐可可"}, {"v": "cate36", "n": "鸡蛋饼"}, {"v": "cate37", "n": "黑椒盖饭"}, {"v": "cate38", "n": "泰国网黄obokozu"}, {"v": "cate39", "n": "Bigfan13yo"}, {"v": "cate40", "n": "Miss A"}, {"v": "cate41", "n": "日系少女地雷"}, {"v": "cate42", "n": "网红留学生-刘玥"}, {"v": "cate43", "n": "日本网黄-Yua"}, {"v": "cate44", "n": "谭晓彤"}, {"v": "cate45", "n": "长腿御姐Apple"}, {"v": "cate46", "n": "下面有根棒棒糖"}, {"v": "cate47", "n": "斯文禽兽"}, {"v": "cate48", "n": "小二先生"}, {"v": "cate49", "n": "唐伯虎"}, {"v": "cate50", "n": "小桃酱"}, {"v": "cate51", "n": "鸡教练"}, {"v": "cate52", "n": "粉色情人"}, {"v": "cate53", "n": "冉冉学姐"}, {"v": "cate54", "n": "二代CC"}, {"v": "cate55", "n": "捅主任"}, {"v": "cate56", "n": "台湾粉红兔"}, {"v": "cate57", "n": "涵菱"}, {"v": "cate58", "n": "荔枝"}, {"v": "cate59", "n": "京圈嫩模瑶瑶"}, {"v": "cate61", "n": "umate博主秀-原创中心"}, {"v": "cate62", "n": "爆款推荐-热播排行榜"}, {"v": "cate63", "n": "台妹-汐梦瑶"}, {"v": "cate64", "n": "懒懒猪儿-喜欢被抱、被操到哭"}, {"v": "cate65", "n": "诺诺-想成为你的专属宝贝!"}, {"v": "cate66", "n": "小巧芋艿taro"}, {"v": "cate67", "n": "阿朱"}, {"v": "cate68", "n": "糖心淑怡"}, {"v": "cate69", "n": "Couple love-原创"}, {"v": "cate70", "n": "羞羞兔"}, {"v": "cate71", "n": "草莓味的软糖呀"}, {"v": "cate72", "n": "台湾第一女优-吴梦梦"}, {"v": "cate73", "n": "小辣椒"}, {"v": "cate74", "n": "yuna"}, {"v": "cate75", "n": "鹤酱-鹤7"}, {"v": "cate76", "n": "Chloe"}, {"v": "cate77", "n": "爱丝袜的Vivian姐"}, {"v": "cate78", "n": "淫妻交换-绿帽老公"}, {"v": "cate79", "n": "艾希老师"}, {"v": "cate80", "n": "许木学长"}, {"v": "cate81", "n": "司雨"}, {"v": "cate82", "n": "蛇信子兔牙"}, {"v": "cate83", "n": "小阿俏"}, {"v": "cate84", "n": "橘子猫"}, {"v": "cate85", "n": "小余baby"}, {"v": "cate86", "n": "米胡桃"}, {"v": "cate87", "n": "国产D先生"}, {"v": "cate88", "n": "猫宝宝"}, {"v": "cate89", "n": "奶茶妹妹"}, {"v": "cate90", "n": "香菜公主"}, {"v": "cate91", "n": "甜心宝贝"}, {"v": "cate92", "n": "水冰月"}, {"v": "cate93", "n": "柚子猫"}, {"v": "cate94", "n": "小苏拉"}, {"v": "cate95", "n": "麻酥酥呦"}, {"v": "cate96", "n": "又又酱"}, {"v": "cate97", "n": "耀灵"}, {"v": "cate98", "n": "九尾狐狸又名-香草少女"}, {"v": "cate99", "n": "小巨"}, {"v": "cate100", "n": "小鸟酱"}, {"v": "cate101", "n": "八月未央"}, {"v": "cate102", "n": "来自喵星的岁酱"}, {"v": "cate103", "n": "果如cc"}, {"v": "cate105", "n": "海量片源-国产天花板-外网女菩萨"}, {"v": "cate106", "n": "反差婊-母狗界天花板"}, {"v": "cate107", "n": "精选萝莉，少女天花板"}, {"v": "cate108", "n": "私人定制-私拍流出"}, {"v": "cate109", "n": "原创短剧-剧情演绎"}, {"v": "cate110", "n": "安安老师-纯欲学姐"}, {"v": "cate111", "n": "米娜学姐"}, {"v": "cate112", "n": "酥酥"}, {"v": "cate113", "n": "91大神"}, {"v": "cate114", "n": "小晗wink"}, {"v": "cate115", "n": "骚御"}, {"v": "cate116", "n": "铃木君"}, {"v": "cate117", "n": "小恩"}, {"v": "cate118", "n": "芋圆"}, {"v": "cate119", "n": "樱狸子"}, {"v": "cate120", "n": "小爱神"}, {"v": "cate121", "n": "仙仙桃"}, {"v": "cate122", "n": "桃谷谷"}, {"v": "cate123", "n": "小晚酱"}, {"v": "cate124", "n": "骚萝baby"}, {"v": "cate125", "n": "软妹"}, {"v": "cate126", "n": "妮酱"}, {"v": "cate127", "n": "萌白酱"}, {"v": "cate128", "n": "可爱兔"}, {"v": "cate129", "n": "花菜"}, {"v": "cate130", "n": "白桃少女"}, {"v": "cate131", "n": "FC2"}, {"v": "cate132", "n": "小奶瓶"}, {"v": "cate134", "n": "嫩妹肏穴-粉嫩鲍鱼举着嫩妹操到射"}, {"v": "cate135", "n": "人妻-别人的老婆是最好的"}, {"v": "cate136", "n": "乱伦实录-伦理的流失 禁忌的快感"}, {"v": "cate137", "n": "网红集结地"}, {"v": "cate138", "n": "下海萝莉-生活不易萝莉卖艺"}, {"v": "cate139", "n": "台湾之光：跨界演出的女优们"}, {"v": "cate140", "n": "色播名场面"}, {"v": "cate141", "n": "探花档案-约炮大神实录"}, {"v": "cate142", "n": "情迷SM-意乱情迷SM调教"}, {"v": "cate143", "n": "吃瓜一线-网红明星的秘史"}, {"v": "cate144", "n": "下海主播-黄播的美女主播"}, {"v": "cate145", "n": "Cos女神堂-cosplay爱好聚集地"}, {"v": "cate146", "n": "台湾色情平台-SWag"}, {"v": "cate147", "n": "台湾嫩模-JVID"}], "tag": [{"v": "cate149", "n": "精选"}, {"v": "cate150", "n": "孕妇奶汁"}, {"v": "cate151", "n": "探花"}, {"v": "cate152", "n": "网红吃瓜"}, {"v": "cate153", "n": "出轨偷情"}, {"v": "cate154", "n": "自慰喷水"}, {"v": "cate155", "n": "成人综艺"}, {"v": "cate156", "n": "真爱男同"}, {"v": "cate157", "n": "明星换脸"}, {"v": "cate158", "n": "女女同性"}, {"v": "cate159", "n": "网红流出"}, {"v": "cate160", "n": "SM调教"}, {"v": "cate161", "n": "绿帽老公"}, {"v": "cate162", "n": "换妻淫趴"}, {"v": "cate163", "n": "户外露出"}, {"v": "cate164", "n": "大奶美乳"}, {"v": "cate165", "n": "媚黑母狗"}, {"v": "cate166", "n": "制服诱惑"}, {"v": "cate167", "n": "校园女神"}, {"v": "cate168", "n": "按摩会所"}, {"v": "cate169", "n": "直播"}, {"v": "cate170", "n": "勾引搭讪"}, {"v": "cate171", "n": "ASMR"}, {"v": "cate172", "n": "反差婊"}, {"v": "cate174", "n": "母子乱伦"}, {"v": "cate175", "n": "淫乱师生"}, {"v": "cate176", "n": "舅甥外侄"}, {"v": "cate177", "n": "女婿通奸"}, {"v": "cate178", "n": "公公儿媳"}, {"v": "cate179", "n": "淫乱兄妹"}, {"v": "cate180", "n": "家庭乱伦"}, {"v": "cate181", "n": "淫乱姐弟"}], "media": [{"v": "cate183", "n": "麻豆传媒"}, {"v": "cate184", "n": "爱豆传媒"}, {"v": "cate185", "n": "91制片厂"}, {"v": "cate186", "n": "皇家华人"}, {"v": "cate187", "n": "SA国际传媒"}, {"v": "cate188", "n": "蜜桃传媒"}, {"v": "cate189", "n": "天美传媒"}, {"v": "cate190", "n": "兔子先生"}, {"v": "cate191", "n": "果冻传媒"}, {"v": "cate192", "n": "乌托邦"}, {"v": "cate193", "n": "性视界"}, {"v": "cate194", "n": "星空传媒"}, {"v": "cate195", "n": "精东传媒"}, {"v": "cate196", "n": "香蕉视频"}], "more": [{"v": "cate198", "n": "全部"}, {"v": "cate199", "n": "家庭乱伦"}, {"v": "cate200", "n": "中文字幕"}, {"v": "cate201", "n": "波多野结衣"}, {"v": "cate202", "n": "河北彩花"}, {"v": "cate203", "n": "橘玛丽"}, {"v": "cate204", "n": "森泽佳奈"}, {"v": "cate205", "n": "无码破解"}, {"v": "cate206", "n": "JULIA"}, {"v": "cate207", "n": "希崎洁西卡"}, {"v": "cate208", "n": "七森莉莉"}, {"v": "cate209", "n": "三上悠亚"}, {"v": "cate210", "n": "桥本有菜"}, {"v": "cate211", "n": "松下纱荣子"}, {"v": "cate212", "n": "水果派解说"}, {"v": "cate214", "n": "全部"}, {"v": "cate215", "n": "Blacked RAW 黑人巨屌干超模"}, {"v": "cate216", "n": "DEEPER 激情性爱高清视频"}, {"v": "cate217", "n": "MILFY 独家4K 熟女超模 高清影片"}, {"v": "cate218", "n": "SLAYED 超模女同色情影片"}, {"v": "cate219", "n": "tushy 独家超模 高清肛交影片"}, {"v": "cate220", "n": "VIXEN 淫乱超模 群交 4K高清"}, {"v": "cate221", "n": "捷克搭讪 金钱的力量"}, {"v": "cate222", "n": "福利姬"}, {"v": "cate223", "n": "经典三级"}, {"v": "cate226", "n": "摄像破解"}, {"v": "cate227", "n": "裙底偷拍"}, {"v": "cate228", "n": "精品厕拍"}, {"v": "cate229", "n": "痴汉偷拍"}, {"v": "cate230", "n": "群交乱斗"}, {"v": "cate231", "n": "澡堂浴池"}, {"v": "cate232", "n": "街射涂鸦"}, {"v": "cate233", "n": "医院偷拍"}, {"v": "cate234", "n": "捷克幻想"}, {"v": "cate235", "n": "国产扫街"}, {"v": "cate237", "n": "1G老湿"}, {"v": "cate238", "n": "思春社"}, {"v": "cate239", "n": "王竹子"}, {"v": "cate240", "n": "独行者"}, {"v": "cate241", "n": "小哥哥艾理"}, {"v": "cate242", "n": "其它"}]};
 
@@ -165,6 +188,35 @@ function extractDataUrl(html) {
   const m = String(html || '').match(/data-url=["']([^"']+)["']/i);
   if (!m) return '';
   return m[1].trim().replace(/\\u002F/g, '/').replace(/\\\//g, '/').replace(/&amp;/g, '&');
+}
+
+// ---------------- 播放主路：siguaspw-hls Worker（2026-11-08，与 REX 1.0.5 同款） ----------------
+// Worker 路由（见 worker_siguaspw_hls.js）：/m3u8?u=<b64url 播单>&r=<b64url referer>
+// 播单改写（KEY URI 与分片行全部指回 Worker），/seg/<b64>/<b64>.ts 分片原样透传
+// （AES 密文不改字节、不剥头，支持 Range），KEY 经 /m3u8 原样回传 16B。
+// 2026-11-08 实测：根回 'siguaspw-hls ok'；dfdf/sxtmo 两线 /m3u8 均 200、319 分片、
+// KEY 200（与源 KEY 字节一致）、首分片 200（3,325,168B，video/mp2t）、Range 206。
+function workerUrl(playUrl) {
+  return WORKER + '/m3u8?u=' + b64url(playUrl) + '&r=' + b64url(HOST + '/');
+}
+
+// 探活 Worker 根路径（5s）：detail() 取页时并发跑，不占串行耗时；失败即 false。
+async function workerAlive() {
+  try {
+    const r = await req.get(WORKER + '/', { timeout: 5000 });
+    return r.status === 200;
+  } catch (e) { return false; }
+}
+
+// 线路短名：dfdf.tjacq.com -> dfdf；*.sxtmo.com -> sxtmo；其余用站方 cdnName 或 host 首段。
+function lineNameFor(base, cdnName) {
+  let host = '';
+  try { host = new URL(base).host.toLowerCase(); } catch (e) { host = ''; }
+  if (host.includes('sxtmo')) return 'sxtmo';
+  if (host.startsWith('dfdf.') || host.includes('tjacq')) return 'dfdf';
+  const nm = String(cdnName || '').trim();
+  if (nm) return nm;
+  return host ? host.split('.')[0] : '丝瓜视频';
 }
 
 // ---------------- 播单/分片本地代理（2026-11-07：修手机播不了；仿 24JAV/蘑菇 v2 形态） ----------------
@@ -718,7 +770,10 @@ async function detail(reqIn) {
   const rawId = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (!rawId) return { list: [] };
   const durl = rawId.startsWith('http') ? rawId : HOST + rawId;
+  // Worker 探活与取页并发跑：探活慢不拖详情（getHtml 本身约 1-4s）。
+  const aliveP = workerAlive();
   const html = await getHtml(rawId);
+  const workerOk = await aliveP.catch(() => false);
   const tM = html.match(/<title>(.*?)<\/title>/i);
   let mainTitle = '精彩视频';
   if (tM) mainTitle = cleanLabel(tM[1]).replace(/\s*-\s*丝瓜视频\s*$/i, '').trim() || '精彩视频';
@@ -730,20 +785,56 @@ async function detail(reqIn) {
     const cm = html.match(/https:\/\/[^\s"'<>]+\/image\/[^\s"'<>]+/);
     if (cm) posterPic = cm[0];
   }
-  let playUrl = '';
+  // 2026-11-08：按 cdn_lines 出 dfdf/sxtmo 两条可选线（vod_play_from 以 $$$ 分组、
+  // 组内集以 # 连接，每集带可播 videoUrl，点哪条播哪条）；解不出的线不整条消失——
+  // 下面 lines 只要拼出播单地址就留名，播单地址拼不出的线才不进表（并在报告里记一笔）。
+  // 主路 Worker（已在用户手机上证实能播）；Worker 探活失败才回落本地 js2p 代理线。
   const dataUrl = extractDataUrl(html);
+  const lines = [];
   if (dataUrl) {
     const bases = parseCdnLines(html);
+    for (const it of bases) {
+      // parseCdnLines 回的是字符串数组（旧口径）；同时兼容对象形 {cdnLine, cdnName}。
+      const raw = (typeof it === 'string') ? it : (it && it.cdnLine) || '';
+      const cdnName = (it && it.cdnName) || '';
+      const base = String(raw || '').replace(/\/+$/, '').replace(/^(https?:)\/([^\/])/, '$1//$2');
+      if (!base.startsWith('http')) continue;
+      let playUrl = '';
+      if (dataUrl.startsWith('http')) playUrl = dataUrl;
+      else playUrl = base + (dataUrl.startsWith('/') ? dataUrl : '/' + dataUrl);
+      if (!playUrl) continue;
+      const name = lineNameFor(base, cdnName);
+      const url = workerOk
+        ? workerUrl(playUrl)
+        : (proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl) || workerUrl(playUrl));
+      let baseHost = '';
+      try { baseHost = new URL(base).host.toLowerCase(); } catch (e) { baseHost = ''; }
+      lines.push({ name, url, _baseHost: baseHost });
+    }
+    // d22 备用线分片宿主已死（2026-11-08 直连与经 Worker 均拉不到分片）：有其他
+    // 可播线时跳过它；若过滤后为空（只剩 d22）则保留全部，不留空详情。
+    const kept = lines.filter((l) => !DEAD_LINE_HOSTS.includes(l._baseHost || ''));
+    if (kept.length) { lines.length = 0; lines.push(...kept); }
+    for (const l of lines) delete l._baseHost;
+  }
+  // 兜底：cdn_lines 解析失败但 data-url 还在时，走旧单线（站方默认首条），不断详情。
+  if (!lines.length && dataUrl) {
+    const bases = parseCdnLines(html);
     const base = pickPlayBase(bases);
+    let playUrl = '';
     if (dataUrl.startsWith('http')) playUrl = dataUrl;
     else if (base) playUrl = base.replace(/\/+$/, '') + (dataUrl.startsWith('/') ? dataUrl : '/' + dataUrl);
-    // 2026-11-07：播放走本地代理（手机到分片域 d3s00p19 cloudfront 未验证、疑似不通），
-    // 播单/KEY/分片全部经代理，手机只与 App 自家服务通信；代理失败时播单内仍可 302 回源。
     if (playUrl) {
-      const proxied = proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl);
-      if (proxied) playUrl = proxied;
+      const url = workerOk
+        ? workerUrl(playUrl)
+        : (proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl) || workerUrl(playUrl));
+      lines.push({ name: '丝瓜视频', url });
     }
   }
+  const from = lines.length ? lines.map((l) => l.name).join('$$$') : '丝瓜视频';
+  const url = lines.length
+    ? lines.map((l) => '正片$' + durl + '@@' + l.url).join('$$$')
+    : '';
   return {
     list: [{
       vod_id: rawId,
@@ -751,8 +842,8 @@ async function detail(reqIn) {
       vod_pic: posterPic,
       vod_remarks: 'HD',
       vod_content: '丝瓜视频',
-      vod_play_from: '丝瓜视频',
-      vod_play_url: playUrl ? ('正片$' + durl + '@@' + playUrl) : '',
+      vod_play_from: from,
+      vod_play_url: url,
     }],
   };
 }
@@ -767,10 +858,18 @@ async function play(reqIn) {
   const at = id.indexOf('@@');
   if (at >= 0) { durl = id.slice(0, at); target = id.slice(at + 2); }
   if (!target) return { parse: 0, url: '' };
-  // 旧缓存的详情可能仍带 CDN 直链：统一包一层本地代理再出（已是代理地址的不重复包）。
-  if (target.indexOf('/proxy/') < 0 && /^https?:\/\//.test(target)) {
-    const proxied = proxyUrl(reqIn, '/proxy/m3u8', target, durl || HOST + '/');
-    if (proxied) target = proxied;
+  // 2026-11-08：按地址形态分发，单路出线、不两套并存——
+  // Worker 地址（新详情）与 js2p 本地代理地址（旧缓存）原样直出，不重复包；
+  // 旧缓存的 CDN 直链：探活 Worker（5s），活着包 Worker /m3u8，死了才包本地代理。
+  if (target.indexOf('/proxy/') >= 0 || target.indexOf(WORKER + '/') === 0) {
+    // 原样直出
+  } else if (/^https?:\/\//.test(target)) {
+    const ok = await workerAlive();
+    if (ok) target = workerUrl(target);
+    else {
+      const proxied = proxyUrl(reqIn, '/proxy/m3u8', target, durl || HOST + '/');
+      if (proxied) target = proxied;
+    }
   }
   // 字幕按条目接：仅当标题或地址含番号才搜，否则不带 subs 键
   const title = subNameCache.get(durl) || '';

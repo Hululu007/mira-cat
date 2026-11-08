@@ -43,6 +43,23 @@ import req from '../../util/req.js';
 //   8 秒回落、内容校验（>2000 字节且无挑战页才算真 HTML）；取页全失败时 category/
 //   search/home 带 msg 回空列表（av123 同款先例），失败不再伪装成真空。
 //   播放代理 v2（/proxy/* 全程字节代理）本轮一字不动——列表不走它，已证伪无关。
+// 2026-11-08 第四轮（猫源仍播不了，REX 1.0.5 正常）：用户 14:08 真机——猫源蘑菇
+//   列表/分类/内容/封面全通，唯独播放不行；同包 REX lai_mogu 1.0.5 正常（走已部署
+//   mogu-hls Worker）。VM 逐级对照同一片（XV072-桃喵喵）坐实站方没变：dfdf/sxtmo
+//   两播单均 200、201 分片仍走 d3s00p19cjdhyv.cloudfront.net、密钥仍 16 字节
+//   sdj3nxuuw3koukvs、AES 解密 0x47 同步 11359/11359；mogu-hls Worker /m3u8 全链
+//   通（改写后 0 处上游域、201 分片全指 /seg/、密钥 16B、首分片 Range 206、整片
+//   200、解密 11359/11359）。断点在猫源唯一的播放腿：play() 把播单包进本地
+//   /proxy/m3u8，代理取数走蜘蛛 req.get（axios）到 dfdf——v2 的 7/7 全通只在
+//   fetch 垫片 harness 里验过，从未经真机确认；v2 上线当晚只确认了列表稳，没确认
+//   过播放。REX 同款 Worker 地址在用户手机上已证能播，本地代理腿从未证过。
+//   修法（照 sextb v10 / javcc 猫源先例，播单直接走 Worker）：detail() 出三条可选线
+//   （Worker / 直连 / 本地代理），vod_play_from 以 $$$ 分组、组内集以 # 连接；
+//   play() 只原样返回 detail 定好的地址，不再统一包一层本地代理（旧版连 Worker
+//   地址也包进去，等于 Worker 白走、仍死在 req.get 到 dfdf 这一腿）；本地代理实现
+//   （rewriteM3u8/m3u8Proxy/fetchBytes）一字不动，只留作“本地代理”线兜底。
+//   sxtmo 播单已探通（与 dfdf 同字节、同 201 分片、同 cloudfront 分片宿主），但与
+//   dfdf 只差播单宿主、分片腿完全相同，未单独立线，保持与 REX 1.0.5 双线同构。
 // 分类：7 大区作顶级分类，各区细分走筛选卡片 filters.sub；6 个分组父类
 //   （cate13/22/36/47/55/59）站方本身无内容，不列为细分，默认取各组首个有内容的子类。
 // 列表：<a href="/video/\d+/"> 卡片，封面 data-src 走 dfdf.tjacq.com（实测 200）
@@ -83,6 +100,12 @@ function b64url(s) {
 }
 function viaWorker(url) {
   return FETCH_WORKER.replace(/\/+$/, '') + '/f/' + b64url(url);
+}
+// 播放 Worker（2026-11-07 用户已部署：https://mogu-hls.li768435813.workers.dev，根回 mogu-hls ok；
+// 播单改写 + 分片字节透传，REX 1.0.5 正片线同款地址形态；本轮起猫源播单主线改走它）。
+const HLS_WORKER = 'https://mogu-hls.li768435813.workers.dev';
+function workerUrl(master) {
+  return HLS_WORKER + '/m3u8?u=' + b64url(master) + '&r=' + b64url(HOST + '/');
 }
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 
@@ -913,6 +936,16 @@ async function detail(reqIn) {
     const selfCard = parseCards(html, HOST).find((c) => c.id === rawId);
     if (selfCard && selfCard.vod_pic) posterPic = selfCard.vod_pic;
   }
+  // 三条可选线（站方每片只给一条单码率播单，三线是同一播单的三条送达腿，不编造多档）：
+  // Worker——播单走 mogu-hls Worker 改写 + 分片透传（REX 1.0.5 正片线同款，用户真机已证能播）；
+  // 直连——dfdf 播单直出（REX 1.0.5 直连集同款）；本地代理——蜘蛛 /proxy/* 全程字节代理（v2 原样保留作兜底）。
+  const playLines = [];
+  if (playUrl) {
+    playLines.push({ group: 'Worker', name: '正片', url: workerUrl(playUrl) });
+    playLines.push({ group: '直连', name: '正片', url: playUrl });
+    const proxied = proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl);
+    if (proxied) playLines.push({ group: '本地代理', name: '正片', url: proxied });
+  }
   return {
     list: [{
       vod_id: rawId,
@@ -920,8 +953,8 @@ async function detail(reqIn) {
       vod_pic: posterPic,
       vod_remarks: 'HD超清',
       vod_content: '蘑菇视频',
-      vod_play_from: '蘑菇视频',
-      vod_play_url: playUrl ? ('正片$' + durl + '@@' + playUrl) : '',
+      vod_play_from: playLines.length ? playLines.map((l) => l.group).join('$$$') : '蘑菇视频',
+      vod_play_url: playLines.length ? playLines.map((l) => l.name + '$' + durl + '@@' + l.url).join('$$$') : '',
     }],
   };
 }
@@ -938,10 +971,12 @@ async function play(reqIn) {
   if (at >= 0) { durl = id.slice(0, at); target = id.slice(at + 2); }
   if (!target) return { parse: 0, url: '' };
   const subsP = durl ? subSearchAll(durl).catch(() => []) : Promise.resolve([]);
-  // 播单走本地代理改写（分片改指 dfdf，见文件头 2026-11-07 返工注）；代理地址
-  // 取不到时回落原直链，不比旧行为更差
-  const proxied = proxyUrl(reqIn, '/proxy/m3u8', target, durl);
-  const result = { parse: 0, url: proxied || target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+  // 2026-11-08：播单地址由 detail() 按线路定好（Worker/直连/本地代理），play() 只原样
+  // 返回，不再统一包一层本地代理——旧版把 Worker 地址也包进 /proxy/m3u8，等于 Worker
+  // 白走、仍死在代理取数（req.get 到 dfdf）这一腿。本地代理只走“本地代理”线那一集
+  // （detail 里已包好地址），其余两线直出。旧格式集（正片$<durl>@@<裸播单>，缓存详情）
+  // 同样原样返回，即直连线行为，不比旧行为更差。
+  const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
   const subs = await subsP;
   if (subs && subs.length) result.subs = subs; // 无字幕命中时不带此键，返回与接入前逐字段一致
   return result;
