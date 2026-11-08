@@ -804,10 +804,12 @@ async function detailHtml(html, rawId, durl) {
   const code = extractLd(html, 'value');
   const payload = extractPayload(html);
   // 播单不在详情时固化：play() 凭 payload 现取 player v2（token 仅 30 秒有效，详情时取必过期，
-  // 故详情只存 payload，不存签名 URL）；有 payload 出 1080p/720p 双集（play() 内现铸现包代理），
+  // 故详情只存 payload，不存签名 URL）；有 payload 出 1080p/720p/自适应三集（play() 内现铸现包代理），
   // 无 payload 只留一集懒解析（play() 内重取详情 HTML 提 payload，提不到回诊断、不转圈）。
+  // v4：再加一条“自适应”线（master 本身走代理出线，代理改写 master 的 variant 行，
+  // 播放器按带宽自选档位；三条线都是真实存在的地址，不编造）。
   const playUrl = payload
-    ? ('1080p$' + durl + '@@' + payload + '@@1080p#720p$' + durl + '@@' + payload + '@@720p')
+    ? ('1080p$' + durl + '@@' + payload + '@@1080p#720p$' + durl + '@@' + payload + '@@720p#自适应$' + durl + '@@' + payload + '@@auto')
     : ('正片$' + durl);
   return {
     list: [{
@@ -829,6 +831,8 @@ async function detailHtml(html, rawId, durl) {
 // #EXT-X-KEY 0 条）。App 播放器不透传 token，详情给的直链 30 秒后必死。
 // 解法：play() 只出本地代理地址；代理按 payload 现铸现贴 token（缓存 25 秒，过期前重铸），
 // 清单改写（分片行指回代理）、分片字节透传（支持 Range，便于拖动）。
+// v4（2026-11-08）：play() 的 variants 改走本地代理地址（v3 是无 token 裸 CDN，双双 403）；
+// 分片取失败先强制重铸重试、仍失败回 502，不再 302 到无 token 裸地址；详情加“自适应”线。
 // 地址形态与 24jav 同款：播放地址查询串 /proxy/m3u8?u=&r=&p=；改写后的分片行用请求 Host
 // 拼完整 http:// 绝对地址、路径段形式 + .ts 后缀（过 ffmpeg 分片后缀白名单）。
 function unb64url(s) {
@@ -928,6 +932,10 @@ function rewriteJrM3u8(raw, playlistUrl, selfBase, referer, payload) {
 // 有 payload 时现铸现贴 token（缓存 25 秒）；无 payload 时按原地址直取（兼容旧地址）。
 async function jrProxy(request, reply) {
   const q = request?.query || {};
+  // v4：分片一级（/proxy/* 路径段形，无查询串 u）与播单一级（/proxy/m3u8?u=…）分开处理。
+  // 分片行 u 是去查询串的 bare 地址，302 回它必 403，故分片失败不再 302，改走强制重铸重试 + 502 快败；
+  // 播单一级的 u 本身带 token，302 尚有意义，保持原样。
+  const isSegment = !q.u;
   let uEnc = q.u || '';
   let rEnc = q.r || '';
   let pEnc = q.p || '';
@@ -968,8 +976,21 @@ async function jrProxy(request, reply) {
     } catch (e) { /* 退回原地址 */ }
   }
   try {
-    const buf = await fetchBytes(fetchUrl, referer);
-    if (!buf || !buf.length) { reply.redirect(target); return; }
+    let buf = await fetchBytes(fetchUrl, referer);
+    if ((!buf || !buf.length) && isSegment && payload) {
+      // v4 分片取失败：先强制重铸一次（绕过 tokenCache）再试一次——旧 token 可能刚过期，
+      // 缓存复用窗口（exp-5）未必覆盖本次失败；仍失败再 502 快败，不 302 到无 token 裸地址。
+      try {
+        tokenCache.delete(payload);
+        const tk2 = await mintFreshToken(referer, payload);
+        if (tk2) fetchUrl = withToken(target, tk2);
+        buf = await fetchBytes(fetchUrl, referer);
+      } catch (e) { /* 重铸失败即走下面的 502 */ }
+    }
+    if (!buf || !buf.length) {
+      if (isSegment) { reply.code(502).send('JavRate segment fetch failed'); return; }
+      reply.redirect(target); return;
+    }
     const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
     if (head.trimStart().startsWith('#EXTM3U')) {
       reply.header('Content-Type', 'application/vnd.apple.mpegurl');
@@ -994,6 +1015,7 @@ async function jrProxy(request, reply) {
     }
     reply.send(buf);
   } catch (e) {
+    if (isSegment) { try { reply.code(502).send('JavRate segment fetch failed'); } catch (e2) { /* 已发送则忽略 */ } return; }
     try { reply.redirect(target); } catch (e2) { /* 已发送则忽略 */ }
   }
 }
@@ -1049,10 +1071,16 @@ async function play(reqIn) {
   else if (id.startsWith('http') || id.startsWith('/')) { durl = id; payload = ''; }
   // 裸详情地址（懒解析集）即 durl 本身，payload 为空、走下面的重取；v2 从未收到裸地址，
   // 沿用“无 @@ 即 payload 本身”的旧解析会把整条 durl 当 payload、铸 master 必然失败。
-  // 集名里带档位：1080p$durl@@payload@@1080p / 720p$durl@@payload@@720p。
+  // 集名里带档位：1080p$durl@@payload@@1080p / 720p$durl@@payload@@720p / 自适应$durl@@payload@@auto。
   let wantHeight = 1080;
+  let wantAdaptive = false;
   const at2 = payload.indexOf('@@');
-  if (at2 >= 0) { if (payload.slice(at2 + 2) === '720p') wantHeight = 720; payload = payload.slice(0, at2); }
+  if (at2 >= 0) {
+    const suffix = payload.slice(at2 + 2);
+    if (suffix === '720p') wantHeight = 720;
+    else if (suffix === 'auto') wantAdaptive = true;
+    payload = payload.slice(0, at2);
+  }
   if (!payload && durl) {
     // 懒解析集：详情走 jina 时无 payload，play 时重取详情 HTML（只走 HTML 腿）再提一次。
     try {
@@ -1079,14 +1107,39 @@ async function play(reqIn) {
           variants = parseMasterVariants(mr.body, rec.master);
         }
       } catch (e) { /* 分档失败不致命，回自适应 master */ }
-      const want = variants.find((v) => v.height === wantHeight)
-        || variants.find((v) => v.height === 1080)
-        || variants.find((v) => v.height === 720);
-      let signedVariant = want ? want.url : rec.master;
-      // parseMasterVariants 解析相对 URI 时会丢查询串（RFC 3986）：变体地址若无 token，补上 master 的查询串。
-      if (signedVariant.indexOf('?') < 0 && rec.q) signedVariant += '?' + rec.q;
+      // v4 自适应集：直接取 master 走代理（master 本身带 token；代理改写其 variant 行，
+      // 播放器按带宽自选档位），不拆档。
+      let signedVariant;
+      if (wantAdaptive) {
+        signedVariant = rec.master;
+      } else {
+        const want = variants.find((v) => v.height === wantHeight)
+          || variants.find((v) => v.height === 1080)
+          || variants.find((v) => v.height === 720);
+        signedVariant = want ? want.url : rec.master;
+        // parseMasterVariants 解析相对 URI 时会丢查询串（RFC 3986）：变体地址若无 token，补上 master 的查询串。
+        if (signedVariant.indexOf('?') < 0 && rec.q) signedVariant += '?' + rec.q;
+      }
       const proxied = proxyUrl(reqIn, '/proxy/m3u8', signedVariant, durl || (HOST + '/'), payload);
       if (proxied) target = proxied;
+      // v4 修 variants：v3 返回的是 parseMasterVariants 解析出的无 token 裸 CDN 地址
+      // （相对 URI 丢查询串、又没补 rec.q），直接取双双 403，且是全仓唯一把 variants
+      // 放进 play() 返回的源。改成每档走蜘蛛本地代理地址（与主 url 同款、带 payload），
+      // 1080p 在前；App 若消费它拿到的是可播地址，若忽略它也无害。绝不返回无 token 的原始 CDN 地址。
+      if (variants.length) {
+        const proxiedVariants = variants
+          .slice()
+          .sort((a, b) => (b.height || 0) - (a.height || 0))
+          .map((v) => {
+            let sv = v.url;
+            if (sv.indexOf('?') < 0 && rec.q) sv += '?' + rec.q;
+            const pu = proxyUrl(reqIn, '/proxy/m3u8', sv, durl || (HOST + '/'), payload);
+            return pu ? { height: v.height, label: v.label, url: pu } : null;
+          })
+          .filter(Boolean);
+        if (proxiedVariants.length) variants = proxiedVariants;
+        else variants = [];
+      }
     }
   } catch (e) { target = ''; }
   const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
