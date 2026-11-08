@@ -243,8 +243,29 @@ async function detail(reqIn) {
   }
   const LINE_ORDER = { VOE: 0, EVS: 10, LUC: 20, VAS: 30, FST: 35, ST: 40, TV: 90 };
   pairs.sort((a, b) => (LINE_ORDER[a[0].toUpperCase()] ?? 50) - (LINE_ORDER[b[0].toUpperCase()] ?? 50));
+  // 分辨率探针（2026-11-09）：各线路并行走一遍 lk→嵌入页→主清单，≥2 档时该线
+  // 按档出集（集名取高度，地址只编码档位标识，点播时 play() 重新现解再按标识
+  // 选档——签名有时效，不把详情期地址写死）；探针失败/单档/15s 超时一律回落
+  // 原单集，不阻塞详情。
+  const probeOut = new Array(pairs.length).fill(null);
+  await Promise.race([
+    Promise.all(pairs.map(async ([nm, ep], i) => {
+      const idPart = String(ep.split('$').pop() || '');
+      const hex = idPart.split('|')[1] || '';
+      if (!hex) return;
+      const vs = await probeLineVariants(hex, durl).catch(() => null);
+      if (vs && vs.length >= 2) probeOut[i] = vs;
+    })),
+    new Promise((r) => setTimeout(r, 15000)),
+  ]);
   const froms = pairs.map(p => p[0]);
-  const urls = pairs.map(p => p[1]);
+  const urls = pairs.map((p, i) => {
+    const vs = probeOut[i];
+    if (!vs) return p[1];
+    const idPart = String(p[1].split('$').pop() || '');
+    const [vidPart, hex] = idPart.split('|');
+    return vs.map(v => `${v.h}p$${vidPart}|${hex}|${v.h}`).join('#');
+  });
 
   let content = title;
   if (tags.length) content += '\n标签: ' + tags.slice(0, 10).join(', ');
@@ -380,15 +401,20 @@ function extractStream(text) {
   return '';
 }
 
-// 主清单多档时挑最高档（RESOLUTION 优先，其次 BANDWIDTH）
-async function pickTopVariant(url, headers) {
-  if (!/\.m3u8(\?|$)/i.test(url)) return url;
+// 主清单多档解析（2026-11-09 分辨率选择）：拉一次清单，返回
+// { ok, isMaster, top, variants }；variants 只保留带 RESOLUTION 高度的
+// 档（同高度留最大 BANDWIDTH，按高度降序），top 为最高档地址；
+// 非主清单/拉取失败时 top 为原地址、variants 为空（调用方回落原行为）。
+async function fetchVariants(url, headers, timeoutMs = 20000) {
+  const res = { ok: false, isMaster: false, top: url, variants: [] };
   try {
-    const r = await httpRaw(url, { headers, timeout: 20000 });
+    const r = await httpRaw(url, { headers, timeout: timeoutMs });
     const text = String(r.data || '');
-    if (!text.includes('#EXT-X-STREAM-INF')) return url;
+    if (r.status !== 200 || !text.includes('#EXTM3U')) return res;
+    res.ok = true;
+    if (!text.includes('#EXT-X-STREAM-INF')) return res;
     const lines = text.split(/\r?\n/);
-    let best = null;
+    const list = [];
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i].trim();
       if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
@@ -399,14 +425,25 @@ async function pickTopVariant(url, headers) {
       if (!uri) continue;
       const rm = line.match(/RESOLUTION=(\d+)x(\d+)/i);
       const bm = line.match(/BANDWIDTH=(\d+)/i);
-      const cand = { uri, h: rm ? parseInt(rm[2], 10) : 0, bw: bm ? parseInt(bm[1], 10) : 0 };
-      if (!best || cand.h > best.h || (cand.h === best.h && cand.bw > best.bw)) best = cand;
+      const h = rm ? parseInt(rm[2], 10) : 0;
+      if (!h) continue;
+      let abs = '';
+      if (/^https?:\/\//i.test(uri)) abs = uri;
+      else {
+        try { abs = new URL(uri, url).toString(); } catch (e) { continue; }
+      }
+      list.push({ h, bw: bm ? parseInt(bm[1], 10) : 0, url: abs });
     }
-    if (!best) return url;
-    if (/^https?:\/\//i.test(best.uri)) return best.uri;
-    return url.slice(0, url.lastIndexOf('/') + 1) + best.uri.replace(/^\.\//, '');
+    const byH = new Map();
+    for (const v of list) {
+      const cur = byH.get(v.h);
+      if (!cur || v.bw > cur.bw) byH.set(v.h, v);
+    }
+    res.variants = [...byH.values()].sort((a, b) => b.h - a.h || b.bw - a.bw);
+    if (res.variants.length) { res.isMaster = true; res.top = res.variants[0].url; }
+    return res;
   } catch (e) {
-    return url;
+    return res;
   }
 }
 
@@ -496,12 +533,7 @@ function hlsFromUnpacked(text) {
   return found.map(f => f.url);
 }
 
-// 验一份清单地址真能出 #EXTM3U
-async function verifyPlaylist(url, headers) {
-  const r = await httpRaw(url, { headers, timeout: 20000 });
-  const text = String(r.data || '');
-  return r.status === 200 && text.includes('#EXTM3U') ? text : '';
-}
+
 
 // ---------- Streamtape: 求值 innerHTML 拼接表达式提 get_video 候选 ----------
 function evalConcatExpr(expr) {
@@ -675,13 +707,16 @@ async function resolveVasApi(embedUrl, embedHtml) {
 }
 
 // ---------- 嵌入页解析分派 ----------
-// 成功回 { url, header }（直链）；ST 令牌服务端试活不过时回
+// 成功回 { url, header, variants }（直链；variants 为主清单档位表，无档
+// 时为空数组）；ST 令牌服务端试活不过时回
 // { sniff: embedUrl }（让播放器在自身会话里打开嵌入页）；全败回 null。
-async function resolveEmbed(embedUrl, embedBody, detailUrl) {
+// opts.fast（详情期探针）：跳过 VAS API 与 ST 试活、缩短各步超时。
+async function resolveEmbed(embedUrl, embedBody, detailUrl, opts = {}) {
+  const fast = !!opts.fast;
   let html = embedBody || '';
   let finalUrl = embedUrl;
   if (!html) {
-    const r = await httpRaw(embedUrl, { headers: { Referer: detailUrl }, timeout: 25000 });
+    const r = await httpRaw(embedUrl, { headers: { Referer: detailUrl }, timeout: fast ? 12000 : 25000 });
     html = String(r.data || '');
   }
   if (!html) return null;
@@ -689,13 +724,14 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl) {
   const jsJump = html.match(/window\.location\.href\s*=\s*'(https?:\/\/[^']+)'/) ||
     html.match(/window\.location\.href\s*=\s*"(https?:\/\/[^"]+)"/);
   if (jsJump && html.length < 3000 && !/jwplayer|application\/json|get_video/.test(html)) {
-    const r2 = await httpRaw(jsJump[1], { headers: { Referer: embedUrl }, timeout: 25000 });
+    const r2 = await httpRaw(jsJump[1], { headers: { Referer: embedUrl }, timeout: fast ? 12000 : 25000 });
     if (r2.data) { html = String(r2.data); finalUrl = jsJump[1]; }
   }
 
   const direct0 = extractStream(html);
   // 1) Streamtape 签名
   if (html.includes('get_video')) {
+    if (fast) return null; // 探针期跳过：令牌与出口 IP 绑定、逐个试活慢，详情只留单集
     const cands = stCandidates(html);
     for (const c of cands) {
       if (await probeStFile(c, finalUrl)) {
@@ -708,10 +744,12 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl) {
   }
   // 2) VAS 系 API 型
   if (/\/api\/stream/.test(html) && /filecode/i.test(html)) {
+    if (fast) return null; // 探针期跳过：API 回包慢（实测 47~84s），详情只留单集
     const su = await resolveVasApi(finalUrl, html);
     if (su) {
-      const top = /\.m3u8/i.test(su) ? await pickTopVariant(su, playHeadersFor(su, finalUrl, detailUrl)) : su;
-      return { url: top, header: playHeadersFor(top, finalUrl, detailUrl) };
+      const hdr = playHeadersFor(su, finalUrl, detailUrl);
+      const fv = /\.m3u8/i.test(su) ? await fetchVariants(su, hdr) : { top: su, variants: [] };
+      return { url: fv.top, header: playHeadersFor(fv.top, finalUrl, detailUrl), variants: fv.variants };
     }
     return { sniff: finalUrl };
   }
@@ -720,7 +758,8 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl) {
   const src = String(cfg.source || '');
   if (/\.m3u8/i.test(src)) {
     const hdr = playHeadersFor(src, finalUrl, detailUrl);
-    return { url: await pickTopVariant(src, hdr), header: hdr };
+    const fv = await fetchVariants(src, hdr, fast ? 10000 : 20000);
+    return { url: fv.top, header: hdr, variants: fv.variants };
   }
   const dau = String(cfg.direct_access_url || '');
   if (/^https?:\/\//i.test(dau)) return { url: dau, header: playHeadersFor(dau, finalUrl, detailUrl) };
@@ -731,29 +770,41 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl) {
     const urls = hlsFromUnpacked(unpacked);
     for (const u of urls.slice(0, 3)) {
       const hdr = playHeadersFor(u, finalUrl, detailUrl);
-      const pl = await verifyPlaylist(u, hdr);
-      if (pl) {
-        const top = await pickTopVariant(u, hdr);
-        return { url: top, header: hdr };
-      }
+      // 单次拉取同时完成验活与拆档（旧版 verifyPlaylist+pickTopVariant 两次拉取）
+      const fv = await fetchVariants(u, hdr, fast ? 8000 : 20000);
+      if (fv.ok) return { url: fv.top, header: hdr, variants: fv.variants };
     }
   }
   // 5) 明文/jwplayer 兜底
   if (direct0) {
     const hdr = playHeadersFor(direct0, finalUrl, detailUrl);
-    const top = /\.m3u8/i.test(direct0) ? await pickTopVariant(direct0, hdr) : direct0;
-    return { url: top, header: hdr };
+    const fv = /\.m3u8/i.test(direct0) ? await fetchVariants(direct0, hdr, fast ? 10000 : 20000) : { top: direct0, variants: [] };
+    return { url: fv.top, header: hdr, variants: fv.variants };
   }
   const jw = html.match(/jwplayer\([^)]*\)\.setup\(\{\s*file:\s*"([^"]+)"/i);
   if (jw) {
     const f = jw[1].replace(/\\\//g, '/');
     if (/^https?:\/\//i.test(f)) {
       const hdr = playHeadersFor(f, finalUrl, detailUrl);
-      const top = /\.m3u8/i.test(f) ? await pickTopVariant(f, hdr) : f;
-      return { url: top, header: hdr };
+      const fv = /\.m3u8/i.test(f) ? await fetchVariants(f, hdr, fast ? 10000 : 20000) : { top: f, variants: [] };
+      return { url: fv.top, header: hdr, variants: fv.variants };
     }
   }
   return null;
+}
+
+// 详情期分辨率探针：走 lk→嵌入页→resolveEmbed（fast 模式，跳过 VAS API 与
+// ST 试活），只取主清单的档位表；拿不到/单档时返回 null，详情回落单集。
+async function probeLineVariants(hex, detailUrl) {
+  try {
+    const lk = await lkResolveEmbed(hex, detailUrl);
+    if (!lk || (!lk.embedUrl && !lk.embedBody)) return null;
+    const got = await resolveEmbed(lk.embedUrl || '', lk.embedBody || '', detailUrl, { fast: true });
+    if (!got || !got.variants || got.variants.length < 2) return null;
+    return got.variants;
+  } catch (e) {
+    return null;
+  }
 }
 
 // supjav-fetch v2 的 /wrap 探活（包装页把门页嵌进 iframe, 绕门页顶层自毁）
@@ -769,10 +820,11 @@ async function probeWrap(gateUrl) {
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const id = String(body.id || '');
-  // id 格式: vid|hex_link
+  // id 格式: vid|hex_link 或 vid|hex_link|高度（分辨率集）
   const parts = id.split('|');
   const vid = parts[0] || '';
   const hex = parts[1] || '';
+  const wantH = parts[2] ? parseInt(parts[2], 10) || 0 : 0;
   if (!hex) {
     return { parse: 0, url: '', message: '无播放线路' };
   }
@@ -785,7 +837,16 @@ async function play(reqIn) {
     if (lk && (lk.embedUrl || lk.embedBody)) {
       const got = await resolveEmbed(lk.embedUrl || '', lk.embedBody || '', detailUrl);
       if (got && got.url) {
-        return subAttach({ parse: 0, url: got.url, header: got.header || headers }, subsP);
+        // 集地址带档位标识（vid|hex|高度）时按标识选档：精确匹配优先，
+        // 其次取不高于该档的最高档，档位已下线时回落最高档。
+        let finalUrl = got.url;
+        if (wantH > 0 && got.variants && got.variants.length) {
+          const exact = got.variants.find((v) => v.h === wantH);
+          const lower = got.variants.filter((v) => v.h < wantH).sort((a, b) => b.h - a.h)[0];
+          const pick = exact || lower || got.variants[0];
+          if (pick) finalUrl = pick.url;
+        }
+        return subAttach({ parse: 0, url: finalUrl, header: got.header || headers }, subsP);
       }
       if (got && got.sniff) {
         return subAttach({ parse: 1, jx: 0, url: got.sniff, header: headers }, subsP);

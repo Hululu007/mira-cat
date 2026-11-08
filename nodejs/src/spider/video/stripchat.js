@@ -32,6 +32,11 @@ import crypto from 'crypto';
 //   列表的变体并直接返回媒体列表, 返回正文同样全是 https, 不再嵌套 js2p 地址; 仅一跳解析失败时才退回旧嵌套改写。
 // 搜索: 站内搜索 (magic-search) 走前端专用服务; /api/front/models 的 username/searchQuery/tag 等参数实测均被忽略
 //       (返回未过滤的默认列表), 没有可用的公开搜索接口, search 返回空列表。
+// 2026-11-09 分辨率选择：detail 拉 edge-hls 主清单按 RESOLUTION 高度出集（集地址 <id>@@<height>）；
+//   play 按 @@<height> 选变体，媒体列表地址走本地代理 /proxy/hls（hlsProxy 直接 rewriteMedia 返回全 https 媒体列表）。
+//   Worker /master/{id} 是否支持档位参数无法核实——同目录 stripchat-hls-worker.js 不在 mira-cat main
+//   （2026-11-09 查 GitHub 仓库文件树，仅 nodejs/src/spider/video/stripchat.js 含 stripchat），故档位不走 Worker 参数；
+//   主清单拉不到/无变体/取不到 pkey 时回退原单集行为（Worker /master/{id}）。Mouflon 解密与 hlsProxy 本体不动。
 
 const KEY = 'py_stripchat';
 const NAME = 'StripChat';
@@ -263,6 +268,55 @@ async function category(reqIn) {
 
 // ---------- 详情 / 播放 ----------
 
+// 主清单解析：按文件顺序返回全部 #EXT-X-STREAM-INF 变体 { attrs, uri, width, height }。
+function parseMasterVariants(masterText) {
+  const lines = String(masterText).split(/\r?\n/);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const L = String(lines[i]).trim();
+    if (L.indexOf('#EXT-X-STREAM-INF:') !== 0) continue;
+    const attrs = L.slice('#EXT-X-STREAM-INF:'.length);
+    const uri = String(lines[i + 1] || '').trim();
+    if (!uri || uri.startsWith('#')) continue;
+    const res = attrs.match(/RESOLUTION=(\d+)x(\d+)/) || [];
+    out.push({
+      attrs,
+      uri,
+      width: parseInt(res[1] || '0', 10) || 0,
+      height: parseInt(res[2] || '0', 10) || 0,
+    });
+  }
+  return out;
+}
+
+// 按请求高度选变体：精确匹配；无则取最接近的低一档；仍无则首个变体。
+function pickStripVariant(variants, wantHeight) {
+  if (!variants || !variants.length) return null;
+  if (!wantHeight) return variants[0];
+  for (const v of variants) if (v.height === wantHeight) return v;
+  let lower = null;
+  for (const v of variants) {
+    if (v.height && v.height < wantHeight && (!lower || v.height > lower.height)) lower = v;
+  }
+  return lower || variants[0];
+}
+
+// 带档位播放：现拉主清单 → pickPkey 取 pkey → 按高度选变体 → 媒体列表地址走本地代理 /proxy/hls
+// （hlsProxy 见媒体列表地址直接 rewriteMedia 返回全 https 媒体列表）。
+// 任一步失败返回 ''，由 play() 回退到原单集行为。
+async function pickVariantMediaUrl(reqIn, id, wantHeight) {
+  const master = `${EDGE}/hls/${id}/master/${id}.m3u8`;
+  const text = await fetchText(master);
+  if (!text || !text.includes('#EXTM3U')) return '';
+  const pkey = pickPkey(text);
+  if (!pkey || !PSCH_KEYS[pkey]) return '';
+  const v = pickStripVariant(parseMasterVariants(text), wantHeight);
+  if (!v) return '';
+  const abs = absUrl(v.uri.replace(/&amp;/g, '&'), master);
+  const mediaUrl = abs + (abs.includes('?') ? '&' : '?') + 'psch=v2&pkey=' + encodeURIComponent(pkey);
+  return proxyUrl(reqIn, '/proxy/hls', mediaUrl, pkey) || '';
+}
+
 async function detail(reqIn) {
   const body = reqIn?.body || {};
   const raw = t(body.id);
@@ -284,14 +338,46 @@ async function detail(reqIn) {
     vod_play_from: NAME,
     vod_play_url: '直播$' + id,
   };
+  // 分辨率选单：拉 edge-hls 主清单，按 RESOLUTION 高度出集（集名如 1080p，集地址 <id>@@<height>）；
+  // 主清单拉不到或无带 RESOLUTION 的变体时，保留原单集行为。
+  try {
+    const master = await fetchText(`${EDGE}/hls/${id}/master/${id}.m3u8`);
+    const heights = [];
+    const seen = new Set();
+    for (const v of parseMasterVariants(master || '')) {
+      if (v.height > 0 && !seen.has(v.height)) { seen.add(v.height); heights.push(v.height); }
+    }
+    heights.sort((a, b) => b - a);
+    if (heights.length) {
+      vod.vod_play_url = heights.map(h => `${h}p$${id}@@${h}`).join('#');
+    }
+  } catch (e) { /* 保留原单集 */ }
   return { list: [vod] };
 }
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const raw = t(body.id);
-  const id = raw.includes('$') ? raw.split('$').pop() : raw;
+  let id = raw.includes('$') ? raw.split('$').pop() : raw;
+  // 集地址形态：<id>@@<height>；无 @@ 后缀时为旧单集地址，按原行为播。
+  let wantHeight = 0;
+  const at = id.lastIndexOf('@@');
+  if (at >= 0) {
+    const h = parseInt(id.slice(at + 2), 10);
+    if (h > 0) { wantHeight = h; id = id.slice(0, at); }
+  }
   if (!/^\d+$/.test(id)) return { parse: 0, url: '' };
+  // 带档位请求：走本地代理 /proxy/hls 返回指定档位的媒体列表；失败回退原单集行为。
+  if (wantHeight) {
+    const picked = await pickVariantMediaUrl(reqIn, id, wantHeight);
+    if (picked) {
+      return {
+        parse: 0,
+        url: picked,
+        header: { 'User-Agent': UA, 'Referer': REFERER },
+      };
+    }
+  }
   // 首选 Worker 代办 (返回正文全 https 的媒体列表); play 本身 0 上游请求
   if (STRIPCHAT_WORKER) {
     return {

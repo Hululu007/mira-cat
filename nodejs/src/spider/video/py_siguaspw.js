@@ -212,6 +212,86 @@ async function workerAlive() {
   } catch (e) { return false; }
 }
 
+// ---------------- 分辨率：主清单拆档（2026-11-09） ----------------
+// 播单是 master（含 #EXT-X-STREAM-INF）时按 RESOLUTION 高度拆档出集；
+// 单档媒体播单/拉取失败时回落原单集。只做纯文本解析与地址拼接，
+// 不动 Worker 腿（siguaspw-hls）与 CDN 线路结构。
+async function fetchPlaylistText(url, timeoutMs) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': HOST + '/' },
+      timeout: timeoutMs || 10000,
+    });
+    const t = typeof r.data === 'string' ? r.data : '';
+    return t.includes('#EXTM3U') ? t : '';
+  } catch (e) { return ''; }
+}
+
+// 纯函数：解析 master 文本，返回按高度降序的档位表（同高度留最大码率）。
+// 无 RESOLUTION 高度的档位不采信、不出集；相对地址以播单原地址为基址解析。
+function parseMasterVariants(text, baseUrl) {
+  if (!String(text || '').includes('#EXT-X-STREAM-INF')) return [];
+  const lines = String(text).split(/\r?\n/);
+  const list = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+    let uri = '';
+    for (let j = i + 1; j < lines.length; j++) {
+      if (lines[j].trim()) { uri = lines[j].trim(); break; }
+    }
+    if (!uri) continue;
+    const rm = line.match(/RESOLUTION=(\d+)x(\d+)/i);
+    const bm = line.match(/BANDWIDTH=(\d+)/i);
+    const h = rm ? parseInt(rm[2], 10) : 0;
+    if (!h) continue;
+    let abs = '';
+    if (/^https?:\/\//i.test(uri)) abs = uri;
+    else {
+      try { abs = new URL(uri, baseUrl).toString(); } catch (e) { continue; }
+    }
+    list.push({ h, bw: bm ? parseInt(bm[1], 10) : 0, uri: abs });
+  }
+  const byH = new Map();
+  for (const v of list) {
+    const cur = byH.get(v.h);
+    if (!cur || v.bw > cur.bw) byH.set(v.h, v);
+  }
+  return [...byH.values()].sort((a, b) => b.h - a.h || b.bw - a.bw);
+}
+
+// 对每条线拉一次播单（Worker 活着时走 Worker /m3u8，否则直拉 CDN 原地址），
+// 是 master 则把各档换算成可播地址；返回 Map<线路下标, [{h, target}]>。
+// 拉取失败/单档/档位地址不可用时该线不进表，详情回落原单集。
+async function probeSiguaspwVariants(lines, workerOk, reqIn, durl) {
+  const out = new Map();
+  await Promise.all(lines.map(async (l, idx) => {
+    const src = l._src || '';
+    if (!src) return;
+    const fetchUrl = workerOk ? l.url : src;
+    const text = await fetchPlaylistText(fetchUrl, 10000);
+    if (!text) return;
+    const vs = parseMasterVariants(text, src);
+    if (vs.length < 2) return;
+    const targets = [];
+    for (const v of vs) {
+      let t = v.uri;
+      // 片段地址（变体行被误改成 /seg/ 分片地址时）不是播单，丢弃该档
+      if (t.indexOf('/seg/') >= 0) continue;
+      if (t.indexOf(WORKER + '/m3u8') === 0 || t.indexOf('/proxy/m3u8') >= 0) {
+        // 已是可直接播的播单地址（Worker/本地代理改写过的变体行），直接用
+      } else if (/^https?:\/\//i.test(t)) {
+        t = workerOk ? workerUrl(t) : (proxyUrl(reqIn, '/proxy/m3u8', t, durl) || t);
+      } else {
+        continue;
+      }
+      targets.push({ h: v.h, target: t });
+    }
+    if (targets.length >= 2) out.set(idx, targets);
+  }));
+  return out;
+}
+
 // 线路短名：dfdf.tjacq.com -> dfdf；*.sxtmo.com -> sxtmo；其余用站方 cdnName 或 host 首段。
 function lineNameFor(base, cdnName) {
   let host = '';
@@ -818,7 +898,7 @@ async function detail(reqIn) {
         : (proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl) || workerUrl(playUrl));
       let baseHost = '';
       try { baseHost = new URL(base).host.toLowerCase(); } catch (e) { baseHost = ''; }
-      lines.push({ name, url, _baseHost: baseHost });
+      lines.push({ name, url, _src: playUrl, _baseHost: baseHost });
     }
     // d22 备用线分片宿主已死（2026-11-08 直连与经 Worker 均拉不到分片）：有其他
     // 可播线时跳过它；若过滤后为空（只剩 d22）则保留全部，不留空详情。
@@ -837,7 +917,7 @@ async function detail(reqIn) {
       const url = workerOk
         ? workerUrl(playUrl)
         : (proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl) || workerUrl(playUrl));
-      lines.push({ name: '丝瓜视频', url });
+      lines.push({ name: '丝瓜视频', url, _src: playUrl });
     }
   }
   // 2026-11-08：预览片标注——站方对部分片只给 _preview.m3u8 播单（全站抽查 432 部：81 部是预览，均为 1 分片、0.9~16.7 秒，
@@ -846,9 +926,20 @@ async function detail(reqIn) {
   // 无播单时（详情页站方 500、或“直播线常驻”占位页无 data-url）备注标“已失效”。
   const isPreview = dataUrl.includes('_preview');
   const epName = isPreview ? '预览' : '正片';
+  // 分辨率（2026-11-09）：预览片与单档播单不拆；每条线拉一次播单，是 master
+  // 才按档出集（集名取高度），其余一律回落原单集，不阻塞详情。
+  let variantMap = new Map();
+  if (!isPreview && lines.length) {
+    variantMap = await probeSiguaspwVariants(lines, workerOk, reqIn, durl).catch(() => new Map());
+  }
+  for (const l of lines) delete l._src;
   const from = lines.length ? lines.map((l) => l.name).join('$$$') : '丝瓜视频';
   const url = lines.length
-    ? lines.map((l) => epName + '$' + durl + '@@' + l.url).join('$$$')
+    ? lines.map((l, idx) => {
+        const vs = variantMap.get(idx);
+        if (vs && vs.length >= 2) return vs.map((v) => v.h + 'p$' + durl + '@@' + v.target).join('#');
+        return epName + '$' + durl + '@@' + l.url;
+      }).join('$$$')
     : '';
   return {
     list: [{

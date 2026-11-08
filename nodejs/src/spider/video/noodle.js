@@ -199,8 +199,35 @@ async function category(reqIn) {
   }
   return { page, pagecount: 9999, limit: 24, total: list.length ? 999999 : 0, list };
 }
+// 2026-11-09 分辨率选择（只改 videofile 回退分支）：不跟随跳转取 301 Location
+// 拿到 CDN 地址（vid_360p.mp4，含 token）。axios 在 maxRedirects:0 下对 301
+// 可能直接返回也可能抛错，两路都从响应头读 Location。
+async function resolveVideofile(vfUrl) {
+  const pick = (headers) => {
+    const loc = headers && (headers.location || headers.Location);
+    if (!loc) return '';
+    try { return new URL(String(loc), vfUrl).href; } catch { return String(loc); }
+  };
+  try {
+    const res = await req.get(vfUrl, { headers: H(HOST), timeout: 10000, maxRedirects: 0 });
+    return pick(res && res.headers);
+  } catch (e) {
+    return pick(e && e.response && e.response.headers);
+  }
+}
+// 并行探活一个 CDN 变体地址：Range 请求回 200 或 206 才算存在。
+async function probeCdn(u) {
+  try {
+    const res = await req.get(u, { headers: { ...H(HOST), Range: 'bytes=0-0' }, timeout: 10000, maxRedirects: 5 });
+    const s = res && res.status;
+    return s === 200 || s === 206;
+  } catch (e) {
+    const s = e && e.response && e.response.status;
+    return s === 200 || s === 206;
+  }
+}
 // 详情播放地址提取：window.playlist 四档优先，空时回退 videofile 单线
-function detailPlayUrl(html, raw) {
+async function detailPlayUrl(html, raw) {
   const pl = [];
   const seenPl = new Set();
   const plRe = /"file"\s*:\s*"([^"]+)"\s*,\s*"label"\s*:\s*"([^"]+)"/gi;
@@ -215,7 +242,21 @@ function detailPlayUrl(html, raw) {
   pl.sort((a, b) => (parseInt(b.label, 10) || 0) - (parseInt(a.label, 10) || 0));
   if (pl.length) return pl.map(x => x.label + '$' + x.file).join('#');
   const vm = html.match(/\/videofile\/[^"'\s<>]+\.mp4/i);
-  return vm ? ('播放$' + HOST.replace(/\/$/, '') + vm[0]) : ('未找到视频源$' + raw);
+  if (!vm) return '未找到视频源$' + raw;
+  const vfUrl = HOST.replace(/\/$/, '') + vm[0];
+  // videofile 回退分支改多档：301 Location 拿到 CDN 360p 地址后，按 720p/480p/360p/240p
+  // 构造变体并行探活，只出探活通过的档（720p>480p>360p>240p）；全部失败、拿不到
+  // Location、或地址不含 360p 时回退原单线行为。
+  try {
+    const cdn = await resolveVideofile(vfUrl);
+    if (cdn && cdn.includes('360p')) {
+      const variants = [720, 480, 360, 240].map(q => ({ q, url: cdn.replace('360p', q + 'p') }));
+      const results = await Promise.all(variants.map(async v => ({ ...v, ok: await probeCdn(v.url) })));
+      const ok = results.filter(r => r.ok);
+      if (ok.length) return ok.map(r => r.q + 'p$' + r.url).join('#');
+    }
+  } catch { /* 回退原单线 */ }
+  return '播放$' + vfUrl;
 }
 async function detail(reqIn) {
   const ids = Array.isArray(reqIn?.body?.id) ? reqIn.body.id : [reqIn?.body?.id];
@@ -223,10 +264,10 @@ async function detail(reqIn) {
   for (const raw of ids.filter(Boolean)) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST + String(raw).replace(/^\/+/, '');
     let html = await getText(url, HOST);
-    let playUrl = detailPlayUrl(html, raw);
+    let playUrl = await detailPlayUrl(html, raw);
     if (playUrl.startsWith('未找到视频源')) {
       const rh = await fetchViaRelay(url, HOST);
-      const playUrl2 = detailPlayUrl(rh, raw);
+      const playUrl2 = await detailPlayUrl(rh, raw);
       if (!playUrl2.startsWith('未找到视频源')) { html = rh; playUrl = playUrl2; }
     }
     const tm = html.match(/data-video-title-base="([^"]+)"/i);

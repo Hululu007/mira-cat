@@ -297,7 +297,8 @@ async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
-  // id 可能是 "第1集$12345" 形式，取 $ 后面的
+  // id 可能是 "第1集$12345" 形式，取 $ 后面的；同时留一份原始 id 供档位前缀匹配用
+  const rawId = id;
   if (id.includes('$')) id = id.split('$').pop().trim();
   const vid = id.replace(/\D/g, '') || id;
   const subsP = subSearchAll(subNormKey(vid)).catch(() => []);
@@ -306,8 +307,16 @@ async function play(reqIn) {
   if (!html) return { parse: 0, url: '' };
   const sources = parseSources(html);
   if (!sources.length) return { parse: 0, url: '' };
-  // 优先 H264 (parseSources 已按 H264 优先排序)
-  const best = sources[0];
+  // 2026-11-09 分辨率选择：detail 已按 <source> 的 label（站方真实档位，如 720p/480p，
+  // AV1 档为 "<档位> AV1"）出线路，play 按 body.flag 匹配对应档位的地址；
+  // 匹配不到（或 App 未传 flag）时回退首档（H264 优先，parseSources 已排好序）。
+  // 兼容个别 App 把档位放在 id 的 "$" 前缀里传回的情况。
+  let want = t(body.flag);
+  if (!want && rawId.includes('$')) {
+    const pre = rawId.split('$')[0].trim();
+    if (sources.some(s => s.label === pre)) want = pre;
+  }
+  const best = (want && sources.find(s => s.label === want)) || sources[0];
   return subAttach({
     parse: 0,
     url: best.url,

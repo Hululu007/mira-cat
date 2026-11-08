@@ -801,6 +801,38 @@ function wgPlayUrl(ep) {
   const u = String(ep.playUrl || '');
   return u.startsWith('http') ? u : '';
 }
+// 围观多档位: videoClarityList 数组 [{clarity, url}] 或 playSetting 对象
+// {super/high/normal: url} (实测 videoClarityList 常为 null, 档位在 playSetting
+// 里; 只有 >=2 档才返回)。档位名只用站方原值 (1080P/super/high/normal 等),
+// 不编数字档位; url 须为 http, 按档位名去重。
+function wgClarityList(ep) {
+  if (!ep || typeof ep !== 'object') return [];
+  let raw = ep.playSetting !== undefined ? ep.playSetting : ep.videoClarityList;
+  if (typeof raw === 'string') {
+    const t = raw.trim();
+    if (!t) return [];
+    try { raw = JSON.parse(t); } catch (e) { return []; }
+  }
+  const out = [];
+  const seen = new Set();
+  const push = (clarity, url) => {
+    const cl = String(clarity || '').trim();
+    const u = String(url || '').trim();
+    if (!cl || !u.startsWith('http') || seen.has(cl)) return;
+    seen.add(cl);
+    out.push({ clarity: cl, url: u });
+  };
+  if (Array.isArray(raw)) {
+    for (const it of raw) {
+      if (!it || typeof it !== 'object') continue;
+      push(it.clarity, pick(it, 'url', 'playUrl'));
+    }
+  } else if (raw && typeof raw === 'object') {
+    // playSetting 对象形: 键即站方档位名 (super/high/normal)
+    for (const k of ['super', 'high', 'normal']) push(k, raw[k]);
+  }
+  return out;
+}
 const weiguan = {
   cats: WG_CATS,
   async list(cat, page) {
@@ -828,19 +860,34 @@ const weiguan = {
       const order = wgOrder(ep, i);
       if (seen.has(order)) return;
       seen.add(order);
-      eps.push({ no: order, name: '第' + order + '集', url: 'weiguan://' + vid + '/' + order });
+      const cls = wgClarityList(ep);
+      if (cls.length >= 2) {
+        for (const c of cls) {
+          eps.push({ no: order, name: '第' + order + '集·' + c.clarity, url: 'weiguan://' + vid + '/' + order + '@' + encodeURIComponent(c.clarity) });
+        }
+      } else {
+        eps.push({ no: order, name: '第' + order + '集', url: 'weiguan://' + vid + '/' + order });
+      }
     });
     eps.sort((a, b) => a.no - b.no);
     if (!eps.length) return null;
     return {
       name: clean(first.title) || vid, pic: String(first.vertPoster || first.horizonPoster || ''),
       desc: clean(pick(first, 'description', 'desc')).slice(0, 400), eps,
+      epCount: seen.size,
     };
   },
-  async play(vid, no) {
+  async play(vid, no, clarity) {
     const items = await wgEpisodes(vid);
     for (let i = 0; i < items.length; i++) {
-      if (wgOrder(items[i], i) === no) return wgPlayUrl(items[i]);
+      if (wgOrder(items[i], i) === no) {
+        if (clarity) {
+          const cls = wgClarityList(items[i]);
+          const hit = cls.find(c => c.clarity === clarity);
+          if (hit) return hit.url;
+        }
+        return wgPlayUrl(items[i]);
+      }
     }
     return '';
   },
@@ -865,15 +912,19 @@ function splitId(id) {
   return ['chengguo', s];
 }
 function parseEpToken(tok) {
-  // 形如 qixing://4739/1
+  // 形如 qixing://4739/1 或 weiguan://<vid>/3@1080P (围观多档位, @后为档位名)
   const m = String(tok || '').match(/^([a-z0-9_]+):\/\/(.+)$/);
   if (!m || !PLATS[m[1]]) return null;
   const rest = m[2];
   const cut = rest.lastIndexOf('/');
   if (cut <= 0) return null;
-  const no = parseInt(rest.slice(cut + 1), 10);
+  const seg = rest.slice(cut + 1);
+  const at = seg.indexOf('@');
+  const no = parseInt(at >= 0 ? seg.slice(0, at) : seg, 10);
   if (!no) return null;
-  return { plat: m[1], vid: rest.slice(0, cut), no };
+  let clarity = '';
+  if (at >= 0) { try { clarity = decodeURIComponent(seg.slice(at + 1)); } catch (e) { clarity = seg.slice(at + 1); } }
+  return { plat: m[1], vid: rest.slice(0, cut), no, clarity };
 }
 const PLAY_UA_HEADERS = {
   chengguo: { 'Referer': CG_SITE + '/', 'User-Agent': UA },
@@ -941,7 +992,7 @@ async function detail(reqIn) {
       vod_name: d.name,
       vod_pic: d.pic || '',
       vod_content: d.desc || '',
-      vod_remarks: '共' + d.eps.length + '集',
+      vod_remarks: '共' + (d.epCount || d.eps.length) + '集',
       vod_play_from: (PLAT_LIST.find(p => p.key === pkey) || {}).name || NAME,
       vod_play_url: d.eps.map(e => e.name + '$' + e.url).join('#'),
     }],
@@ -959,7 +1010,7 @@ async function play(reqIn) {
     return { parse: 1, url: '', header: {} };
   }
   let url = '';
-  try { url = await PLATS[ep.plat].play(ep.vid, ep.no); } catch (e) {}
+  try { url = await PLATS[ep.plat].play(ep.vid, ep.no, ep.clarity); } catch (e) {}
   if (!url || !/^https?:\/\//i.test(url)) return { parse: 1, url: '', header: {} };
   return { parse: 0, url, header: PLAY_UA_HEADERS[ep.plat] || { 'User-Agent': UA } };
 }

@@ -569,15 +569,39 @@ async function resolveEmbed(embed, durl, serverName) {
   return null;
 }
 
+// 单线解析（各线自身的 resolveEmbed 逻辑不动）：取 /api/episodes/<id>/player
+// 的 embed_url 再解。失败返回 null，不抛错。
+async function resolveOneServer(sv, durl) {
+  const pj = await getJson(HOST + '/api/episodes/' + encodeURIComponent(sv.episode) + '/player', durl);
+  const embed = pj && pj.data && pj.data.embed_url ? String(pj.data.embed_url) : '';
+  if (!embed) return null;
+  const res = await resolveEmbed(embed, durl, sv.name);
+  if (!res) return null;
+  return { url: res.url, embed: res.embed, label: res.label, server: sv.server, episode: sv.episode };
+}
+
 async function resolveFromServers(servers, durl) {
   for (const sv of servers) {
-    const pj = await getJson(HOST + '/api/episodes/' + encodeURIComponent(sv.episode) + '/player', durl);
-    const embed = pj && pj.data && pj.data.embed_url ? String(pj.data.embed_url) : '';
-    if (!embed) continue;
-    const res = await resolveEmbed(embed, durl, sv.name);
+    const res = await resolveOneServer(sv, durl).catch(() => null);
     if (res) return res;
   }
   return null;
+}
+
+// 分辨率选择（2026-11-09）：遍历全部服务器逐个解析，各线都列为一集；
+// 某线解失败跳过、不阻塞其他线；全部失败返回空数组（detail 再回退首个可解）。
+async function resolveAllServers(servers, durl) {
+  const out = [];
+  for (const sv of servers) {
+    const res = await resolveOneServer(sv, durl).catch(() => null);
+    if (res) out.push(res);
+  }
+  return out;
+}
+
+// 点播时重解用户点的那条线（签名有时效，详情期地址可能过期）。
+async function resolveServerById(server, episode, durl) {
+  return resolveOneServer({ server, episode, name: '' }, durl).catch(() => null);
 }
 
 // Returns { url, embed, label } or null. The embed URL matters as Referer: the vid-snap
@@ -660,10 +684,16 @@ async function detail(reqIn) {
     if (pm) posterPic = pm[0];
   }
   const servers = parseServers(html);
-  const stream = await resolveFromServers(servers, durl);
-  const playUrl = stream ? stream.url : '';
-  const playLabel = stream ? stream.label : 'JaSex';
-  const playEmbed = stream ? stream.embed : '';
+  // 各线全解、全列为集（集名沿用各线自带档位 label，如 VIP·1080p、SHG·720p）；
+  // 全部失败时回退原首个可解行为（再走一遍 resolveFromServers）。
+  let streams = await resolveAllServers(servers, durl);
+  if (!streams.length) {
+    const one = await resolveFromServers(servers, durl).catch(() => null);
+    if (one) streams = [one];
+  }
+  const playUrl = streams.length
+    ? streams.map((s) => s.label + '$' + durl + '@@' + s.url + '@@' + s.embed + (s.episode ? '@@' + s.server + '|' + s.episode : '')).join('#')
+    : '';
   return {
     list: [{
       vod_id: rawId,
@@ -672,7 +702,7 @@ async function detail(reqIn) {
       vod_remarks: code || 'HD',
       vod_content: code ? ('番号：' + code) : 'JaSex',
       vod_play_from: 'JaSex',
-      vod_play_url: playUrl ? (playLabel + '$' + durl + '@@' + playUrl + '@@' + playEmbed) : '',
+      vod_play_url: playUrl,
     }],
   };
 }
@@ -685,13 +715,27 @@ async function play(reqIn) {
   let durl = '';
   let target = id;
   let storedEmbed = '';
+  let storedServer = '';
+  let storedEpisode = '';
   const parts = id.split('@@');
-  if (parts.length >= 2) { durl = parts[0]; target = parts[1]; storedEmbed = parts[2] || ''; }
+  if (parts.length >= 2) {
+    durl = parts[0]; target = parts[1]; storedEmbed = parts[2] || '';
+    if (parts[3]) {
+      const sp = parts[3].split('|');
+      storedServer = sp[0] || '';
+      storedEpisode = sp[1] || '';
+    }
+  }
   // Re-resolve at play time: signed tokens/paths are time-limited, so a detail-time
   // URL may have expired by the time the user presses play. Fall back to the
   // stored target only if the fresh resolve fails.
+  // 用户点的集优先重解同一条线（集地址末段带 server|episode）；该线解不出
+  // 时再回退整站首个可解线，最后回退详情期地址。
   let fresh = null;
-  if (durl) {
+  if (durl && storedEpisode) {
+    try { fresh = await resolveServerById(storedServer, storedEpisode, durl); } catch (e) { fresh = null; }
+  }
+  if (!fresh && durl) {
     try { fresh = await resolveStream(durl); } catch (e) { fresh = null; }
   }
   const url = fresh ? fresh.url : target;

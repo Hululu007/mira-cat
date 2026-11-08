@@ -300,6 +300,12 @@ async function detail(reqIn) {
     vod_play_from: 'JavHD.Today',
     vod_play_url: `正片$${durl}`,
   };
+  // s3 (vidara) 有多档时把各档列为分集 (集名取实测高度, 降序), 末尾保留原正片
+  // (点播仍走原 s3 分支); 解不到/单档/超时(8s)保持原单集
+  const vs = await withTimeout(tryQualityEpisodes(durl, html), 8000);
+  if (vs && vs.length >= 2) {
+    vod.vod_play_url = vs.map(v => v.label + '$' + v.url).join('#') + '#正片$' + durl;
+  }
   subRegister(id, vod);
   return { list: [vod] };
 }
@@ -340,6 +346,55 @@ async function resolveServerJson(playerUrl, referer) {
 async function resolveSelfPlayer(playerUrl, referer) {
   const r = await resolveServerJson(playerUrl, referer);
   return r && r.kind === 'hls' ? { url: r.url, playerUrl: r.playerUrl, host: new URL(playerUrl).origin } : '';
+}
+
+// 解析 master 播单的变体 (javgg 同款): 只认带 RESOLUTION 的档位, 按高度降序返回
+// [{label:'1080p', url:<变体媒体列表绝对地址>}]; 不足 2 档或无 RESOLUTION 返回 []。
+// 变体 URI 相对 master 地址解析 (自带 token 查询串, 原样保留); 同高度只留带宽最大者。
+function parseVariants(masterText, masterUrl) {
+  const lines = String(masterText || '').split('\n');
+  const byHeight = new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(/#EXT-X-STREAM-INF:([^\n]*)/);
+    if (!m) continue;
+    const res = (m[1].match(/RESOLUTION=(\d+)x(\d+)/) || [])[2] || '';
+    const bw = parseInt((m[1].match(/BANDWIDTH=(\d+)/) || [])[1] || '0', 10) || 0;
+    const uri = (lines[i + 1] || '').trim();
+    const h = parseInt(res, 10);
+    if (!h || !uri || uri.startsWith('#')) continue;
+    let abs = '';
+    try { abs = new URL(uri, masterUrl).toString(); } catch (e) { continue; }
+    const prev = byHeight.get(h);
+    if (!prev || bw > prev.bw) byHeight.set(h, { label: h + 'p', url: abs, bw });
+  }
+  return [...byHeight.values()].sort((a, b) => parseInt(b.label, 10) - parseInt(a.label, 10))
+    .map(v => ({ label: v.label, url: v.url }));
+}
+
+// 超时即 resolve null (永不 reject), 供 detail 期封顶用
+function withTimeout(p, ms) {
+  return Promise.race([p, new Promise((r) => setTimeout(() => r(null), ms))]);
+}
+
+// s3 (vidara) detail 期解变体: 详情页 embed -> s3 ?json=1 -> master -> parseVariants;
+// >=2 档才返回, 否则 null (detail 回退原单集)。只动 s3 分支, 其他 server 不动。
+// 实测: vidara master 含 480/720/1080 三档 (RESOLUTION, 相对路径 + token)。
+async function tryQualityEpisodes(durl, html) {
+  try {
+    const embedUrl = extractEmbed(html);
+    if (!embedUrl) return null;
+    const embedHtml = await getHtml(embedUrl, durl);
+    if (!embedHtml) return null;
+    const players = extractPlayers(embedHtml);
+    const s3 = players.find(p => /javhdz\.today\//i.test(p.url) && /embed_server3\.php/i.test(p.url));
+    if (!s3) return null;
+    const r = await resolveServerJson(s3.url, embedUrl);
+    if (!r || r.kind !== 'hls' || !r.url) return null;
+    const txt = await getHtml(r.url, embedUrl);
+    if (!txt || !txt.includes('#EXTM3U')) return null;
+    const vs = parseVariants(txt, r.url);
+    return (vs && vs.length >= 2) ? vs : null;
+  } catch (e) { return null; }
 }
 
 async function play(reqIn) {
