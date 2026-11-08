@@ -13,6 +13,19 @@ import req from '../../util/req.js';
 // 分类：菜单 3 个（censored/uncensored/chinese）+ 关键词分类（名与路径均取自站方 /keywords/movie 索引页实测）
 // 列表翻页：菜单 /menu/<m>/5-2-<页>；关键词 /keywords/movie/<词>?page=<页>&moviesort=3（第 2 页标题实测“第2頁”）
 // 搜索：/search/<关键词>（实测 FNS-274 返回 1 条）；详情 JSON-LD identifier.value 即番号，字幕按条目接。
+// v2（2026-11-08，基于 main blob 7ebb3fad 手术式修改；CATS 与字幕芯一字未动）：
+// 站方墙 11-08 收紧，直连/Worker /f/Railway 三腿全死，只剩 jina（r.jina.ai）活。
+// getHtml 改多腿并行竞速：Worker 8s / 直连 3s / jina 20s，先到先赢；jina 回 Markdown，
+// 走 Markdown 解析分支（parseCardsMd / parseDetailMd），不再把 Markdown 当 HTML 解析。
+// jina 腿有 req 与 fetch 双通道（见 getPage 注释：VM 里仓库 req.js 的自定义 Agent 不走
+// 出口代理，直连 jina 会 ECONNRESET；全局 fetch 走代理全通）。竞速器 firstSuccess 在
+// 全部腿落败时立即回空，不再烧满 20.5s 上限（初版 bug：axios 版全链路 12 个环节各烧
+// 满 20.5s 才回空，146/386 条）。
+// jina 会剥 script 与 iframe：详情页拿不到 /player/v2 payload 与 JSON-LD contentUrl，
+// 故 jina 详情不出播单（play_url 为空，不转圈）；play() 仍保留原链路（payload 在时现铸
+// master，master 到手拆 720p/1080p 两档，铸不出回空地址 + msg 诊断）。
+// 播单改写代理不写进蜘蛛（B 路 11-08 已判死：/f 取详情 6 次全 403，铸不出新鲜 master），
+// 等墙松了再接独立 javrate-hls Worker。
 const HOST = 'https://www.javrate.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const RELAY = 'https://javrate.li768435813.workers.dev';
@@ -70,33 +83,88 @@ function normUrl(u) {
   return s;
 }
 
-async function getHtml(path) {
+// ---------------- 取数：三腿并行竞速（v2） ----------------
+// Worker 8s / 直连 3s / jina 20s 同时发，先成功者赢；挑战页/空页/报错的腿只算失败，
+// 不抢赢。lastFetch 记录赢腿的 kind（'html' | 'md'）与 via，供解析分支选用。
+// jina 腿：https://r.jina.ai/<目标 URL>，回 Markdown（头含 Title:/URL Source:/Markdown Content:）。
+const JINA = 'https://r.jina.ai/';
+const lastFetch = { kind: 'html', via: '' };
+
+function isJinaMd(body) {
+  return typeof body === 'string' && body.length > 200 && body.indexOf('Markdown Content:') >= 0;
+}
+
+function firstSuccess(jobs, ms) {
+  return new Promise((resolve) => {
+    let done = false;
+    let settled = 0;
+    const total = jobs.length;
+    const timer = setTimeout(() => { if (!done) { done = true; resolve(null); } }, ms);
+    const onSettled = () => {
+      settled += 1;
+      if (!done && settled >= total) { done = true; clearTimeout(timer); resolve(null); }
+    };
+    if (total === 0) { done = true; clearTimeout(timer); resolve(null); return; }
+    for (const p of jobs) {
+      Promise.resolve(p).then((v) => {
+        if (done) return;
+        if (v) { done = true; clearTimeout(timer); resolve(v); return; }
+        onSettled();
+      }).catch(onSettled);
+    }
+  });
+}
+
+async function getPage(path) {
   let url = String(path || '');
   if (url.startsWith('//')) url = 'https:' + url;
   else if (url.startsWith('/')) url = HOST + url;
   const headers = { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8' };
-  // 取数：Worker 优先（手机直连被拦时走 Worker），直连兜底；每腿单次、有界返回。
-  // 2026-11-05 LA 鉴别：LA 节点也空，排除 IP/验证问题；旧版 Worker 3×30s +
-  //   直连 2×30s，挂住最长约 150 秒才回空，超 App 蜘蛛超时致空。故 Worker 8s、
-  //   直连 3s 双界，总耗时至多约 11 秒；挑战页仍视为失败（其余逻辑不变）。
   const legs = [
-    { u: viaWorker(url), ms: 8000 },
-    { u: url, ms: 3000 },
+    { via: 'worker', ms: 8000, kind: 'html', u: viaWorker(url), transport: 'req' },
+    { via: 'direct', ms: 3000, kind: 'html', u: url, transport: 'req' },
+    { via: 'jina-req', ms: 20000, kind: 'md', u: JINA + url, transport: 'req' },
   ];
-  for (const leg of legs) {
-    const p = (async () => {
-      try {
-        const r = await req.get(leg.u, { headers, timeout: leg.ms });
-        const body = (r && r.data != null) ? String(r.data) : '';
-        if (r && r.status === 200 && body && !isChallengeHtml(body)) return body;
-      } catch (e) { /* ignore, next leg */ }
-      return '';
-    })();
-    const to = new Promise((resolve) => setTimeout(() => resolve(''), leg.ms));
-    const body = await Promise.race([p, to]);
-    if (body) return body;
+  // jina 双通道（2026-11-08 VM 实测）：仓库 req.js 是 axios.create 配自定义 https.Agent，
+  // 该 Agent 不走 VM 出口代理（NODE_USE_ENV_PROXY 只对 globalAgent 生效），直连 r.jina.ai
+  // 会在收到 200 后被中途掐断（ECONNRESET，7/8 次）；而全局 fetch（undici，走代理）与
+  // 不带自定义 Agent 的 axios 4/4 全通。故 jina 腿再加一条 fetch 通道（有 fetch 的运行
+  // 时才发），与 req 通道并行竞速，先到先赢；App 内无 fetch 时只剩 req 通道（手机直连，
+  // 无 VM 代理问题，行为待真机看）。Worker/直连腿仍走 req，与 v1 一致。
+  if (typeof fetch === 'function') {
+    legs.push({ via: 'jina-fetch', ms: 20000, kind: 'md', u: JINA + url, transport: 'fetch' });
   }
+  const jobs = legs.map((leg) => (async () => {
+    try {
+      let body = '';
+      let status = 0;
+      if (leg.transport === 'fetch') {
+        const ctrl = new AbortController();
+        const to = setTimeout(() => { try { ctrl.abort(); } catch (e) { /* ignore */ } }, leg.ms);
+        try {
+          const r = await fetch(leg.u, { headers, signal: ctrl.signal });
+          status = r.status;
+          body = await r.text();
+        } finally { clearTimeout(to); }
+      } else {
+        const r = await req.get(leg.u, { headers, timeout: leg.ms });
+        status = r.status || 0;
+        body = (r && r.data != null) ? String(r.data) : '';
+      }
+      if (!body || isChallengeHtml(body)) return null;
+      if (leg.kind === 'md' && !isJinaMd(body)) return null;
+      if (status === 200) return { body, kind: leg.kind, via: leg.via };
+    } catch (e) { /* ignore, other legs race on */ }
+    return null;
+  })());
+  const won = await firstSuccess(jobs, 20500);
+  if (won) { lastFetch.kind = won.kind; lastFetch.via = won.via; return won.body; }
+  lastFetch.kind = 'html'; lastFetch.via = '';
   return '';
+}
+
+async function getHtml(path) {
+  return getPage(path);
 }
 
 // 字幕芯取数原语（与 py_mogu 一致）：统一回 {status, body}
@@ -157,6 +225,116 @@ function parseCards(html, host) {
     }
   }
   return out;
+}
+
+// ---------------- jina Markdown 解析分支（v2） ----------------
+// jina 把站方 HTML 转成 Markdown：卡片是图链 + 文链两个锚点共用同一详情 URL，
+//   图链：[![Image N: <完整标题> 封面](<picture.avking.xyz 图>)](<详情 URL> "<完整标题>")
+//   文链：### [**<番号>** <完整标题>](<详情 URL> "<完整标题>")
+// 封面以 Markdown 图片形式保留（_s.webp/_thumbnail.webp 直链）；时长/徽标在图链后
+//   约 400 字符内（“無碼·中字”徽标行、02:10 这类时长行）；分页链接 jina 不保留，
+//   翻页仍按已知 URL 模式（/menu/<m>/5-2-<页>、?page=<页>），总数从 Title 行取。
+// 注意：jina 详情页剥 script/iframe，无 payload、无 JSON-LD，见 parseDetailMd。
+function mdNormDur(s) {
+  return String(s || '').replace(/\s*:\s*/g, ':');
+}
+
+function parseCardsMd(md, host) {
+  const text = String(md || '');
+  const byUrl = new Map();
+  // 外层 Markdown 链接：[文字](URL "标题")；图链的文字本身是 ![alt](pic)
+  const re = /\[((?:!\[[^\]]*\]\([^)]*\)|[^\]]*))\]\((https?:\/\/[^)\s"]+\/movie\/detail\/[^)\s"]+\.html)(?:\s+"([^"]*)")?\)/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    const outer = m[1] || '';
+    const abs = m[2].trim();
+    const titleAttr = (m[3] || '').trim();
+    const vUrl = abs.replace(/^https?:\/\/[^/]+/, '');
+    let it = byUrl.get(vUrl);
+    if (!it) { it = { vod_id: vUrl, vod_name: '', vod_pic: '', vod_remarks: '' }; byUrl.set(vUrl, it); }
+    if (outer.indexOf('![') === 0) {
+      const picM = outer.match(/!\[[^\]]*\]\(([^)]+)\)/);
+      const altM = outer.match(/!\[([^\]]*)\]/);
+      if (picM && picM[1] && !it.vod_pic) it.vod_pic = normUrl(picM[1].trim().startsWith('http') ? picM[1].trim() : absUrl(picM[1].trim(), host));
+      const cand = titleAttr || (altM ? cleanLabel(altM[1]).replace(/\s*封面\s*$/, '') : '');
+      if (cand && cand.length > it.vod_name.length) it.vod_name = cand;
+    } else {
+      const cand = titleAttr || cleanLabel(outer.replace(/\*\*/g, ''));
+      if (cand && cand.length > it.vod_name.length) it.vod_name = cand;
+    }
+    if (!it.vod_remarks) {
+      const win = text.slice(m.index + m[0].length, m.index + m[0].length + 400);
+      const durM = win.match(/(\d{1,2}\s*:\s*\d{2}(?::\s*\d{2})?)/);
+      if (durM) it.vod_remarks = mdNormDur(durM[1]);
+      else {
+        const badgeM = win.match(/(無碼·中字|無碼破解|無碼|中文字幕)/);
+        if (badgeM) it.vod_remarks = badgeM[1];
+      }
+    }
+  }
+  const out = [];
+  for (const it of byUrl.values()) {
+    if (it.vod_pic || it.vod_name) {
+      if (!it.vod_name) it.vod_name = '精彩视频';
+      out.push(it);
+    }
+  }
+  return out;
+}
+
+// jina 详情 Title 行：“第1頁 共29039部”这类总数；无则回 null
+function mdPageTotal(md) {
+  const t = String(md || '').match(/^Title: (.*)$/m);
+  if (!t) return null;
+  const m = t[1].match(/第(\d+)頁\s*共(\d+)部/);
+  if (!m) return null;
+  return { page: parseInt(m[1], 10), total: parseInt(m[2], 10) };
+}
+
+function parseDetailMd(md, rawId, durl) {
+  const text = String(md || '');
+  let title = '';
+  const tM = text.match(/^Title: (.*)$/m);
+  if (tM) title = cleanLabel(tM[1]).replace(/\s*\|\s*Javrate\s*$/i, '').trim();
+  if (!title) {
+    const hM = text.match(/^# \*\*([^*]+)\*\*(.*)$/m);
+    if (hM) title = cleanLabel(hM[1] + hM[2]);
+  }
+  if (!title) title = '精彩视频';
+  subCacheName(durl, title);
+  // 封面：_m.webp 大图优先（jina 详情 Image 15），退回任一 picture.avking.xyz 图
+  let posterPic = '';
+  const mPosters = text.match(/https:\/\/picture\.avking\.xyz[^)\s"<>]+?_m\.webp/g);
+  if (mPosters && mPosters.length) posterPic = mPosters[0];
+  if (!posterPic) {
+    const anyPic = text.match(/https:\/\/picture\.avking\.xyz[^)\s"<>]+?\.webp/g);
+    if (anyPic && anyPic.length) posterPic = anyPic[0];
+  }
+  let code = '';
+  const codeM = text.match(/\n番號\n\n([A-Z0-9][A-Z0-9\- ]*)\n/);
+  if (codeM) code = codeM[1].trim();
+  if (!code) code = subExtractCode(title) || '';
+  let dur = '';
+  const durM = text.match(/(\d{1,2}\s*:\s*\d{2}\s*:\s*\d{2})/);
+  if (durM) dur = mdNormDur(durM[1]);
+  let desc = '';
+  const descM = text.match(/影片劇情\n\n([\s\S]*?)(?:\n\n展開全文|\n## 出演女優|$)/);
+  if (descM) {
+    desc = clean(descM[1].replace(/\[([^\]]*)\]\([^)]*\)/g, '$1').replace(/^【在綫觀看】[^\n]*\n?/, ''));
+  }
+  // jina 剥 script/iframe：详情 Markdown 里没有 /player/v2?payload=，也没有 JSON-LD
+  // contentUrl，故不出播单（play_url 为空，App 不会进 play，也就不会转圈）。
+  return {
+    list: [{
+      vod_id: rawId,
+      vod_name: title,
+      vod_pic: posterPic,
+      vod_remarks: code ? (code + (dur ? ' · ' + dur : '')) : 'HD',
+      vod_content: desc || 'JavRate',
+      vod_play_from: 'JavRate',
+      vod_play_url: '',
+    }],
+  };
 }
 
 
@@ -523,7 +701,10 @@ async function home() {
   const classes = [{ type_id: 'new', type_name: '最新更新' }];
   for (const c of CATS) classes.push({ type_id: c.id, type_name: c.name });
   let list = [];
-  try { list = parseCards(await getHtml('/'), HOST).slice(0, 30); } catch (e) { list = []; }
+  try {
+    const html = await getHtml('/');
+    list = (lastFetch.kind === 'md' ? parseCardsMd(html, HOST) : parseCards(html, HOST)).slice(0, 30);
+  } catch (e) { list = []; }
   return { class: classes, filters: {}, list };
 }
 
@@ -533,14 +714,19 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!tid || tid === 'new') {
     const html = await getHtml('/movie/new');
-    return { page: 1, pagecount: 1, list: parseCards(html, HOST) };
+    return { page: 1, pagecount: 1, list: lastFetch.kind === 'md' ? parseCardsMd(html, HOST) : parseCards(html, HOST) };
   }
   const cat = CAT_MAP[tid];
   if (!cat) return { page, pagecount: page, list: [] };
   const html = await getHtml(catUrl(cat, page));
-  const list = parseCards(html, HOST);
-  const hasNext = page === 1 ? list.length > 0 : list.length > 0;
-  return { page, pagecount: hasNext ? page + 1 : page, list };
+  const list = lastFetch.kind === 'md' ? parseCardsMd(html, HOST) : parseCards(html, HOST);
+  // jina 腿：总数从 Title 行取（“第X頁 共Y部”），pagecount 直接算出；HTML 腿沿用 v1 口径
+  let pagecount = list.length > 0 ? page + 1 : page;
+  if (lastFetch.kind === 'md') {
+    const tot = mdPageTotal(html);
+    if (tot && tot.total > 0 && list.length > 0) pagecount = Math.ceil(tot.total / list.length);
+  }
+  return { page, pagecount, list };
 }
 
 async function search(reqIn) {
@@ -548,7 +734,7 @@ async function search(reqIn) {
   const kw = String(body.wd || '').trim();
   if (!kw) return { list: [] };
   const html = await getHtml('/search/' + encodeURIComponent(kw));
-  return { page: 1, pagecount: 1, list: parseCards(html, HOST) };
+  return { page: 1, pagecount: 1, list: lastFetch.kind === 'md' ? parseCardsMd(html, HOST) : parseCards(html, HOST) };
 }
 
 function extractPayload(html) {
@@ -568,6 +754,7 @@ async function detail(reqIn) {
   const durl = rawId.startsWith('http') ? rawId : HOST + rawId;
   const html = await getHtml(rawId);
   if (!html) return { list: [] };
+  if (lastFetch.kind === 'md') return parseDetailMd(html, rawId, durl);
   let mainTitle = extractLd(html, 'name');
   if (!mainTitle) {
     const tM = html.match(/<title>(.*?)<\/title>/i);
@@ -604,8 +791,10 @@ async function detail(reqIn) {
 }
 
 async function resolveSignedMaster(durl, payload) {
-  // 现取 player v2（Referer 必须为详情页），抽签名 master；master 内含 720p/1080p 两档（首个样本实测），
-  // 但返回 master 本身（自适应），不在此虚构分档选单；分片仍需 token（见文件头），App 内播通与否未经证实。
+  // 现取 player v2（Referer 必须为详情页），抽签名 master；master 内含 720p/1080p 两档（首个样本实测）。
+  // 注意：jina 腿取 player 页会剥 script，master 链接大概率不在 Markdown 里；HTML 腿活着时
+  // 竞速会先赢，仍走老路。/player/v2 在 v1 里就是 GET，不走 POST（POST 透传 11-08 实测：
+  // Worker /f POST 同样 403 验证页、直连 POST 20s 超时，两腿在到达站方前就死，无法验证）。
   const playerHtml = await getHtml('/player/v2?payload=' + encodeURIComponent(payload));
   if (!playerHtml) return '';
   const found = [];
@@ -618,23 +807,65 @@ async function resolveSignedMaster(durl, payload) {
   return found.length ? found[0] : '';
 }
 
+// 自适应 master 播单拆两档：#EXT-X-STREAM-INF 的 RESOLUTION 行 + 下一行 URI。
+// URI 可能是相对路径（带 token 查询串），按 master URL 解析成绝对地址。
+function parseMasterVariants(masterText, masterUrl) {
+  const lines = String(masterText || '').split(/\r?\n/);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const inf = lines[i].match(/#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)x(\d+)/);
+    if (!inf) continue;
+    const uri = (lines[i + 1] || '').trim();
+    if (!uri || uri.startsWith('#')) continue;
+    let abs = uri;
+    try { abs = new URL(uri, masterUrl).toString(); } catch (e) { /* 保持原样 */ }
+    out.push({ height: parseInt(inf[2], 10), label: inf[2] + 'p', url: abs });
+  }
+  return out;
+}
+
+const PLAY_DIAG_NO_PAYLOAD = 'JavRate 播放失败：详情页里没有播放参数（jina 会剥掉播放器脚本，直连与 Worker 腿又被站方验证墙拦住），铸不出签名播单。列表与详情可看，播放需等墙松。';
+const PLAY_DIAG_NO_MASTER = 'JavRate 播放失败：拿到播放参数但铸不出签名播单（/player/v2 被站方验证墙拦住），请稍后再试，不要反复点播。';
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (id.includes('$')) id = id.split('$').pop();
-  if (!id) return { parse: 0, url: '' };
+  if (!id) return { parse: 0, url: '', msg: PLAY_DIAG_NO_PAYLOAD };
   let durl = '';
   let payload = id;
   const at = id.indexOf('@@');
   if (at >= 0) { durl = id.slice(0, at); payload = id.slice(at + 2); }
-  if (!payload) return { parse: 0, url: '' };
+  if (!payload) return { parse: 0, url: '', msg: PLAY_DIAG_NO_PAYLOAD };
   // 字幕按条目接：仅当标题含番号才搜，否则不带 subs 键（与模板同一口径）
   const title = subNameCache.get(durl) || '';
   const code = subExtractCode(title) || subExtractCode(durl);
   const subsP = code ? subSearchAll(durl).catch(() => []) : Promise.resolve([]);
   let target = '';
-  try { target = await resolveSignedMaster(durl, payload); } catch (e) { target = ''; }
-  if (!target) {
+  let variants = [];
+  let playerKind = 'html';
+  try {
+    const master = await resolveSignedMaster(durl, payload);
+    playerKind = lastFetch.kind;
+    if (master) {
+      target = master;
+      // master 到手拆两档：取 master 播单文本，1080p 优先、720p 其次、都无则回自适应 master。
+      // 分片仍需 token（见文件头），App 内播通与否未经证实——此步只解决“出哪档”，不保证播通。
+      try {
+        const mr = await reqRaw(master, { 'User-Agent': UA, 'Referer': durl || (HOST + '/') }, 8000);
+        if (mr.status === 200 && mr.body && mr.body.indexOf('#EXTM3U') >= 0) {
+          variants = parseMasterVariants(mr.body, master);
+          const v1080 = variants.find((v) => v.height === 1080);
+          const v720 = variants.find((v) => v.height === 720);
+          if (v1080) target = v1080.url;
+          else if (v720) target = v720.url;
+        }
+      } catch (e) { /* 分档失败不致命，回自适应 master */ }
+    }
+  } catch (e) { target = ''; }
+  if (!target && playerKind === 'html') {
+    // 兜底只在 HTML 腿时尝试：jina Markdown 里没有 JSON-LD contentUrl，再取一次详情
+    // 也拿不到裸清单，只会白白多等一轮 jina（最长 20s），直接跳过。
     // 兜底：详情 JSON-LD 的裸清单（已知取数 403，仅作“非空”保底，不宣称可播）
     try {
       const html = await getHtml(durl.startsWith('http') ? durl : durl);
@@ -643,6 +874,8 @@ async function play(reqIn) {
     } catch (e) { /* ignore */ }
   }
   const result = { parse: 0, url: target, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+  if (variants.length) result.variants = variants;
+  if (!target) result.msg = PLAY_DIAG_NO_MASTER;
   const subs = await subsP;
   if (subs && subs.length) result.subs = subs;
   return result;
