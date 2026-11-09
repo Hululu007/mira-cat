@@ -415,7 +415,12 @@ async function play(reqIn) {
   // 2026-11-10 晚：不直接包 m3u8 地址（长 URL + auth_key 会过期导致播放器
   // “视频加载失败”），改返回 Worker 短地址 /play.m3u8?series=&ep=，
   // 播放器点开时 Worker 现调接口取新鲜 m3u8 再改写返回。
-  const apiM = raw.match(/\/duanju\/(\d+)-[^/]+\/(\d+)\/?/);
+  // 2026-11-10：play() 的 API 正则之前只认 /duanju/，/manju/、/zhenrenju/、
+  // /shipin/ 三个频道的集链接匹配不上，跳过播放接口、回落到空的 current.src，
+  // 返回 parse:1“视频加载失败”。播放接口本身与频道无关（POST /api/videos/{id}/
+  // episodes/{n}/playback，manju/zhenrenju/shipin 实测均回 streams.main），
+  // 故正则改为认任意频道。
+  const apiM = raw.match(/\/[^/]+\/(\d+)-[^/]+\/(\d+)\/?/);
   if (apiM && FETCH_WORKER) {
     return { parse: 0, url: FETCH_WORKER + '/play.m3u8?series=' + apiM[1] + '&ep=' + apiM[2], header: { 'User-Agent': UA, Referer: raw.startsWith('http') ? raw : HOST + '/' } };
   }
