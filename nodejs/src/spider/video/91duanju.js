@@ -412,7 +412,13 @@ async function play(reqIn) {
   // 2026-11-10 修“视频加载失败”：详情页 "current" 的 src 为空，真 m3u8 只在
   // POST /api/videos/{seriesId}/episodes/{ep}/playback 里（streams.main），
   // 匿名即可调用；先走 API，失败再回落原来的 HTML 抓取。
+  // 2026-11-10 晚：不直接包 m3u8 地址（长 URL + auth_key 会过期导致播放器
+  // “视频加载失败”），改返回 Worker 短地址 /play.m3u8?series=&ep=，
+  // 播放器点开时 Worker 现调接口取新鲜 m3u8 再改写返回。
   const apiM = raw.match(/\/duanju\/(\d+)-[^/]+\/(\d+)\/?/);
+  if (apiM && FETCH_WORKER) {
+    return { parse: 0, url: FETCH_WORKER + '/play.m3u8?series=' + apiM[1] + '&ep=' + apiM[2], header: { 'User-Agent': UA, Referer: raw.startsWith('http') ? raw : HOST + '/' } };
+  }
   if (apiM) {
     const apiUrl = HOST + '/api/videos/' + apiM[1] + '/episodes/' + apiM[2] + '/playback';
     const j = await postJson(apiUrl, {
