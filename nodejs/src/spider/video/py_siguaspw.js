@@ -44,6 +44,10 @@ const HOST = 'https://siguaspw.cc';
 const KEY = 'py_siguaspw';
 const SITE_FETCH = 'https://site-fetch.li768435813.workers.dev';
 const WORKER = 'https://siguaspw-hls.li768435813.workers.dev';
+// 2026-11-10：封面走 sigua-img-proxy Worker 代取（封面直链 dfdf.tjacq.com 在
+// 用户手机上加载不出：站方回 Content-Type: text/base64.jpg 且 URL 无扩展名，
+// 播放器图片加载器不认；Worker 代取后以 image/jpeg + .jpg 后缀返回）。
+const IMG_PROXY = 'https://sigua-img-proxy.li768435813.workers.dev';
 // d22 备用线分片宿主已死（2026-11-08 直连与经 Worker 均拉不到分片）；有其他可播线时跳过它。
 const DEAD_LINE_HOSTS = ['d22m1nnedmviq9.cloudfront.net'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
@@ -73,6 +77,12 @@ function absUrl(u, host) {
   if (u.startsWith('//')) return 'https:' + u;
   if (u.startsWith('/')) return host + u;
   return u;
+}
+
+function proxyCover(u) {
+  const s = String(u || '').trim();
+  if (!s || !/^https?:\/\//i.test(s)) return s;
+  return IMG_PROXY + '/cover.jpg?u=' + encodeURIComponent(s);
 }
 
 function normUrl(u) {
@@ -148,7 +158,7 @@ function parseCards(html, host) {
     let it = byUrl.get(vUrl);
     if (!it) { it = { vod_id: vUrl, vod_name: '', vod_pic: '', vod_remarks: '' }; byUrl.set(vUrl, it); }
     const pic = extractPic(inner);
-    if (pic && !it.vod_pic) it.vod_pic = normUrl(pic.startsWith('http') ? pic : absUrl(pic, host));
+    if (pic && !it.vod_pic) it.vod_pic = proxyCover(normUrl(pic.startsWith('http') ? pic : absUrl(pic, host)));
     const txt = cleanLabel(inner);
     if (txt && txt.length > 2 && !it.vod_name) it.vod_name = txt;
     const durM = inner.match(/(\d{1,2}:\d{2}(?::\d{2})?)/);
@@ -945,7 +955,7 @@ async function detail(reqIn) {
     list: [{
       vod_id: rawId,
       vod_name: mainTitle,
-      vod_pic: posterPic,
+      vod_pic: proxyCover(posterPic),
       vod_remarks: !lines.length ? '已失效' : (isPreview ? '预览·约10秒' : 'HD'),
       vod_content: '丝瓜视频',
       vod_play_from: from,
