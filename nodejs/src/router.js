@@ -18,7 +18,6 @@ import chigua57 from './spider/video/chigua57.js';
 import feiye from './spider/video/feiye.js';
 import supjav from './spider/video/supjav.js';
 import hl818 from './spider/video/hl818.js';
-import upload5 from './spider/video/upload5.js';
 import getav from './spider/video/getav.js';
 import koreanbj from './spider/video/koreanbj.js';
 import duanju91 from './spider/video/91duanju.js';
@@ -154,7 +153,6 @@ const spiders = [
     madou,
     mrds,
     mitao,
-    upload5,
     mogu,
     noodle,
     one,
