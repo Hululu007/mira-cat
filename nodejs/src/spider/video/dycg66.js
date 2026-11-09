@@ -91,8 +91,9 @@ function parseDetail(html, rawId) {
     }
     if (!url) continue;
     url = url.replace(/\\u0026/g, '&');
-    const tm = attrs.match(/data-video_title="([^"]*)"/i);
-    eps.push({ name: tm ? stripTags(tm[1]) : '', url });
+    // 2026-11-10：集名改短编号（之前用 data-video_title 近 40 字完整标题，集数网格
+    // 看起来像重复长文本）；完整标题已在详情 vod_name 里
+    eps.push({ name: '第' + (eps.length + 1) + '集', url });
   }
   let pic = '';
   const dm = html.match(/<div class="dplayer"[^>]*data-config="([^"]*)"/i);
@@ -110,7 +111,8 @@ function parseDetail(html, rawId) {
   let playFrom = '91大赛';
   const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
   if (eps.length === 1) {
-    playUrl = ('播放$' + wrapEp(eps[0].url)) + '$$$' + ('播放$' + eps[0].url);
+    // 2026-11-10：单集也显示为明确的分集“正片”，而不是一个“播放”按钮
+    playUrl = ('正片$' + wrapEp(eps[0].url)) + '$$$' + ('正片$' + eps[0].url);
     playFrom = '91大赛·中转$$$91大赛·直连';
   } else if (eps.length > 1) {
     const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
@@ -118,7 +120,8 @@ function parseDetail(html, rawId) {
     playUrl = relay + '$$$' + direct;
     playFrom = '91大赛·中转$$$91大赛·直连';
   } else playUrl = '未找到视频源$' + rawId;
-  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_play_from: playFrom, vod_play_url: playUrl };
+  // 2026-11-10：补集数备注，否则 App 不显示集数
+  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_remarks: eps.length ? '共' + eps.length + '集' : '', vod_play_from: playFrom, vod_play_url: playUrl };
 }
 
 async function init() { return {}; }

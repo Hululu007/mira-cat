@@ -283,6 +283,32 @@ async function play(reqIn) {
     const relay = await relayM3u8(raw);
     return { parse: 0, url: relay || raw, header: { 'User-Agent': UA, Referer: HOST + '/' } };
   }
+  // 2026-11-10 修“视频加载失败”：详情页 "current" 的 src 为空，真 m3u8 只在
+  // POST /api/videos/{seriesId}/episodes/{ep}/playback 里（streams.main），
+  // 匿名即可调用；先走 API，失败再回落原来的 HTML 抓取。
+  const apiM = raw.match(/\/duanju\/(\d+)-[^/]+\/(\d+)\/?/);
+  if (apiM) {
+    try {
+      const apiUrl = HOST + '/api/videos/' + apiM[1] + '/episodes/' + apiM[2] + '/playback';
+      const { data } = await req.post(apiUrl, {}, {
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'User-Agent': UA,
+          Referer: raw.startsWith('http') ? raw : HOST + '/',
+        },
+        timeout: 15000,
+      });
+      const j = typeof data === 'string' ? JSON.parse(data) : data;
+      const main = j && j.status === 1 && j.data && j.data.streams && j.data.streams.main;
+      if (main) {
+        let m3u8Url = String(main).replace(/\\u0026/g, '&');
+        if (m3u8Url.startsWith('//')) m3u8Url = 'https:' + m3u8Url;
+        const relay = await relayM3u8(m3u8Url);
+        return { parse: 0, url: relay || m3u8Url, header: { 'User-Agent': UA, Referer: raw } };
+      }
+    } catch (e) {}
+  }
   const html = await fetchHtml(raw, HOST + '/');
   if (!html) return { parse: 1, url: raw };
 

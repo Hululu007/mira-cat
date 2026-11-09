@@ -99,14 +99,17 @@ function extractEps(html) {
 }
 
 // V2 双集 (中转组只包 .m3u8, 直连组全直链; 假线路无视频时保持单源原样)。
+// 2026-11-10：直连放第一线（中转放第二线保底）。之前中转在前时，Railway 免费档
+// 冷启动会让播放器建时间轴不可靠，出现“不从头播、无法快进”；直连若在个别手机上
+// 被拦，可手动切第二线“91吃瓜·中转”。
 function buildPlayUrl(eps, rawId) {
   const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
   if (eps.length === 1) {
-    return { playUrl: ('播放$' + wrapEp(eps[0].url)) + '$$$' + ('播放$' + eps[0].url), playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
+    return { playUrl: ('播放$' + eps[0].url) + '$$$' + ('播放$' + wrapEp(eps[0].url)), playFrom: '91吃瓜·直连$$$91吃瓜·中转' };
   } else if (eps.length > 1) {
-    const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
     const direct = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
-    return { playUrl: relay + '$$$' + direct, playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
+    const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
+    return { playUrl: direct + '$$$' + relay, playFrom: '91吃瓜·直连$$$91吃瓜·中转' };
   }
   return { playUrl: '未找到视频源$' + rawId, playFrom: '91吃瓜' };
 }
@@ -117,11 +120,12 @@ function buildPlayUrl(eps, rawId) {
 // 两次都空仍按主干形态交出 (不断线、不改成无线路)。
 // 注意: 只探 m3u8 清单, 绝不探 mp4 (getText 会把整段视频读进内存);
 // 假线路 (无视频) 不探, 原样交出。
+// 2026-11-10 提速：原来逐个顺序探每集 m3u8（每集约 40KB），多集文章要等很多轮
+// HTTP 才返回；改成 Promise.all 并发探，逻辑不变（空体才重拉详情拿新 token）。
 async function probeEps(eps, articleUrl) {
   const idxs = eps.map((e, i) => (/\.m3u8/i.test(e.url) ? i : -1)).filter((i) => i >= 0);
   if (!idxs.length) return eps;
-  const lens = [];
-  for (const i of idxs) lens.push((await getText(eps[i].url, HOST)).length);
+  const lens = await Promise.all(idxs.map((i) => getText(eps[i].url, HOST).then((s) => s.length).catch(() => -1)));
   if (!lens.some((n) => n === 0)) return eps;
   const html2 = await getText(articleUrl, HOST);
   if (!html2) return eps;
@@ -138,17 +142,18 @@ async function probeEps(eps, articleUrl) {
   return out;
 }
 
-function parseDetail(html, rawId) {
+function parseDetail(html, rawId, epsIn) {
   const hm = html.match(/<h1[^>]*>([\s\S]{0,400}?)<\/h1>/i);
   const title = hm ? stripTags(hm[1]) : '91吃瓜';
-  const eps = extractEps(html);
+  const eps = epsIn || extractEps(html);
   let pic = '';
   // 详情封面在 <meta itemprop="image" content="https://pic.hdhwqx.cn/...">（与列表卡封面同一张）
   const pm = html.match(/<meta itemprop="image" content="([^"]+)"/i)
     || html.match(/loadBannerDirect\('([^']+)'/i);
   if (pm) pic = proxyPic(pm[1]);
   const { playUrl, playFrom } = buildPlayUrl(eps, rawId);
-  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_play_from: playFrom, vod_play_url: playUrl };
+  // 2026-11-10：补集数备注，否则 App 不显示集数
+  return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_remarks: eps.length ? '共' + eps.length + '集' : '', vod_play_from: playFrom, vod_play_url: playUrl };
 }
 
 async function init() { return {}; }
@@ -201,14 +206,16 @@ async function detail(reqIn) {
   for (const raw of ids.filter(Boolean)) {
     const url = /^https?:\/\//i.test(raw) ? raw : HOST + String(raw).replace(/^\/+/, '');
     const html = await getText(url, HOST);
-    const base = parseDetail(html, raw);
-    // 探针在直链清单上跑, 双集按探后结果重建 (假线路无 m3u8, probeEps 原样返回)。
+    // 2026-11-10：extractEps 只调一次，parseDetail 与 probe 共用同一份 eps
     const eps = extractEps(html);
+    const base = parseDetail(html, raw, eps);
+    // 探针在直链清单上跑, 双集按探后结果重建 (假线路无 m3u8, probeEps 原样返回)。
     const probed = await probeEps(eps, url);
     if (probed !== eps) {
       const { playUrl, playFrom } = buildPlayUrl(probed, raw);
       base.vod_play_url = playUrl;
       base.vod_play_from = playFrom;
+      base.vod_remarks = probed.length ? '共' + probed.length + '集' : base.vod_remarks;
     }
     list.push(base);
   }

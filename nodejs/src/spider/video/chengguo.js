@@ -215,8 +215,15 @@ async function detail(reqIn) {
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
+  // 2026-11-10 修“无法播放”：App 有时会把 "第N集${...}" 整段传回，裸 JSON.parse
+  // 会抛错导致返回空地址；先剥掉集名前缀再解析，解析失败再用正则抠 path
+  const dollar = id.indexOf('$');
+  const jsonPart = dollar >= 0 ? id.slice(dollar + 1) : id;
   let payload = null;
-  try { payload = JSON.parse(id); } catch (e) {}
+  try { payload = JSON.parse(jsonPart); } catch (e) {
+    const m = id.match(/\{[^}]*"path"\s*:\s*"[^"]+"/);
+    if (m) { try { payload = JSON.parse(m[0] + '}'); } catch (e2) {} }
+  }
   if (!payload || !payload.path) return { parse: 0, url: '' };
   const url = await resolvePlay(payload.path);
   if (!url) return { parse: 0, url: '' };

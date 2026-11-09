@@ -5,6 +5,7 @@ import kanav from './spider/video/kanav.js';
 import taiav from './spider/video/taiav.js';
 import rou from './spider/video/rou.js';
 import madou from './spider/video/madou.js';
+import mitao from './spider/video/mitao.js';
 import pornhub from './spider/video/pornhub.js';
 import ppp from './spider/video/ppp.js';
 import xvideos from './spider/video/xvideos.js';
@@ -152,6 +153,7 @@ const spiders = [
     lissav,
     madou,
     mrds,
+    mitao,
     upload5,
     mogu,
     noodle,
