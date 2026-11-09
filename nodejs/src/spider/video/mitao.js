@@ -210,8 +210,12 @@ function splitCat(raw) {
 function coverOf(item) {
   const u = t(item && (item.cover_n || item.cover || ''));
   if (!u) return '';
-  if (u.indexOf('://') !== -1) return u;
-  return u.charAt(0) === '/' ? BASE + u : u;
+  let abs = u;
+  if (u.indexOf('://') === -1) abs = u.charAt(0) === '/' ? BASE + u : BASE + '/' + u;
+  // 2026-11-10：封面直连 honeypeach.cc 在用户手机上加载不出（站方拦设备出口）。
+  // 封面走 mitao-handshake Worker 代取（Worker 须为全接口代理版，允许 /cover/*）。
+  if (HS_WORKER) return HS_WORKER + '/?u=' + encodeURIComponent(abs);
+  return abs;
 }
 
 async function fetchModule(key, catTriple, page) {
@@ -377,8 +381,48 @@ async function detail(reqIn) {
 }
 
 function extractFanhao(text) {
-  const m = t(text).match(/([a-zA-Z]{2,6})-?(\d{2,6})/);
+  const s = t(text);
+  // FC2：FC2-PPV-1234567（7 位数字），旧正则会误切成 ppv-500565 导致播不了
+  const fc = s.match(/fc2-ppv-(\d{6,7})/i);
+  if (fc) return 'fc2-ppv-' + fc[1];
+  const m = s.match(/([a-zA-Z]{2,6})-?(\d{2,6})/);
   return m ? (m[1] + '-' + m[2]).toLowerCase() : '';
+}
+
+// 视频类播放：对照已确认可播的 mira-cat MissAV 蜘蛛，不走 missav-emby Worker
+// 改写清单（Worker 清单 4516 段/5 小时、从头播与快进异常），改走直连：
+// 取 missav 详情页，提 UUID 与 CDN host，返回 720p 直链（1080p 多为 AV1，iOS 播不了）。
+// 直连失败再回落 Worker。
+// 2026-11-10：missav slug 就是 API 返回的原始 id（如 n1854、110326_001、
+// caribbeancom-110726-001），不要用 extractFanhao 再切——旧正则会把
+// caribbeancom 切成 eancom、n1854/110326_001 直接提不出，导致东京热/一本道/加勒比播不了。
+// 先试原始 id，再试提取出的番号。
+async function missavDirect720(rawVid, code) {
+  const candidates = [];
+  const v = t(rawVid).toLowerCase();
+  if (v) candidates.push(v);
+  const c = t(code).toLowerCase();
+  if (c && c !== v) candidates.push(c);
+  for (const slug of candidates) {
+    const pageUrl = 'https://missav.fans/cn/' + encodeURIComponent(slug);
+    let html = '';
+    try {
+      const { data } = await req.get(pageUrl, {
+        headers: { 'User-Agent': UA, Referer: 'https://missav.fans/', Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+        timeout: 20000,
+      });
+      html = typeof data === 'string' ? data : '';
+    } catch (e) {
+      continue;
+    }
+    if (!html) continue;
+    const uuidM = html.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+    if (!uuidM) continue;
+    const hostM = html.match(/https?:\/\/(surrit\.[^\/\\"']+)/);
+    const host = hostM ? hostM[1].replace(/\\/g, '') : 'surrit.mrstcdn.store';
+    return 'https://' + host + '/' + uuidM[0] + '/720p/video.m3u8';
+  }
+  return '';
 }
 
 async function play(reqIn) {
@@ -394,11 +438,17 @@ async function play(reqIn) {
   if (!k || !vid) return { parse: 0, url: '' };
   const headers = { 'User-Agent': UA, Referer: BASE + '/' };
 
-  // missav 来源：只给 Worker 代理的 720p 一条线
+  // missav 来源：先走直连 720p（对照 MissAV 蜘蛛，从头播、可快进），失败再回落 Worker
   if (k === 'video' || s === 'missav') {
     const code = extractFanhao(vid) || extractFanhao(parts.slice(5).join('|'));
+    const direct = await missavDirect720(vid, code);
+    if (direct) return { parse: 0, url: direct, header: headers };
     if (code) {
       return { parse: 0, url: MISSAV_WORKER + '/missav?code=' + encodeURIComponent(code), header: headers };
+    }
+    // 番号提不出也别回空：用原始 id 走 Worker 试一次
+    if (vid) {
+      return { parse: 0, url: MISSAV_WORKER + '/missav?code=' + encodeURIComponent(vid), header: headers };
     }
   }
 
