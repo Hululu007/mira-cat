@@ -212,6 +212,8 @@ function splitVid(raw) {
 }
 
 async function home() {
+  // 2026-11-10：用户纠正——猫源里的蜜桃就是三级片那个，只留视频（成人片）分类，
+  // 短剧/擦边/动漫/黑料/国产这些不要（之前 24 个分类里混了太多非三级片内容）
   return {
     class: [
       { type_id: 'video|new|missav|', type_name: '最近更新' },
@@ -227,17 +229,6 @@ async function home() {
       { type_id: 'video|caribbeancom|missav|', type_name: '加勒比' },
       { type_id: 'video|today-hot|missav|', type_name: '今日热门' },
       { type_id: 'video|weekly-hot|missav|', type_name: '本周热门' },
-      { type_id: 'duanju|tuijian|huangguo|0', type_name: '短剧推荐' },
-      { type_id: 'duanju|all|huangguo|0', type_name: '短剧精选' },
-      { type_id: 'duanju|chiguo|huangguo|0', type_name: '赤果短剧' },
-      { type_id: 'duanju|zhenren|huangguo|0', type_name: '真人短剧' },
-      { type_id: 'duanju|duanju|huangguo|0', type_name: 'AI成人短剧' },
-      { type_id: 'duanju|manju|huangguo|0', type_name: 'AI成人漫剧' },
-      { type_id: 'duanju|rank|huangguo|0', type_name: '短剧排行' },
-      { type_id: 'caibian|0|huangdou|0', type_name: '擦边短剧' },
-      { type_id: 'shortv|all|dongman|0', type_name: '蜜桃动漫' },
-      { type_id: 'heiliao|0|huangdou|0', type_name: '黑料吃瓜' },
-      { type_id: 'guochan|||', type_name: '国产精品' },
     ],
     filters: {},
   };
@@ -264,7 +255,8 @@ async function search(reqIn) {
   const wd = t(body.wd);
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!wd) return { list: [], page, pagecount: page, limit: PAGE_SIZE, total: 0 };
-  const keys = ['video', 'duanju', 'shortv', 'guochan', 'caibian'];
+  // 2026-11-10：只搜三级片（video 分类），不搜短剧/动漫等
+  const keys = ['video'];
   const merged = [];
   const seen = {};
   for (const key of keys) {
