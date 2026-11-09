@@ -11,6 +11,11 @@ const UA =
 const PAGE_SIZE = 20;
 // 封面为 AES-128-CBC 加密存储（与 818/八卦同一套密钥），需走用户自建解密 Worker
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev';
+// 2026-11-10：取页/API 中转 Worker（Cloudflare 边缘代取 91 站页面与接口）。
+// 站方走 Cloudflare，设备侧（VPN 出口）直连会被拦/返回空页，表现为“暂无数据”
+// 与“载入失败：网络…”；Worker 先行、失败回落直连。Worker 需用户部署
+// （duanju91-fetch.li768435813.workers.dev），未部署前行为与原来一致。
+const FETCH_WORKER = 'https://duanju91-fetch.li768435813.workers.dev';
 
 function t(v) {
   return String(v == null ? '' : v).trim();
@@ -33,11 +38,62 @@ function headers(referer) {
 }
 
 async function fetchHtml(url, referer) {
+  // 2026-11-10：先走 Worker（Cloudflare 边缘代取），拿到真页面才用；
+  // Worker 未部署时请求会落到 Cloudflare 错误页（404 但正文近 20KB），
+  // 故必须校验内容是真站页（有链接、非错误标题），否则回落直连。
+  if (FETCH_WORKER) {
+    try {
+      const { data } = await req.get(FETCH_WORKER + '/?u=' + encodeURIComponent(url), { headers: headers(referer), timeout: 20000 });
+      const html = String(data || '');
+      if (isRealPage(html)) return html;
+    } catch (e) {}
+  }
   try {
     const { data } = await req.get(url, { headers: headers(referer), timeout: 20000 });
     return String(data || '');
   } catch (e) {
     return '';
+  }
+}
+
+// 校验 Worker 回来的内容是不是真站页（而非 Cloudflare 错误页）
+function isRealPage(text) {
+  if (!text || text.length < 100) return false;
+  try {
+    const j = JSON.parse(text);
+    if (j && typeof j === 'object') {
+      if (typeof j.type === 'string' && j.type.includes('developers.cloudflare.com')) return false;
+      if (j.status != null || j.data != null || j.items != null) return true;
+      return false;
+    }
+  } catch (e) {}
+  if (text.length < 500) return false;
+  if (/error code:/i.test(text)) return false;
+  if (/Just a moment/i.test(text)) return false;
+  const tm = text.match(/<title>([\s\S]*?)<\/title>/i);
+  const title = tm ? tm[1].trim() : '';
+  if (/^(Page not found|Attention Required|Error)/i.test(title)) return false;
+  if (text.indexOf('<a ') < 0 && text.indexOf('<a>') < 0) return false;
+  return true;
+}
+
+// POST JSON：先走 Worker，失败回落直连（供 play() 的 playback 接口用）
+async function postJson(url, postHeaders) {
+  if (FETCH_WORKER) {
+    try {
+      const { data } = await req.post(FETCH_WORKER + '/?u=' + encodeURIComponent(url), {}, { headers: postHeaders, timeout: 15000 });
+      const raw = String(data || '');
+      if (isRealPage(raw)) {
+        const j = typeof data === 'string' ? JSON.parse(data) : data;
+        if (j && typeof j === 'object') return j;
+      }
+    } catch (e) {}
+  }
+  try {
+    const { data } = await req.post(url, {}, { headers: postHeaders, timeout: 15000 });
+    return typeof data === 'string' ? JSON.parse(data) : data;
+  } catch (e) {
+    return null;
   }
 }
 
@@ -288,26 +344,20 @@ async function play(reqIn) {
   // 匿名即可调用；先走 API，失败再回落原来的 HTML 抓取。
   const apiM = raw.match(/\/duanju\/(\d+)-[^/]+\/(\d+)\/?/);
   if (apiM) {
-    try {
-      const apiUrl = HOST + '/api/videos/' + apiM[1] + '/episodes/' + apiM[2] + '/playback';
-      const { data } = await req.post(apiUrl, {}, {
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'User-Agent': UA,
-          Referer: raw.startsWith('http') ? raw : HOST + '/',
-        },
-        timeout: 15000,
-      });
-      const j = typeof data === 'string' ? JSON.parse(data) : data;
-      const main = j && j.status === 1 && j.data && j.data.streams && j.data.streams.main;
-      if (main) {
-        let m3u8Url = String(main).replace(/\\u0026/g, '&');
-        if (m3u8Url.startsWith('//')) m3u8Url = 'https:' + m3u8Url;
-        const relay = await relayM3u8(m3u8Url);
-        return { parse: 0, url: relay || m3u8Url, header: { 'User-Agent': UA, Referer: raw } };
-      }
-    } catch (e) {}
+    const apiUrl = HOST + '/api/videos/' + apiM[1] + '/episodes/' + apiM[2] + '/playback';
+    const j = await postJson(apiUrl, {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'User-Agent': UA,
+      Referer: raw.startsWith('http') ? raw : HOST + '/',
+    });
+    const main = j && j.status === 1 && j.data && j.data.streams && j.data.streams.main;
+    if (main) {
+      let m3u8Url = String(main).replace(/\\u0026/g, '&');
+      if (m3u8Url.startsWith('//')) m3u8Url = 'https:' + m3u8Url;
+      const relay = await relayM3u8(m3u8Url);
+      return { parse: 0, url: relay || m3u8Url, header: { 'User-Agent': UA, Referer: raw } };
+    }
   }
   const html = await fetchHtml(raw, HOST + '/');
   if (!html) return { parse: 1, url: raw };
