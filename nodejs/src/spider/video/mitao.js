@@ -155,16 +155,32 @@ async function signedGet(path, query) {
     const canonical = ['GET', path, query, sha256Hex(''), ts, nonce, session.sid].join('\n');
     const signature = hmacSha256Hex(session.skey, canonical);
     const url = BASE + path + (query ? '?' + query : '');
+    const headers = {
+      'User-Agent': UA,
+      Accept: 'application/json',
+      'X-Hp-Sid': session.sid,
+      'X-Hp-Ts': ts,
+      'X-Hp-Nonce': nonce,
+      'X-Hp-Sign': signature,
+      Referer: BASE + '/',
+    };
+    // 2026-11-10：签名请求也走 Worker（与握手同一出口）。只代理握手不够：
+    // 握手走 Worker 拿到 sid/skey 后，签名请求若直连（VPN 出口）会被站方拒收，
+    // 导致分类加载不出任何内容。Worker 须更新为全接口代理版（见 mitao-handshake-worker.js），
+    // 未部署新版/失败时回落直连。
+    if (HS_WORKER) {
+      try {
+        const wres = await req.get(HS_WORKER + '/?u=' + encodeURIComponent(url), { headers, timeout: 20000 });
+        const wbody = wres && wres.data !== undefined ? wres.data : wres;
+        const wtext = typeof wbody === 'string' ? wbody : JSON.stringify(wbody || {});
+        if (wtext && wtext.length > 20 && !wtext.includes('developers.cloudflare.com')) {
+          const wj = typeof wbody === 'string' ? (function () { try { return JSON.parse(wbody); } catch (e) { return {}; } })() : (wbody || {});
+          if (wj && typeof wj === 'object') return { status: (wres && wres.status != null) ? wres.status : 200, body: wj };
+        }
+      } catch (e) {}
+    }
     const res = await req.get(url, {
-      headers: {
-        'User-Agent': UA,
-        Accept: 'application/json',
-        'X-Hp-Sid': session.sid,
-        'X-Hp-Ts': ts,
-        'X-Hp-Nonce': nonce,
-        'X-Hp-Sign': signature,
-        Referer: BASE + '/',
-      },
+      headers,
       timeout: 20000,
     });
     const body = res && res.data !== undefined ? res.data : res;
