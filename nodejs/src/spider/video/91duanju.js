@@ -16,6 +16,10 @@ const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev';
 // 与“载入失败：网络…”；Worker 先行、失败回落直连。Worker 需用户部署
 // （duanju91-fetch.li768435813.workers.dev），未部署前行为与原来一致。
 const FETCH_WORKER = 'https://duanju91-fetch.li768435813.workers.dev';
+// 播放代理 Worker（用户已部署 dj-hls：/up 暂存清单、/p 取清单、/s 代拉分片密钥）。
+// 2026-11-10：播放改走 dj-hls 为首选——Railway 中转（/hls）在用户手机上能打开
+// 清单但直接卡住、一秒都播不了；dj-hls 全程走 Cloudflare，不走 Railway。
+const DJ_WORKER = 'https://dj-hls.li768435813.workers.dev';
 
 function t(v) {
   return String(v == null ? '' : v).trim();
@@ -109,6 +113,55 @@ async function relayM3u8(m3u8Url) {
     const relayUrl = RELAY + 'hls?url=' + encodeURIComponent(m3u8Url);
     const { data } = await req.get(relayUrl, { headers: headers(''), timeout: 15000 });
     if (String(data || '').includes('#EXTM3U')) return relayUrl;
+  } catch (e) {}
+  return '';
+}
+
+// 清单内分片/密钥地址改写到 dj-hls /s 中转
+function rewritePlaylistToDj(text, playlistUrl) {
+  const lines = String(text || '').split('\n');
+  const out = [];
+  for (const line of lines) {
+    const tr = line.trim();
+    if (!tr) { out.push(line); continue; }
+    if (tr.charAt(0) === '#') {
+      out.push(line.replace(/URI="([^"]+)"/g, (mm, u) => {
+        let abs = u;
+        try { abs = new URL(u, playlistUrl).href; } catch (e) {}
+        return 'URI="' + DJ_WORKER + '/s?u=' + encodeURIComponent(abs) + '"';
+      }));
+      continue;
+    }
+    let abs2 = tr;
+    try { abs2 = new URL(tr, playlistUrl).href; } catch (e) {}
+    out.push(DJ_WORKER + '/s?u=' + encodeURIComponent(abs2));
+  }
+  return out.join('\n');
+}
+
+// dj-hls 代理线：手机侧取清单 → 改写分片/密钥到 dj-hls /s → POST /up 暂存 →
+// 回读校验后返回 /p/ 地址；失败返回 ''（调用方回落 Railway 中转/直连）
+async function djHlsLine(m3u8Url, referer) {
+  try {
+    const { data } = await req.get(m3u8Url, { headers: { 'User-Agent': UA, Referer: referer || HOST + '/' }, timeout: 15000 });
+    const text = String(data || '');
+    if (!text.includes('#EXTM3U')) return '';
+    const rewritten = rewritePlaylistToDj(text, m3u8Url);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let relay = '';
+      try {
+        const up = await req.post(DJ_WORKER + '/up', rewritten, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'User-Agent': UA }, timeout: 15000 });
+        const upBody = String(up.data || '');
+        let parsed = null;
+        try { parsed = JSON.parse(upBody); } catch (e) {}
+        relay = parsed && parsed.url ? String(parsed.url) : '';
+      } catch (e) {}
+      if (!relay.startsWith(DJ_WORKER + '/p/')) return '';
+      try {
+        const chk = await req.get(relay, { headers: { 'User-Agent': UA }, timeout: 10000 });
+        if (String(chk.data || '').includes('#EXTM3U')) return relay;
+      } catch (e) {}
+    }
   } catch (e) {}
   return '';
 }
@@ -331,13 +384,28 @@ async function detail(reqIn) {
   return { list };
 }
 
+// 解析出最终可播地址：duanju91-fetch Worker 直播改写首选（全程 Cloudflare，
+// 现取现改、不需暂存；Railway 中转在用户手机上能打开清单但直接卡住，
+// dj-hls /up+/p/ 暂存回 404 均不可靠）→ Railway 中转 → 直连
+async function bestPlayUrl(m3u8Url, referer) {
+  if (/\.m3u8/i.test(m3u8Url) && FETCH_WORKER) {
+    return FETCH_WORKER + '/?u=' + encodeURIComponent(m3u8Url);
+  }
+  if (/\.m3u8/i.test(m3u8Url)) {
+    const dj = await djHlsLine(m3u8Url, referer);
+    if (dj) return dj;
+  }
+  const relay = await relayM3u8(m3u8Url);
+  return relay || m3u8Url;
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   const raw = t(body.id);
   if (!raw) return { parse: 1, url: raw };
   if (isVideoFormat(raw)) {
-    const relay = await relayM3u8(raw);
-    return { parse: 0, url: relay || raw, header: { 'User-Agent': UA, Referer: HOST + '/' } };
+    const url = await bestPlayUrl(raw, HOST + '/');
+    return { parse: 0, url, header: { 'User-Agent': UA, Referer: HOST + '/' } };
   }
   // 2026-11-10 修“视频加载失败”：详情页 "current" 的 src 为空，真 m3u8 只在
   // POST /api/videos/{seriesId}/episodes/{ep}/playback 里（streams.main），
@@ -355,8 +423,8 @@ async function play(reqIn) {
     if (main) {
       let m3u8Url = String(main).replace(/\\u0026/g, '&');
       if (m3u8Url.startsWith('//')) m3u8Url = 'https:' + m3u8Url;
-      const relay = await relayM3u8(m3u8Url);
-      return { parse: 0, url: relay || m3u8Url, header: { 'User-Agent': UA, Referer: raw } };
+      const url = await bestPlayUrl(m3u8Url, raw);
+      return { parse: 0, url, header: { 'User-Agent': UA, Referer: raw } };
     }
   }
   const html = await fetchHtml(raw, HOST + '/');
@@ -384,8 +452,8 @@ async function play(reqIn) {
   if (m3u8Url) {
     if (m3u8Url.startsWith('//')) m3u8Url = 'https:' + m3u8Url;
     else if (m3u8Url.startsWith('/')) m3u8Url = HOST + m3u8Url;
-    const relay = await relayM3u8(m3u8Url);
-    return { parse: 0, url: relay || m3u8Url, header: { 'User-Agent': UA, Referer: raw } };
+    const url = await bestPlayUrl(m3u8Url, raw);
+    return { parse: 0, url, header: { 'User-Agent': UA, Referer: raw } };
   }
   return { parse: 1, url: raw, header: { 'User-Agent': UA, Referer: HOST + '/' } };
 }
