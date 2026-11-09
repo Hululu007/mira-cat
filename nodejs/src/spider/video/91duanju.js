@@ -387,9 +387,11 @@ async function detail(reqIn) {
 // 解析出最终可播地址：duanju91-fetch Worker 直播改写首选（全程 Cloudflare，
 // 现取现改、不需暂存；Railway 中转在用户手机上能打开清单但直接卡住，
 // dj-hls /up+/p/ 暂存回 404 均不可靠）→ Railway 中转 → 直连
+// 2026-11-10：Worker 地址用 /playlist.m3u8?u= 形式（路径带 .m3u8 后缀，
+// 部分播放器按扩展名认类型；Worker 忽略路径，只认 ?u= 参数）。
 async function bestPlayUrl(m3u8Url, referer) {
   if (/\.m3u8/i.test(m3u8Url) && FETCH_WORKER) {
-    return FETCH_WORKER + '/?u=' + encodeURIComponent(m3u8Url);
+    return FETCH_WORKER + '/playlist.m3u8?u=' + encodeURIComponent(m3u8Url);
   }
   if (/\.m3u8/i.test(m3u8Url)) {
     const dj = await djHlsLine(m3u8Url, referer);
