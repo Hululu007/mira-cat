@@ -1,22 +1,38 @@
 // 橙果短剧 - CatPawOpen 格式
 // 转换自 REX forward.chengguo.tut，站点 https://chengguodj.com (Nuxt.js)
 import req from '../../util/req.js';
+import crypto from 'crypto';
 
 const KEY = 'py_chengguo';
 const NAME = '橙果短剧';
 const SITE = 'https://chengguodj.com';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1';
 
+// 2026-11-10：首页推荐、排行榜置顶（用户令）。
 const CATS = [
+  { type_id: 'home', type_name: '首页推荐' },
+  { type_id: 'rank', type_name: '排行榜' },
   { type_id: 'yuanchuang', type_name: '原创短剧' },
   { type_id: 'mogai', type_name: '魔改短剧' },
   { type_id: 'manju', type_name: '漫剧' },
   { type_id: 'zhenren', type_name: '真人短剧' },
   { type_id: 'aiduanju', type_name: 'AI短剧' },
   { type_id: 'browse', type_name: '片库索引' },
-  { type_id: 'rank', type_name: '排行榜' },
-  { type_id: 'home', type_name: '首页推荐' },
 ];
+
+// 2026-11-10：分类改走站方加密 API（api2.chengguodj.com）。
+// 旧取法已死：/rank 与 /home 路由站方已删（404）、/xxx/page-N 也 404，
+// ?page=N 被服务端忽略（永远回第 1 页内容）；原创短剧全站仅 16 部，
+// 旧代码 pagecount 恒报 page+1，App 翻到第 2 页必空。
+// API：POST /api/v1/channels/{code}?page={n}、/api/v1/dramas?page={n}、
+// /api/v1/home；回包 {errcode:0, data:"<base64>"}，data 为 AES-128-CBC
+// （key "2acf7e91e9864673"、iv "1c29882d3ddfcfd6"、Pkcs7）加密的 JSON，
+// 内层 {success:true, data:{items, pagination:{total_pages}}}。
+// home 取 /api/v1/home 的 hot（排行榜）、featured+freshest+各频道（首页推荐）。
+const API2 = 'https://api2.chengguodj.com';
+const API_KEY = Buffer.from('2acf7e91e9864673', 'utf8');
+const API_IV = Buffer.from('1c29882d3ddfcfd6', 'utf8');
+const CHANNELS = ['yuanchuang', 'mogai', 'manju', 'zhenren', 'aiduanju'];
 
 function t(v) {
   return String(v == null ? '' : v).trim();
@@ -45,6 +61,64 @@ function proxyImg(raw) {
   } catch (e) {
     return raw;
   }
+}
+
+function apiDecrypt(b64) {
+  try {
+    const d = crypto.createDecipheriv('aes-128-cbc', API_KEY, API_IV);
+    d.setAutoPadding(true);
+    const plain = Buffer.concat([d.update(Buffer.from(String(b64 || ''), 'base64')), d.final()]).toString('utf8');
+    return JSON.parse(plain);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function apiPost(path) {
+  try {
+    const r = await req.post(API2 + path, '{}', {
+      headers: {
+        'User-Agent': UA,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'Referer': SITE + '/',
+      },
+      timeout: 15000,
+    });
+    if (!r || r.status !== 200) return null;
+    const j = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+    if (!j || j.errcode !== 0 || typeof j.data !== 'string') return null;
+    const inner = apiDecrypt(j.data);
+    if (!inner || inner.success !== true) return null;
+    return inner.data || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function apiItemsToList(items) {
+  const out = [];
+  const seen = {};
+  for (const it of items || []) {
+    if (!it || typeof it !== 'object') continue;
+    const title = t(it.title);
+    if (!title) continue;
+    const route = t(it.detail_route) || (t(it.slug) ? '/drama/' + t(it.slug) : '');
+    if (!route) continue;
+    const vid = 'cg:' + route;
+    if (seen[vid]) continue;
+    seen[vid] = 1;
+    let pic = '';
+    const cover = it.cover;
+    if (cover && typeof cover === 'object') pic = t(cover.url) || t(cover.fallback_url);
+    else if (typeof cover === 'string') pic = cover;
+    const tot = it.total_episode_count;
+    const pub = it.published_episode_count;
+    const remarks = (typeof tot === 'number' && tot) ? '全' + tot + '集'
+      : (typeof pub === 'number' && pub) ? '已更' + pub + '集' : '';
+    out.push({ vod_id: vid, vod_name: title, vod_pic: proxyImg(pic), vod_remarks: remarks });
+  }
+  return out;
 }
 
 async function fetchHtml(url) {
@@ -111,8 +185,10 @@ function extractList(html) {
   return items;
 }
 
+// SSR 兜底：API 不通时用服务端直出页（仅第 1 页有内容，page-N 路由已死）。
 function catUrl(tid, page) {
   page = parseInt(page, 10) || 1;
+  if (tid === 'home') return SITE + '/';
   if (page <= 1) return SITE + '/' + tid;
   return SITE + '/' + tid + '/page-' + page;
 }
@@ -125,6 +201,67 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const id = String(Array.isArray(body.id) ? body.id[0] : body.id || 'yuanchuang');
   const page = Math.max(1, parseInt(body.page) || 1);
+
+  // 首页推荐：home API 的 featured + freshest + 各频道 section（去重）。
+  if (id === 'home') {
+    const d = await apiPost('/api/v1/home');
+    if (d) {
+      const pool = [];
+      if (d.featured && d.featured.items) pool.push(...d.featured.items);
+      if (d.freshest && d.freshest.items) pool.push(...d.freshest.items);
+      if (Array.isArray(d.channel_sections)) {
+        for (const s of d.channel_sections) {
+          if (s && s.items) pool.push(...s.items);
+        }
+      }
+      const list = apiItemsToList(pool);
+      if (list.length) return { page: 1, pagecount: 1, list };
+    }
+    const html = await fetchHtml(SITE + '/');
+    const list = extractList(html);
+    return { page: 1, pagecount: 1, list };
+  }
+
+  // 排行榜：home API 的 hot（热播榜，按 7 日热度排）。
+  if (id === 'rank') {
+    const d = await apiPost('/api/v1/home');
+    if (d && d.hot && d.hot.items) {
+      const list = apiItemsToList(d.hot.items);
+      if (list.length) return { page: 1, pagecount: 1, list };
+    }
+    const html = await fetchHtml(SITE + '/');
+    const list = extractList(html);
+    return { page: 1, pagecount: 1, list };
+  }
+
+  // 频道分类：channels API（真分页，pagecount 取 total_pages）。
+  if (CHANNELS.indexOf(id) >= 0) {
+    const d = await apiPost('/api/v1/channels/' + id + '?page=' + page);
+    if (d && d.items) {
+      const list = apiItemsToList(d.items);
+      const pg = d.pagination || {};
+      const totalPages = (typeof pg.total_pages === 'number' && pg.total_pages) ? pg.total_pages : (list.length ? page + 1 : page);
+      return { page, pagecount: totalPages, list };
+    }
+    const html = await fetchHtml(catUrl(id, page));
+    const list = extractList(html);
+    return { page, pagecount: list.length ? page + 1 : page, list };
+  }
+
+  // 片库索引：dramas API（真分页）。
+  if (id === 'browse') {
+    const d = await apiPost('/api/v1/dramas?page=' + page);
+    if (d && d.items) {
+      const list = apiItemsToList(d.items);
+      const pg = d.pagination || {};
+      const totalPages = (typeof pg.total_pages === 'number' && pg.total_pages) ? pg.total_pages : (list.length ? page + 1 : page);
+      return { page, pagecount: totalPages, list };
+    }
+    const html = await fetchHtml(catUrl(id, page));
+    const list = extractList(html);
+    return { page, pagecount: list.length ? page + 1 : page, list };
+  }
+
   const html = await fetchHtml(catUrl(id, page));
   const list = extractList(html);
   return { page, pagecount: list.length ? page + 1 : page, list };
