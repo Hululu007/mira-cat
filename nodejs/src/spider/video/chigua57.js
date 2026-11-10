@@ -1,4 +1,6 @@
 // 57吃瓜 (https://57cg4.com) -> CatPawOpen spider
+// 2026-11-11 取页加固：主域 req 重试 + 备用域 9527heiliao.top + fetch 兜底，
+// 分类名容错；解析逻辑未动（站方 HTML 与解析实测均正常）。
 // 转换自 REX Forward Widget: forward.57cg.tut v1.1.0 (作者: 宝宝巴士)
 // 列表 /events/{id}/ 结构, 详情页提取 m3u8 / mp4 直链
 // 封面在 s.chigua.media CDN, 需 Referer -> 走服务器代理透传
@@ -7,6 +9,14 @@ import req from '../../util/req.js';
 const KEY = 'py_chigua57';
 const NAME = '57吃瓜';
 const HOST = 'https://57cg4.com';
+// 备用域（站方 canonical 域，内容与主域一致；主域取不到内容时自动切换）
+const ALT_HOST = 'https://9527heiliao.top';
+// 分类名（type_name）→ type_id 容错：App 若传显示名也能定位到正确分类
+const NAME_TO_ID = {
+  '热门': 'hot', '首页最新': 'home', '今日吃瓜': 'jrcg', '每日大赛': 'mrds',
+  '网红黑料': 'wanghong', '网黄合集': 'video', '出轨劈腿': 'cheating',
+  '直播擦边': 'live', '成人AI短剧': 'aichengduanju', '社会事件': 'society', '明星八卦': 'star',
+};
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
 // 分类: REX 原有 9 个 + 站点导航新增 society(社会事件) / star(明星八卦)
@@ -33,13 +43,54 @@ function headers() {
   };
 }
 
-async function getHtml(url) {
+async function getHtmlOnce(url) {
   try {
     const { data } = await req.get(url, { headers: headers(), timeout: 20000 });
-    return String(data || '');
+    const s = String(data || '');
+    // Cloudflare 验证页 / 空页一律视为未取到（交给备用域重试）
+    if (s && !/Just a moment|Attention Required|cf-browser-verification|cf-challenge/i.test(s)) return s;
+    return '';
   } catch (e) {
     return '';
   }
+}
+
+async function getHtmlFetch(url) {
+  try {
+    if (typeof fetch === 'undefined') return '';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 22000);
+    const r = await fetch(url, { headers: headers(), signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) return '';
+    const s = String(await r.text() || '');
+    if (/Just a moment|Attention Required|cf-browser-verification|cf-challenge/i.test(s)) return '';
+    return s;
+  } catch (e) {
+    return '';
+  }
+}
+
+// 2026-11-11：分类能出、内容全空（暂无数据）。蜘蛛逻辑与站方 HTML 实测均正常，
+// 失败在 App 内取页环节（直连偶发被拒/空回）。改法：同一地址 req 重试一次，
+// 再换备用域 9527heiliao.top 重试，仍空才走 fetch 兜底；任一通道拿到含
+// /events/ 的页面即返回。
+async function getHtml(url) {
+  let html = await getHtmlOnce(url);
+  if (html && html.indexOf('/events/') >= 0) return html;
+  html = await getHtmlOnce(url);
+  if (html && html.indexOf('/events/') >= 0) return html;
+  // 换备用域（同路径）
+  if (url.indexOf(HOST) === 0) {
+    const altUrl = ALT_HOST + url.slice(HOST.length);
+    html = await getHtmlOnce(altUrl);
+    if (html && html.indexOf('/events/') >= 0) return html;
+    html = await getHtmlOnce(altUrl);
+    if (html && html.indexOf('/events/') >= 0) return html;
+  }
+  html = await getHtmlFetch(url);
+  if (html && html.indexOf('/events/') >= 0) return html;
+  return html || '';
 }
 
 function t(v) {
@@ -199,7 +250,8 @@ async function home() {
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  const id = String(body.id || 'hot');
+  let id = String(body.id || 'hot');
+  if (NAME_TO_ID[id]) id = NAME_TO_ID[id];
   const html = await getHtml(listUrl(id, page));
   const list = parseList(html, reqIn);
   return {

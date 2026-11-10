@@ -2,6 +2,8 @@
 // 源站：https://kbjclub.club/（WordPress retrotube 主题，loop-video 卡片）
 // 列表：首页 /、分类 /category/<slug>/、翻页 /page/<n>/、搜索 /?s=<kw>
 // 详情：详情页 player-6w.php 播放器 → JW setup file: master.txt → 三档变体
+// 2026-11-11：新增 wkwk.php / kbj.php 的 Plyr 直链 mp4 提取（<source src>），
+// 此前这类嵌套四步全 miss 只能回落原页；另 contentUrl 正则改为大小写不敏感。
 //   （自动/1080p/720p/480p）；无 player-6w 时回落 /e/ 嵌套（VOE 解包）或 oct4 嵌套
 //   （JW file 为 .php 播放列表，需现取现验）。死链（master 取不到）不推死线，
 //   改试下一个嵌套；全部嵌套都死才回落原页。详情不再生成网页播线。
@@ -182,7 +184,7 @@ function extractEmbedUrls(html, pageUrl) {
   };
   const h = String(html || '');
   let m;
-  const re1 = /"contentURL"\s*:\s*"([^"]+)"/g;
+  const re1 = /"contentUrl"\s*:\s*"([^"]+)"/gi;
   while ((m = re1.exec(h)) !== null) add(m[1].replace(/\\\//g, '/'));
   const re2 = /iframe\.setAttribute\(\s*['"]src['"]\s*,\s*['"]([^'"]+)['"]/g;
   while ((m = re2.exec(h)) !== null) add(m[1]);
@@ -213,6 +215,15 @@ async function resolveVoe(embedUrl, referer) {
     if (/^https?:\/\//i.test(u) && /(master\.txt|\.m3u8|\/hls\d*\/?)/i.test(u) && !/\.vtt$/i.test(u)) {
       return { m3u8: u, direct: '' };
     }
+  }
+  // 2026-11-11：Plyr 类嵌套（wkwk.php / kbj.php）的直链 mp4：页内以
+  // <source src="...mp4"> 形式存在，旧逻辑四步全 miss → 回落原页。
+  // 此处直接取 mp4 作 direct 返回（detail 已有 MP4 分支、play 已处理 .mp4）。
+  const srcM = html.match(/<(?:source|video)[^>]+src=["']([^"']+\.mp4(?:\?[^"']*)?)["']/i)
+    || html.match(/["'](https?:\/\/[^"'\s<>]+\.mp4(?:\?[^"'\s<>]*)?)["']/i);
+  if (srcM) {
+    const u = srcM[1].replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    if (/^https?:\/\//i.test(u)) return { m3u8: '', direct: u };
   }
   const cfg = voeDecode(html);
   const src = t(cfg.source);
