@@ -99,6 +99,7 @@ import px8x from './spider/video/px8x.js';
 import seniu from './spider/video/seniu.js';
 import wddfa from './spider/video/wddfa.js';
 import xiu313 from './spider/video/xiu313.js';
+import wukong from './spider/video/wukong.js';
 
 const spiders = [
     missav_xptv,
@@ -195,6 +196,7 @@ const spiders = [
     ultra,
     uu_video,
     wddfa,
+    wukong,
     xingmengasmr,
     xiu313,
     xnxx,
