@@ -2,8 +2,11 @@
 // 源站：https://kbjclub.club/（WordPress retrotube 主题，loop-video 卡片）
 // 列表：首页 /、分类 /category/<slug>/、翻页 /page/<n>/、搜索 /?s=<kw>
 // 详情：详情页 player-6w.php 播放器 → JW setup file: master.txt → 三档变体
-// 2026-11-11：新增 wkwk.php / kbj.php 的 Plyr 直链 mp4 提取（<source src>），
-// 此前这类嵌套四步全 miss 只能回落原页；另 contentUrl 正则改为大小写不敏感。
+// 2026-11-11：新增 wkwk.php 的 Plyr 直链 mp4 提取（<source src>），放 voeDecode
+// 之后作最后兜底；此前这类嵌套四步全 miss 只能回落原页。
+// 2026-11-11 修正：mp4 提取绝不能放在 voeDecode 之前、绝不能用裸 URL 正则——
+// VOE 嵌套页里含 Big Buck Bunny 10 秒测试视频，会被误当成正片，导致“自动”+
+// 分辨率档位全丢、只剩单条 10 秒 MP4。另 contentUrl 正则改为大小写不敏感。
 //   （自动/1080p/720p/480p）；无 player-6w 时回落 /e/ 嵌套（VOE 解包）或 oct4 嵌套
 //   （JW file 为 .php 播放列表，需现取现验）。死链（master 取不到）不推死线，
 //   改试下一个嵌套；全部嵌套都死才回落原页。详情不再生成网页播线。
@@ -216,15 +219,6 @@ async function resolveVoe(embedUrl, referer) {
       return { m3u8: u, direct: '' };
     }
   }
-  // 2026-11-11：Plyr 类嵌套（wkwk.php / kbj.php）的直链 mp4：页内以
-  // <source src="...mp4"> 形式存在，旧逻辑四步全 miss → 回落原页。
-  // 此处直接取 mp4 作 direct 返回（detail 已有 MP4 分支、play 已处理 .mp4）。
-  const srcM = html.match(/<(?:source|video)[^>]+src=["']([^"']+\.mp4(?:\?[^"']*)?)["']/i)
-    || html.match(/["'](https?:\/\/[^"'\s<>]+\.mp4(?:\?[^"'\s<>]*)?)["']/i);
-  if (srcM) {
-    const u = srcM[1].replace(/\\\//g, '/').replace(/&amp;/g, '&');
-    if (/^https?:\/\//i.test(u)) return { m3u8: '', direct: u };
-  }
   const cfg = voeDecode(html);
   const src = t(cfg.source);
   if (/\.m3u8/i.test(src) || /^https?:\/\//i.test(src)) {
@@ -233,6 +227,30 @@ async function resolveVoe(embedUrl, referer) {
   const dau = t(cfg.direct_access_url);
   if (/^https?:\/\//i.test(dau)) return { m3u8: '', direct: dau };
   if (/^https?:\/\//i.test(src)) return { m3u8: '', direct: src };
+  // 2026-11-11 修正：直链 mp4 只能放在最后兜底（voeDecode 之后）。
+  // 教训：之前放在 voeDecode 之前，且用了裸 URL 正则，结果把 VOE 嵌套页里的
+  // Big Buck Bunny 10 秒测试视频（test-videos.co.uk/.../Big_Buck_Bunny_1080_10s_5MB.mp4）
+  // 当成正片返回，导致原来能出“自动”+分辨率的条目全变成单条 MP4、只播 10 秒。
+  // 现在只认两处，且都排除测试视频：
+  // (1) <source>/<video> 标签（wkwk.php 的 Plyr 直链；VOE 页没有这种标签，不会被劫持）；
+  // (2) 嵌套地址自身的 url= 参数（kbj.php 的 ?url=https://...mp4，页内无 <source> 标签时用）。
+  const srcM = html.match(/<(?:source|video)[^>]+src=["']([^"']+\.mp4(?:\?[^"']*)?)["']/i);
+  if (srcM) {
+    const u = srcM[1].replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    if (/^https?:\/\//i.test(u) && !/test-videos|bigbuckbunny|big_buck_bunny/i.test(u)) {
+      return { m3u8: '', direct: u };
+    }
+  }
+  const qm = String(embedUrl || '').match(/[?&]url=(https?%3A%2F%2F[^&]+)/i)
+    || String(embedUrl || '').match(/[?&]url=(https?:\/\/[^&]+\.mp4[^&]*)/i);
+  if (qm) {
+    let u = qm[1];
+    try { u = decodeURIComponent(u); } catch (e) {}
+    u = u.replace(/\\\//g, '/').replace(/&amp;/g, '&');
+    if (/^https?:\/\/[^\s"'<>]+\.mp4(\?|$)/i.test(u) && !/test-videos|bigbuckbunny|big_buck_bunny/i.test(u)) {
+      return { m3u8: '', direct: u };
+    }
+  }
   return { m3u8: '', direct: '' };
 }
 
