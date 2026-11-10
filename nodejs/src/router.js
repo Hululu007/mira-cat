@@ -52,7 +52,6 @@ import brazz from './spider/video/brazz.js';
 import bigbuttshub from './spider/video/bigbuttshub.js';
 import mmtv from './spider/video/7mmtv.js';
 import javideo from './spider/video/javideo.js';
-import bestjavporn from './spider/video/bestjavporn.js';
 import chaturbate from './spider/video/chaturbate.js';
 import asmrba from './spider/video/asmrba.js';
 import hlbdy from './spider/video/hlbdy.js';
@@ -125,7 +124,6 @@ const spiders = [
     avporn,
     hyjx0817,
     bagua,
-    bestjavporn,
     bianfu,
     bigbuttshub,
     brazz,
