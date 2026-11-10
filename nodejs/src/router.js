@@ -87,6 +87,18 @@ import javhey from './spider/video/py_javhey.js';
 import jav24 from './spider/video/py_24jav.js';
 import hyjx0817 from './spider/video/py_0817hyjx.js';
 import javrate from './spider/video/py_javrate.js';
+import a91porn from './spider/video/a91porn.js';
+import av01 from './spider/video/av01.js';
+import avporn from './spider/video/avporn.js';
+import chineseav from './spider/video/chineseav.js';
+import javsaga from './spider/video/javsaga.js';
+import javxxx from './spider/video/javxxx.js';
+import littlepervert from './spider/video/littlepervert.js';
+import madouai from './spider/video/madouai.js';
+import px8x from './spider/video/px8x.js';
+import seniu from './spider/video/seniu.js';
+import wddfa from './spider/video/wddfa.js';
+import xiu313 from './spider/video/xiu313.js';
 
 const spiders = [
     missav_xptv,
@@ -99,14 +111,17 @@ const spiders = [
     chigua57,
     duanju91,
     cg91,
+    a91porn,
     dycg66,
     hl818,
     animesex,
     asian,
     asmr,
     asmrba,
+    av01,
     avdb,
     avjoy,
+    avporn,
     hyjx0817,
     bagua,
     bestjavporn,
@@ -116,6 +131,7 @@ const spiders = [
     cableav,
     chaturbate,
     chengguo,
+    chineseav,
     spankbang,
     ero,
     feiye,
@@ -143,7 +159,9 @@ const spiders = [
     javplayer,
     javportals,
     javrate,
+    javsaga,
     javtiful,
+    javxxx,
     jinguo,
     juheduanju,
     kanav,
@@ -151,8 +169,10 @@ const spiders = [
     koreanbj,
     lissav,
     madou,
+    madouai,
     mrds,
     mitao,
+    littlepervert,
     mogu,
     noodle,
     one,
@@ -161,8 +181,10 @@ const spiders = [
     porncgw,
     pornhub,
     ppp,
+    px8x,
     qimao,
     rou,
+    seniu,
     sextb,
     siguaspw,
     stripchat,
@@ -172,7 +194,9 @@ const spiders = [
     topjav,
     ultra,
     uu_video,
+    wddfa,
     xingmengasmr,
+    xiu313,
     xnxx,
     xvideos,
     xxxfollow,
