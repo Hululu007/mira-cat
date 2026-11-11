@@ -79,14 +79,18 @@ async function getText(url, timeout = 60000) {
 // 即返回；失败通道 90 秒内跳过（蜘蛛进程常驻，模块级状态跨请求有效），
 // 通道复活后由后续请求自动探活恢复。校验沿用旧口径（非拦截页且
 // >3000B），并补挡 "Attention Required" 硬封页（4.8KB 会漏过旧校验）。
+// 2026-11-11 提速：只留 direct + worker。jina 已实测会毒化竞速——它回的
+// Markdown 能过 goodPage（>3000B 且含 javsaga），但 parseCards/detail
+// 都要真 HTML，jina 赢了竞速就等于分类 0 条、详情空白（手机模拟实测：
+// jina 600ms 快过 direct 800ms 时分类 0 条、详情只有 fallback 标题）。
+// fzcrym（fs/page）主机已死，/fs 挂到超时 0 字节，45s 超时只会拖垮
+// direct 失败时的回空路径（最长 45s 才结算）。worker 未部署、404 速败，
+// 留作备用。direct 是手机主通道。
 const PAGE_CHANNELS = [
   { name: 'direct', timeout: 20000, build: (u) => u },
-  { name: 'jina', timeout: 20000, build: (u) => 'https://r.jina.ai/' + u },
-  { name: 'fs', timeout: 45000, build: (u) => FS_PAGE_API + encodeURIComponent(u) },
-  { name: 'page', timeout: 45000, build: (u) => PAGE_API + encodeURIComponent(u) },
-  { name: 'worker', timeout: 25000, build: (u) => FETCH_WORKER + '/?u=' + encodeURIComponent(u) },
+  { name: 'worker', timeout: 15000, build: (u) => FETCH_WORKER + '/?u=' + encodeURIComponent(u) },
 ];
-const PAGE_BUDGET_MS = 120000;
+const PAGE_BUDGET_MS = 30000;
 const CHAN_COOLDOWN_MS = 90 * 1000;
 const chanDeadUntil = {};
 
@@ -282,10 +286,18 @@ async function detail(reqIn) {
   }
   const LINE_ORDER = { VOE: 0, EVS: 10, LUC: 20, VAS: 30, FST: 35, ST: 40, TV: 90 };
   pairs.sort((a, b) => (LINE_ORDER[a[0].toUpperCase()] ?? 50) - (LINE_ORDER[b[0].toUpperCase()] ?? 50));
+  // 2026-11-11 提速：字幕预热提前到探针之前，与探针并行跑（原来在探针
+  // 之后才登记，预热要等探针的 8~15s 过去才启动，点播时缓存还没好）。
+  // 先按探针前单集地址登记一次；探针后再按最终地址登记（幂等）。
+  try {
+    subRegister(ids, { vod_id: vid, vod_name: title || ('JavSaga ' + vid), vod_play_url: pairs.map((p) => p[1]).join('$$$') });
+  } catch (e) {}
   // 分辨率探针（2026-11-09）：各线路并行走一遍 lk→嵌入页→主清单，≥2 档时该线
-  // 按档出集（集名取高度，地址只编码档位标识，点播时 play() 重新现解再按标识
-  // 选档——签名有时效，不把详情期地址写死）；探针失败/单档/15s 超时一律回落
-  // 原单集，不阻塞详情。
+  // 按档出集（集名取高度，地址只编码档位标识，点播时 play() 优先用探针期
+  // 已验活的缓存地址、验活失败再重新现解——签名有时效，缓存只留 120 秒）；
+  // 探针失败/单档/8s 超时一律回落原单集，不阻塞详情。
+  // 2026-11-11 实测：15s 预算下探针常被 lk1/嵌入页的慢 hop 拖满 15s 且
+  // 一档都没探出来（五线全回落单集），8s 已覆盖主机正常时的探针耗时。
   const probeOut = new Array(pairs.length).fill(null);
   await Promise.race([
     Promise.all(pairs.map(async ([nm, ep], i) => {
@@ -295,7 +307,7 @@ async function detail(reqIn) {
       const vs = await probeLineVariants(hex, durl).catch(() => null);
       if (vs && vs.length >= 2) probeOut[i] = vs;
     })),
-    new Promise((r) => setTimeout(r, 15000)),
+    new Promise((r) => setTimeout(r, 8000)),
   ]);
   const froms = pairs.map(p => p[0]);
   const urls = pairs.map((p, i) => {
@@ -367,7 +379,8 @@ function locOf(resp) {
 // lk1 取嵌入地址: ?c= 手工读 Location; 空跳转/失败时经门页 OLID 重试,
 // 再失败试 supjav-fetch Worker 备用出口 (v2 才支持, v1 自动判败)。
 // 返回 { embedUrl } 或 { embedBody, embedUrl } 或 null。
-async function lkResolveEmbed(hex, detailUrl) {
+async function lkResolveEmbed(hex, detailUrl, opts = {}) {
+  const fast = !!opts.fast;
   const gateUrl = `${LK_BASE}?l=${hex}`;
   const navHeaders = {
     'Referer': gateUrl,
@@ -379,7 +392,7 @@ async function lkResolveEmbed(hex, detailUrl) {
   };
   const tryC = async (h) => {
     const cUrl = `${LK_BASE}?c=${reverseStr(h)}`;
-    const r = await httpRaw(cUrl, { headers: navHeaders, timeout: 15000, maxRedirects: 0 });
+    const r = await httpRaw(cUrl, { headers: navHeaders, timeout: fast ? 8000 : 10000, maxRedirects: 0 });
     const loc = locOf(r);
     if (loc) {
       try {
@@ -393,13 +406,14 @@ async function lkResolveEmbed(hex, detailUrl) {
     if (body.length > 800 && !/OLID|start_player/.test(body)) return { embedBody: body, embedUrl: cUrl };
     return null;
   };
-  // 直试两次 (lk1 本身抖)
-  for (let i = 0; i < 2; i++) {
+  // 直试两次 (lk1 本身抖)；探针期只试一次，失败即回落，不烧预算
+  for (let i = 0; i < (fast ? 1 : 2); i++) {
     const got = await tryC(hex);
     if (got) return got;
   }
+  if (fast) return null;
   // 门页拿 OLID 再试 (OLID 实测与 data-link hex 相同, 但形态以站方为准)
-  const gate = await httpRaw(gateUrl, { headers: { Referer: detailUrl, ...navHeaders }, timeout: 15000, maxRedirects: 0 });
+  const gate = await httpRaw(gateUrl, { headers: { Referer: detailUrl, ...navHeaders }, timeout: 10000, maxRedirects: 0 });
   const gateBody = String(gate.data || '');
   const olidM = gateBody.match(/OLID\s*=\s*['"]([0-9a-fA-F]{32,})['"]/) || gateBody.match(/["']([0-9a-fA-F]{32,})["']/);
   if (olidM && olidM[1] && olidM[1] !== hex) {
@@ -409,7 +423,7 @@ async function lkResolveEmbed(hex, detailUrl) {
   // 备用出口: supjav-fetch Worker (v2 手工跟跳转回 x-final-url; v1 回
   // "host not allowed" 判败)。只在直连全灭时才走, 不拖慢正常路径。
   try {
-    const w = await httpRaw(FETCH_WORKER + '/?u=' + encodeURIComponent(`${LK_BASE}?c=${reverseStr(hex)}`), { timeout: 30000, maxRedirects: 0 });
+    const w = await httpRaw(FETCH_WORKER + '/?u=' + encodeURIComponent(`${LK_BASE}?c=${reverseStr(hex)}`), { timeout: 15000, maxRedirects: 0 });
     const finalUrl = w.headers?.['x-final-url'] || '';
     const wbody = String(w.data || '');
     if (finalUrl && !/supjav\.php|saga\.php/.test(finalUrl) && wbody.length > 300) {
@@ -755,7 +769,7 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl, opts = {}) {
   let html = embedBody || '';
   let finalUrl = embedUrl;
   if (!html) {
-    const r = await httpRaw(embedUrl, { headers: { Referer: detailUrl }, timeout: fast ? 12000 : 25000 });
+    const r = await httpRaw(embedUrl, { headers: { Referer: detailUrl }, timeout: fast ? 12000 : 15000 });
     html = String(r.data || '');
   }
   if (!html) return null;
@@ -763,7 +777,7 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl, opts = {}) {
   const jsJump = html.match(/window\.location\.href\s*=\s*'(https?:\/\/[^']+)'/) ||
     html.match(/window\.location\.href\s*=\s*"(https?:\/\/[^"]+)"/);
   if (jsJump && html.length < 3000 && !/jwplayer|application\/json|get_video/.test(html)) {
-    const r2 = await httpRaw(jsJump[1], { headers: { Referer: embedUrl }, timeout: fast ? 12000 : 25000 });
+    const r2 = await httpRaw(jsJump[1], { headers: { Referer: embedUrl }, timeout: fast ? 12000 : 15000 });
     if (r2.data) { html = String(r2.data); finalUrl = jsJump[1]; }
   }
 
@@ -772,9 +786,12 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl, opts = {}) {
   if (html.includes('get_video')) {
     if (fast) return null; // 探针期跳过：令牌与出口 IP 绑定、逐个试活慢，详情只留单集
     const cands = stCandidates(html);
-    for (const c of cands) {
-      if (await probeStFile(c, finalUrl)) {
-        return { url: c, header: playHeadersFor(c, finalUrl, detailUrl) };
+    // 2026-11-11 提速：候选 get_video 并行试活，按顺序取首个通过的
+    // （与旧版逐个试活结果一致）。
+    const oks = await Promise.all(cands.map((c) => probeStFile(c, finalUrl).catch(() => false)));
+    for (let i = 0; i < cands.length; i++) {
+      if (oks[i]) {
+        return { url: cands[i], header: playHeadersFor(cands[i], finalUrl, detailUrl) };
       }
     }
     // 令牌与铸造出口 IP 绑定：服务端试活不过不代表播放器不行，
@@ -807,11 +824,17 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl, opts = {}) {
   if (/eval\(function\(p,a,c,k/.test(html)) {
     const unpacked = unpackPacker(html);
     const urls = hlsFromUnpacked(unpacked);
-    for (const u of urls.slice(0, 3)) {
+    // 2026-11-11 提速：3 个候选清单并行验活，按下标取首个可用的（与旧版
+    // 逐个试活结果一致，EVS 的 403 主清单不再拖住后面的候选）。
+    const cands = urls.slice(0, 3);
+    const fvs = await Promise.all(cands.map(async (u) => {
       const hdr = playHeadersFor(u, finalUrl, detailUrl);
       // 单次拉取同时完成验活与拆档（旧版 verifyPlaylist+pickTopVariant 两次拉取）
-      const fv = await fetchVariants(u, hdr, fast ? 8000 : 20000);
-      if (fv.ok) return { url: fv.top, header: hdr, variants: fv.variants };
+      const fv = await fetchVariants(u, hdr, fast ? 5000 : 20000);
+      return { u, hdr, fv };
+    }));
+    for (const c of fvs) {
+      if (c.fv.ok) return { url: c.fv.top, header: c.hdr, variants: c.fv.variants };
     }
   }
   // 5) 明文/jwplayer 兜底
@@ -832,14 +855,34 @@ async function resolveEmbed(embedUrl, embedBody, detailUrl, opts = {}) {
   return null;
 }
 
+// 2026-11-11 提速：详情探针已验活的解析结果缓存 120 秒，供 play() 复用。
+// 签名有时效，play() 用前先对缓存地址重新验活（fetchVariants），
+// 验活失败即走完整链路重解，行为与无缓存一致。只缓存 m3u8 直链。
+const RESOLVE_CACHE_TTL = 120000;
+const resolveCache = new Map(); // hex -> { at, url, variants, header }
+function resolveCacheGet(hex) {
+  const hit = resolveCache.get(String(hex || ''));
+  if (!hit || Date.now() - hit.at > RESOLVE_CACHE_TTL) return null;
+  return hit;
+}
+function resolveCachePut(hex, got) {
+  if (!hex || !got || !got.url || !/\.m3u8/i.test(got.url)) return;
+  resolveCache.set(String(hex), { at: Date.now(), url: got.url, variants: got.variants || [], header: got.header || null });
+  if (resolveCache.size > 50) resolveCache.delete(resolveCache.keys().next().value);
+}
+
 // 详情期分辨率探针：走 lk→嵌入页→resolveEmbed（fast 模式，跳过 VAS API 与
 // ST 试活），只取主清单的档位表；拿不到/单档时返回 null，详情回落单集。
 async function probeLineVariants(hex, detailUrl) {
   try {
-    const lk = await lkResolveEmbed(hex, detailUrl);
+    const lk = await lkResolveEmbed(hex, detailUrl, { fast: true });
     if (!lk || (!lk.embedUrl && !lk.embedBody)) return null;
     const got = await resolveEmbed(lk.embedUrl || '', lk.embedBody || '', detailUrl, { fast: true });
-    if (!got || !got.variants || got.variants.length < 2) return null;
+    if (!got || !got.url) return null;
+    // 单档线也缓存已验活的地址：play() 复用它只需再验一次主清单，
+    // 不必重走 lk→嵌入页；多档才返回档位表出分辨率集。
+    resolveCachePut(hex, got);
+    if (!got.variants || got.variants.length < 2) return null;
     return got.variants;
   } catch (e) {
     return null;
@@ -871,11 +914,30 @@ async function play(reqIn) {
   const detailUrl = `${HOST}/${vid}.html`;
   const gateUrl = `${LK_BASE}?l=${hex}`;
   const headers = { 'User-Agent': UA, 'Referer': detailUrl };
+  // 详情探针刚验活过的地址直接复用：只验一次主清单（约 2s），跳过 lk→嵌入页
+  // 的 3 跳（约 7s）；验活失败/无缓存时走原完整链路。
+  const cached = resolveCacheGet(hex);
+  if (cached) {
+    try {
+      const fv = await fetchVariants(cached.url, cached.header || headers, 10000);
+      if (fv.ok) {
+        let finalUrl = fv.top;
+        if (wantH > 0 && fv.variants && fv.variants.length) {
+          const exact = fv.variants.find((v) => v.h === wantH);
+          const lower = fv.variants.filter((v) => v.h < wantH).sort((a, b) => b.h - a.h)[0];
+          const pick = exact || lower || fv.variants[0];
+          if (pick) finalUrl = pick.url;
+        }
+        return subAttach({ parse: 0, url: finalUrl, header: cached.header || headers }, subsP);
+      }
+    } catch (e) {}
+  }
   try {
     const lk = await lkResolveEmbed(hex, detailUrl);
     if (lk && (lk.embedUrl || lk.embedBody)) {
       const got = await resolveEmbed(lk.embedUrl || '', lk.embedBody || '', detailUrl);
       if (got && got.url) {
+        resolveCachePut(hex, got);
         // 集地址带档位标识（vid|hex|高度）时按标识选档：精确匹配优先，
         // 其次取不高于该档的最高档，档位已下线时回落最高档。
         let finalUrl = got.url;
