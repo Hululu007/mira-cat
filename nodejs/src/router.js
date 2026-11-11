@@ -95,10 +95,9 @@ import javxxx from './spider/video/javxxx.js';
 import littlepervert from './spider/video/littlepervert.js';
 import madouai from './spider/video/madouai.js';
 import px8x from './spider/video/px8x.js';
-import seniu from './spider/video/seniu.js';
 import wddfa from './spider/video/wddfa.js';
-import xiu313 from './spider/video/xiu313.js';
 import wukong from './spider/video/wukong.js';
+import rdd22 from './spider/video/rdd22.js';
 
 const spiders = [
     missav_xptv,
@@ -183,7 +182,7 @@ const spiders = [
     px8x,
     qimao,
     rou,
-    seniu,
+    rdd22,
     sextb,
     siguaspw,
     stripchat,
@@ -196,7 +195,6 @@ const spiders = [
     wddfa,
     wukong,
     xingmengasmr,
-    xiu313,
     xnxx,
     xvideos,
     xxxfollow,

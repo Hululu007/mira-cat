@@ -23,6 +23,17 @@ const PAGE_API = PROXY_BASE + '/page?u=';
 // v1 在岗时对 lk1 回 "host not allowed" 自动判败，v2 在岗时可手工跟跳转
 // 并提供 /wrap 包装页。部署状态不影响其余通道）
 const FETCH_WORKER = 'https://javsaga-fetch.li768435813.workers.dev';
+// 2026-11-11 实测（VM，supjav 同条件对照）：lk1 的 ?c= 能解 supjav 的
+// data-link hex（EVS/VOE/ST 三线均回真 embed），但对 javsaga 的 hex
+// 一律回 302 空 Location（两条 hex、反转/不反转、五种 Referer、
+// 蜘蛛原样头、新鲜 hex 全试过）。即 lk1 解不了 javsaga 的 hex，
+// javsaga 的真实 link 服务不在此（详情页按钮是 javascript:;，
+// 站内无 lk 地址；主题 JS pcmload.js 取不到——直连 CF 403、
+// 代理 502、Wayback 无快照）。手机上播放全灭与此一致。
+// 在拿到 javsaga 真实 link 服务地址前，play 链路走 lk1 注定失败；
+// 详情/列表不受影响（fetchPage 已修好，见 goodPage）。
+// 待确认：手机 Safari 开 javsaga 详情页、点任一线路，读播放器
+// iframe 的实际地址，即为真实 link 服务地址，届时把 LK_BASE 换过去。
 const LK_BASE = 'https://lk1.supremejav.com/supjav.php';
 
 // javsaga 分类（Wayback 2025-09-06 快照实测；站方导航原样）。
@@ -84,7 +95,13 @@ const CHAN_COOLDOWN_MS = 90 * 1000;
 const chanDeadUntil = {};
 
 function goodPage(html) {
-  return !!html && html.length > 3000 &&
+  // 2026-11-11 修：只判大小 + 两个 CF 串不够。未部署的 javsaga-fetch
+  // Worker 回 404 配 ~20KB Cloudflare 错误页（无 'Just a moment'、
+  // 无 'Attention Required'），会通过旧校验并在并行竞速里抢赢真页，
+  // 导致分类/详情/搜索取到错页回空（harness 实测分类 0 条即因此）。
+  // 真站页（首页/分类/详情/搜索/热门/标签）标题与站内链接一律含
+  // 'javsaga'，错页没有；加此锚定后错页再也赢不了竞速。
+  return !!html && html.length > 3000 && /javsaga/i.test(html) &&
     !html.includes('Just a moment') && !html.includes('Attention Required');
 }
 

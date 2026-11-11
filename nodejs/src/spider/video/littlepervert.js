@@ -1,7 +1,12 @@
 // 蜜夜AI (https://littlepervert.com/zh-CN/) -> CatPawOpen spider
 // AI 生成的成人短剧站（竖屏短剧，每部剧多集）。Vue 前端。
 // 分类：5 个顶级分组 -> 66 个子分类（/zh-CN/categories/ 的 JSON-LD）。
-// 列表：分类页 /zh-CN/c/<slug>/ 一次渲染全部剧集（JSON-LD ItemList + HTML 卡片）。
+// 列表：分类页 /zh-CN/c/<slug>/ 一次渲染全部剧集（JSON-LD ItemList + HTML 卡片），
+//   站内无翻页（无“加载更多”按钮、?page= 参数被忽略、site.js 里无分类分页接口；
+//   “共 X 部”与卡片数逐类核对一致，66 类 0 误差）。
+// 翻页（2026-11-11 修）：蜘蛛在本地按 20 条一页切分（paginate），page 1 回前 20 条、
+//   page 2 回剩余，pagecount=ceil(总数/20)；≤20 条的分类 pagecount=1 不触发翻页。
+//   旧版 page 1 全量返回、page>1 直接回空，App 点“加载更多”拿不到内容。
 // 详情：剧集页 /zh-CN/s/<slug>/ 内嵌 eps JSON（签名 m3u8，15 分钟过期）。
 // 播放：签名疑似绑 IP，必须点播现取：detail 只放 token "lp:<slug>:<n>"，
 // play() 现调 GET /p?s=<slug> 拿新鲜签名 m3u8。单档 720p 竖屏，无多清晰度。
@@ -11,6 +16,9 @@ const KEY = 'py_littlepervert';
 const NAME = '蜜夜AI';
 const HOST = 'https://littlepervert.com';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+// 本地分页页长：站内无翻页，分类页一次渲染全部剧集（“共 X 部”与卡片数一致），
+// 蜘蛛在本地按 20 条一页切分，page 1 只回前 20 条、page 2 回剩余，pagecount=ceil(总数/20)，
+// 这样 App 点“加载更多”能真正拿到剩余内容；≤20 条的分类 pagecount=1，不触发翻页。
 
 // 66 个子分类（type_id 用 slug，type_name 用中文名），按站方 5 个分组排列
 const CLASSES = [
@@ -290,6 +298,19 @@ function extractCover(html) {
   return '';
 }
 
+// 本地分页：把一次取回的完整列表按 PAGE_SIZE 切页返回
+const PAGE_SIZE = 20;
+
+function paginate(list, page) {
+  const total = list.length;
+  const pagecount = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  if (page > pagecount) {
+    return { page, pagecount, limit: PAGE_SIZE, total, list: [] };
+  }
+  const start = (page - 1) * PAGE_SIZE;
+  return { page, pagecount, limit: PAGE_SIZE, total, list: list.slice(start, start + PAGE_SIZE) };
+}
+
 async function init() {
   return {};
 }
@@ -302,19 +323,10 @@ async function category(reqIn) {
   const body = reqIn?.body || {};
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const id = String(body.id || 'off-limits');
-  // 分类页一次渲染全部剧集，无翻页；page > 1 直接返回空
-  if (page > 1) {
-    return { page, pagecount: 1, limit: 0, total: 0, list: [] };
-  }
+  // 站内无翻页：分类页一次渲染全部剧集，本地按 20 条一页切分返回
   const html = await getHtml(HOST + '/zh-CN/c/' + encodeURIComponent(id) + '/');
   const list = parseList(html);
-  return {
-    page,
-    pagecount: 1,
-    limit: list.length || 20,
-    total: list.length,
-    list,
-  };
+  return paginate(list, page);
 }
 
 async function detail(reqIn) {
@@ -402,19 +414,10 @@ async function search(reqIn) {
   const wd = String(body.wd || '').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!wd) return { page, pagecount: page, limit: 0, total: 0, list: [] };
-  // 搜索页一次渲染全部结果，无翻页
-  if (page > 1) {
-    return { page, pagecount: 1, limit: 0, total: 0, list: [] };
-  }
+  // 搜索页一次渲染全部结果、无翻页，本地按 20 条一页切分返回
   const html = await getHtml(HOST + '/zh-CN/search/?q=' + encodeURIComponent(wd));
   const list = parseList(html);
-  return {
-    page,
-    pagecount: 1,
-    limit: list.length || 20,
-    total: list.length,
-    list,
-  };
+  return paginate(list, page);
 }
 
 export default function spider() {
