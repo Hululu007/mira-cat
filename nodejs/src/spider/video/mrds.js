@@ -1,8 +1,9 @@
 // 每日大赛 - CatPawOpen 格式
 // 转换自 REX rex.mrds，站点 https://www.mrds66.com (WordPress)
 // 2026-11-11 修：手机上全空（暂无数据），根因是手机直连疑似被 CloudFront 按出口/IP 指纹拦
-// （VM 直连正常、站方标记与解析均未变）；修法为 fetchHtml 加 Worker 兜底腿
-// （直连优先、失败或回非真页时走 mrds-fetch Worker，需用户部署），解析/详情/播放/搜索未动。
+// （VM 直连正常、站方标记与解析均未变）；修法为 fetchHtml 加 Worker 腿。
+// 2026-11-11 夜：直连优先版手机仍全空（直连挂满超时烧掉 App 预算），改并行竞速，
+// 解析/详情/播放/搜索未动。
 import req from '../../util/req.js';
 
 const KEY = 'py_mrds';
@@ -81,13 +82,24 @@ async function fetchViaReq(url, timeout) {
 }
 
 async function fetchHtml(url) {
-  // 直连优先（短超时，免得在被拦的出口上空等 20 秒）
-  let html = await fetchViaReq(url, 10000);
-  if (looksReal(html)) return html;
-  // 直连失败或回非真页 → 走 Worker 兜底（Cloudflare 边缘代取）
-  html = await fetchViaReq(FETCH_WORKER + '/f/?u=' + encodeURIComponent(url), 15000);
-  if (looksReal(html)) return html;
-  return html || '';
+  // 2026-11-11 夜修：直连优先版推上去手机仍全空。直连在手机上被拦时不是快速失败，
+  // 而是把连接挂满超时（直连 10 秒烧完 App 的等待预算），Worker 腿来不及跑完。
+  // 改并行竞速（javrate v10 同款）：Worker 腿（已证实可用、约 2 秒）与直连腿同时跑，
+  // 谁先拿到真页用谁，谁都不等谁；两腿都失败才回空。
+  const workerUrl = FETCH_WORKER + '/f/?u=' + encodeURIComponent(url);
+  return new Promise((resolve) => {
+    let done = false;
+    let pending = 2;
+    let fallback = '';
+    const finish = (html) => {
+      if (done) return;
+      if (looksReal(html)) { done = true; resolve(html); return; }
+      if (html) fallback = html;
+      if (--pending === 0) { done = true; resolve(fallback); }
+    };
+    fetchViaReq(workerUrl, 8000).then(finish, () => finish(''));
+    fetchViaReq(url, 5000).then(finish, () => finish(''));
+  });
 }
 
 function parseArticles(html) {
