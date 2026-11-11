@@ -98,6 +98,8 @@ import px8x from './spider/video/px8x.js';
 import wddfa from './spider/video/wddfa.js';
 import wukong from './spider/video/wukong.js';
 import rdd22 from './spider/video/rdd22.js';
+import javass from './spider/video/javass.js';
+import pubjav from './spider/video/pubjav.js';
 
 const spiders = [
     missav_xptv,
@@ -142,6 +144,7 @@ const spiders = [
     sanjipian,
     ipornbase,
     jasex,
+    javass,
     javcc,
     javct,
     javfeed,
@@ -179,6 +182,7 @@ const spiders = [
     porncgw,
     pornhub,
     ppp,
+    pubjav,
     px8x,
     qimao,
     rou,
