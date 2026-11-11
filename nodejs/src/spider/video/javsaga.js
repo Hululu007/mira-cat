@@ -79,18 +79,24 @@ async function getText(url, timeout = 60000) {
 // 即返回；失败通道 90 秒内跳过（蜘蛛进程常驻，模块级状态跨请求有效），
 // 通道复活后由后续请求自动探活恢复。校验沿用旧口径（非拦截页且
 // >3000B），并补挡 "Attention Required" 硬封页（4.8KB 会漏过旧校验）。
-// 2026-11-11 提速：只留 direct + worker。jina 已实测会毒化竞速——它回的
-// Markdown 能过 goodPage（>3000B 且含 javsaga），但 parseCards/detail
-// 都要真 HTML，jina 赢了竞速就等于分类 0 条、详情空白（手机模拟实测：
-// jina 600ms 快过 direct 800ms 时分类 0 条、详情只有 fallback 标题）。
-// fzcrym（fs/page）主机已死，/fs 挂到超时 0 字节，45s 超时只会拖垮
-// direct 失败时的回空路径（最长 45s 才结算）。worker 未部署、404 速败，
-// 留作备用。direct 是手机主通道。
+// 2026-11-11 晚 v4：提速版（只留 direct + worker）回归——最新全空。
+// 教训：javsaga-fetch Worker 从来就没部署过，worker 腿从一开始就是死
+// 的；直连又被 CF 墙拦（VM 000/403），等于只剩走不通的腿。
+// jina 不进竞速：它回的 Markdown 能过 goodPage（>3000B 且含 javsaga），
+// 但 parseCards/detail 都要真 HTML，jina 赢了竞速就等于分类 0 条、详情
+// 空白（手机模拟实测：jina 600ms 快过 direct 800ms 时分类 0 条）。
+// fzcrym（fs/page）2026-10-22 曾死过，但 2026-11-11 晚实测已复活：
+// 首页 /fs 2.4 秒、/page 2.2 秒回真页（11 万字节），是目前唯一实测可
+// 用且快的备用腿（分类页方差大，8–55 秒）。Worker 是主通道（部署后）：
+// 同款 javxxx-fetch 取同样被墙的 javxxx.me 已实测可用。
+// 预算 60 秒 = 最长单腿超时 45 秒 + 15 秒余量。
 const PAGE_CHANNELS = [
   { name: 'direct', timeout: 20000, build: (u) => u },
+  { name: 'fs', timeout: 45000, build: (u) => FS_PAGE_API + encodeURIComponent(u) },
+  { name: 'page', timeout: 45000, build: (u) => PAGE_API + encodeURIComponent(u) },
   { name: 'worker', timeout: 15000, build: (u) => FETCH_WORKER + '/?u=' + encodeURIComponent(u) },
 ];
-const PAGE_BUDGET_MS = 30000;
+const PAGE_BUDGET_MS = 60000;
 const CHAN_COOLDOWN_MS = 90 * 1000;
 const chanDeadUntil = {};
 
@@ -143,12 +149,41 @@ async function fetchPage(url, bypassCooldown = false) {
   });
 }
 
+// Worker /list 快路径：服务端解析列表页成 JSON（约 10KB），比回 110KB
+// HTML 再由手机解析快得多。Worker 未部署/失败/回 0 条时返回 null，
+// 调用方回落 fetchPage + parseCards。只认 200 + 合法 JSON + 非空 list。
+async function fetchListViaWorker(url) {
+  try {
+    const r = await req.get(FETCH_WORKER + '/list?u=' + encodeURIComponent(url), {
+      headers: { 'User-Agent': UA },
+      timeout: 20000,
+    });
+    if (!r || r.status !== 200) return null;
+    const j = JSON.parse(String(r.data || ''));
+    if (!j || !Array.isArray(j.list) || !j.list.length) return null;
+    if (!j.list.every((it) => it && it.vod_id && it.vod_name)) return null;
+    return { list: j.list, pagecount: parseInt(j.pagecount, 10) || 1 };
+  } catch (e) {
+    return null;
+  }
+}
+
+// 列表统一入口：先走 Worker /list 快路径，失败回落 fetchPage + parseCards。
+async function fetchList(url, bypassCooldown = false) {
+  const w = await fetchListViaWorker(url);
+  if (w) return w;
+  const html = await fetchPage(url, bypassCooldown);
+  return { list: parseCards(html), pagecount: pagecount(html, 1) };
+}
+
 function parseCards(html) {
   const out = [];
   const seen = new Set();
   const blocks = String(html || '').split('<div class="post">').slice(1);
   for (const b of blocks) {
-    const m = b.match(new RegExp(`href="${HOST.replace(/\./g, '\\.')}/zh/(\\d+)\\.html"`));
+    // 根页 / 的条目链接不带 /zh/ 前缀（https://javsaga.ninja/<vid>.html），
+    // /zh/ 及分类页带前缀；两种都认，否则 homeVod 永远 0 条。
+    const m = b.match(new RegExp(`href="${HOST.replace(/\./g, '\\.')}/(?:zh/)?(\\d+)\\.html"`));
     if (!m) continue;
     const vid = m[1];
     if (seen.has(vid)) continue;
@@ -203,8 +238,8 @@ async function home() {
 }
 
 async function homeVod() {
-  const html = await fetchPage(HOST + '/');
-  return { list: parseCards(html) };
+  const r = await fetchList(HOST + '/');
+  return { list: r.list };
 }
 
 async function category(reqIn) {
@@ -227,14 +262,14 @@ async function category(reqIn) {
     url = page === 1 ? base + '/' : `${base}/page/${page}/`;
     if (sort) url += '?sort=' + encodeURIComponent(sort);
   }
-  let html = await fetchPage(url);
-  let items = parseCards(html);
+  let r = await fetchList(url);
+  let items = r.list;
   if (!items.length && lastFetchStarted === 0 && !lastFetchFromCache) {
     // 首轮一个通道都没启动（全被熔断跳过）时，才绕开熔断做一次真重试；首轮已实打实试过全部通道时不再烧第二轮
-    html = await fetchPage(url, true);
-    items = parseCards(html);
+    r = await fetchList(url, true);
+    items = r.list;
   }
-  return { page, pagecount: pagecount(html, page), limit: items.length || 24, total: items.length, list: items };
+  return { page, pagecount: Math.max(r.pagecount, page), limit: items.length || 24, total: items.length, list: items };
 }
 
 async function detail(reqIn) {
@@ -972,13 +1007,13 @@ async function search(reqIn) {
   if (!wd) return { page, pagecount: page, limit: 24, total: 0, list: [] };
   const kw = encodeURIComponent(wd);
   const url = page === 1 ? `${HOST}/?s=${kw}` : `${HOST}/page/${page}/?s=${kw}`;
-  let html = await fetchPage(url);
-  let items = parseCards(html);
+  let r = await fetchList(url);
+  let items = r.list;
   if (!items.length) {
-    html = await fetchPage(url);
-    items = parseCards(html);
+    r = await fetchList(url, true);
+    items = r.list;
   }
-  return { page, pagecount: pagecount(html, page), limit: items.length || 24, total: items.length, list: items };
+  return { page, pagecount: Math.max(r.pagecount, page), limit: items.length || 24, total: items.length, list: items };
 }
 
 // ---------------- 字幕聚合 (Layer A 铺开, 2026-10-23) ----------------
