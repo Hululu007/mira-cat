@@ -16,9 +16,21 @@
 //   若某片日后出现多档会自动出多线，绝不硬编。
 // 字幕：已接定版 subcore（2026-11-02）；但本站片名全为中文标题、基本不含番号，
 //   只有抠出番号的片才登记+预热，实测基本无字幕可贴（见 harness）。
-// 分类：49 个（实测）：首页最新 + 视频库 + 短剧库 + 糖心 12 + 福利姬 10 + 探花 10
-//   + PMV 7 + ASMR 1 + 短剧工作室 6；创作者按 /creators 页顺序取前 N（站内 93 个
+// 分类：51 个（实测）：首页最新 + 视频库 + 短剧库 + 糖心 12 + 福利姬 10 + 探花 10
+//   + PMV 7 + ASMR 1 + 短剧工作室 8；创作者按 /creators 页顺序取前 N（站内 93 个
 //   博主全量列出既验不过来、App 里也翻不动）；子分类名前缀标组，注释标从属。
+// 翻页修复（2026-11-12，用户报“有的分类下无法加载出更多内容，比如短剧类”）：
+//   根因 1（主因）：category()/search() 用 pagecount=Math.max(pc, page) 把页数
+//   “保底”成当前页——单页分类请求 p2 时回 pagecount=2 + 空列表，App 认为还有
+//   下一页、继续往空页里翻，表现为永远加载不出更多内容。已改：pagecount =
+//   本页有条目 ? max(导航最大页, 本页) : 导航最大页（导航不含当前页链接，故末页
+//   导航最大值会比真实页数小 1，必须用本页号补；空页绝不继承页号，单页分类
+//   任何页都报 1，App 到末页即停）。
+//   根因 2：短剧库 /c/shorts 全量统计漏了 2 个工作室——短剧放映室（39 部，2 页）
+//   与 2048AI短剧（15 部，1 页），本次补进短剧组。
+//   已核实不是 bug 的：4 个短剧工作室单页是站方真实总量（91成人短剧 4 部、
+//   黄果短剧 10 部、橙果短剧 16 部、野果短剧 24 部，站内元描述计数与 /c/shorts
+//   全量统计一致）；多页分类 p1/p2/p3 零重叠、导航恒含末页，翻页本身正常。
 import req from '../../util/req.js';
 
 const KEY = 'py_huangvideo';
@@ -86,6 +98,8 @@ const CLASSES = [
   { type_id: 'c:chengguo', type_name: '短剧·橙果短剧' },
   { type_id: 'c:huang-guo', type_name: '短剧·黄果短剧' },
   { type_id: 'c:huangguo', type_name: '短剧·黄果AI短剧' },
+  { type_id: 'c:short-videos', type_name: '短剧·短剧放映室' },
+  { type_id: 'c:ai2048', type_name: '短剧·2048AI短剧' },
 ];
 
 function headers(referer) {
@@ -304,12 +318,13 @@ async function category(reqIn) {
   }
   const html = await getHtml(listUrl(id, page));
   const list = parseList(html);
-  const pc = id === 'home' ? 1 : parseMaxPage(html);
+  const navMax = id === 'home' ? 1 : parseMaxPage(html);
+  const pc = list.length ? Math.max(navMax, page) : navMax;
   return {
     page,
-    pagecount: Math.max(pc, page),
+    pagecount: pc,
     limit: list.length || 24,
-    total: Math.max(pc, page) * (list.length || 24),
+    total: pc * (list.length || 24),
     list,
   };
 }
@@ -420,12 +435,13 @@ async function search(reqIn) {
   const url = HOST + '/search?q=' + encodeURIComponent(wd) + '&page=' + page;
   const html = await getHtml(url);
   const list = parseList(html);
-  const pc = parseMaxPage(html);
+  const navMax = parseMaxPage(html);
+  const pc = list.length ? Math.max(navMax, page) : navMax;
   return {
     page,
-    pagecount: Math.max(pc, page),
+    pagecount: pc,
     limit: list.length || 24,
-    total: Math.max(pc, page) * (list.length || 24),
+    total: pc * (list.length || 24),
     list,
   };
 }
