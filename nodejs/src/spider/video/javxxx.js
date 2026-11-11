@@ -15,6 +15,10 @@
 //  - /api/play/ 从 VM 实测 HTTP 200（与 bestjavporn 的 POST 全死不同），
 //    但最终 streamtape 取片在 VM 因出口 IP 与请求 IP 不一致被拒（500），
 //    手机上 App 内同一 IP 走完全程，预期可播，须真机验证。
+//  - v2（2026-11-11）：站方质询收紧后直连重试已无意义，取数改多腿并行竞速
+//    （Worker + 直连 + fetch + jina，见 getHtml/fetchPage），主腿是待部署的
+//    javxxx-fetch Worker（代码见 javxxx-fetch-worker.js，用户自行部署）；
+//    Worker 未部署时行为与 v1 一致（直连重试），部署后无需重推即生效。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -55,9 +59,7 @@ function headers(referer) {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// Cloudflare 托管质询页特征（2026-11-11 起站方质询变严：VM 侧约 70-80%
-// 的请求会被质询，同一地址重试常能拿到真页；单次请求失败即回空是
-// “列表能出、内容出不来”的直接原因）。命中质询页按失败重试。
+// Cloudflare 托管质询页特征：命中即算该腿失败（不抢赢、不污染结果）。
 function isChallengePage(body) {
   const s = String(body || '');
   return !s || s.length < 800 || s.includes('Just a moment') ||
@@ -65,41 +67,273 @@ function isChallengePage(body) {
     s.includes('challenges.cloudflare.com');
 }
 
-// 带重试的取页：质询/空响应/异常都重试，最多 6 次（每次独立过质询，
-// 实测 VM 侧约 25% 单次通过率，6 次累计约 82%；手机端 iOS
-// 原生 TLS 指纹通过率高于 VM，实际更好）。
-async function getHtml(url, referer) {
-  for (let i = 0; i < 6; i++) {
-    try {
-      const { data } = await req.get(url, { headers: headers(referer), timeout: 12000 });
-      const body = String(data || '');
-      if (!isChallengePage(body)) return body;
-    } catch (e) { /* 失败即重试 */ }
-    if (i < 5) await sleep(1000);
-  }
-  return '';
+// ---------- 取数：多腿并行竞速（2026-11-11 v2，照 JavRate v10 + pornhub-fetch 模式重构） ----------
+// 背景：站方 2026-11-11 起把 Cloudflare 托管质询收紧，VM 侧直连基本全灭
+// （403 "Just a moment" 或连接直接被掐断），手机端 App 的 req（axios 沙箱）
+// 同样被指纹拦，列表全空。旧版“直连重试 6 次”在质询率 ~100% 时已无意义。
+// 新版照抄两条已被证实有效的路子：
+//  ① JavRate 猫源 v10：三腿并行竞速——Worker 腿 + 直连腿 + jina 腿，
+//     先拿到真页者赢；另加两条全局 fetch 腿（直连 + Worker），赌 App 的
+//     fetch 走与 REX Widget.http.get 相近的原生栈（REX 的 JavRate 能过
+//     站方验证、猫源 req 被指纹拦，同源同理）。App 内无 fetch 时不加腿。
+//  ② pornhub-fetch / duanju91-fetch：专用取页 Worker（CF 边缘代取），
+//     列表/详情/播放接口全走它。Worker 未部署时该腿速败（404），行为与
+//     旧版一致；部署后无需重推即生效。
+// 腿清单（getHtml，列表用；jina 只给列表，见 mdToListHtml）：
+//   worker        req   FETCH_WORKER /f/<b64url>  15s
+//   direct        req   直连（内部最多 3 次，1s 间隔）  12s/次
+//   worker-fetch  fetch FETCH_WORKER /f/<b64url>  15s（有 fetch 才发）
+//   direct-fetch  fetch 直连                      12s（有 fetch 才发）
+//   jina          req   https://r.jina.ai/<目标>   20s（回 Markdown，转列表 HTML）
+//   jina-fetch    fetch 同上                       20s（有 fetch 才发）
+// getHtmlOnly（详情/播放/embed 用，不走 jina）：jina 的 Markdown 丢掉了
+// data-ts-live / data-ts-id / data-config 这些 HTML 属性，解不出播放地址，
+// 故详情与播放链路只走 HTML 腿（Worker + 直连 + fetch），与 JavRate 的
+// htmlOnly/mdOnly 分流同理。
+// 质询页/空页/报错的腿只算失败、不抢赢；全部腿落败时立即回空，不烧满上限。
+const FETCH_WORKER = 'https://javxxx-fetch.li768435813.workers.dev';
+const JINA = 'https://r.jina.ai/';
+
+function b64url(str) {
+  try {
+    return Buffer.from(String(str), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+function viaWorker(url) { return FETCH_WORKER + '/f/' + b64url(url); }
+
+// 硬定时器包装（照 JavRate v6）：不依赖 axios timeout 是否生效，超时即结算 fallback。
+function withTimeout(p, ms, fallback) {
+  var t;
+  var to = new Promise(function (resolve) { t = setTimeout(function () { resolve(fallback); }, ms); });
+  return Promise.race([Promise.resolve(p).finally(function () { clearTimeout(t); }), to]);
 }
 
-// 带重试的 POST /api/play/：质询/异常/非 JSON/非 status:true 都重试 4 次。
-async function postForm(url, form, referer) {
-  for (let i = 0; i < 4; i++) {
-    try {
-      const qs = new URLSearchParams(form).toString();
-      const { data } = await req.post(url, qs, {
-        headers: { ...headers(referer), 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' },
-        timeout: 15000,
-      });
-      let obj = {};
-      if (typeof data === 'string') {
-        try { obj = JSON.parse(data); } catch (e) { obj = {}; }
-      } else if (data && typeof data === 'object') obj = data;
-      if (obj && obj.status === true && obj.data) return obj;
-      // 非 status:true 但有 data 的也接受（容错站方字段变化）
-      if (obj && obj.data) return obj;
-    } catch (e) { /* 失败即重试 */ }
-    if (i < 3) await sleep(1000);
+// 先成功者赢：任一 job 返回真值即结算；全部失败/超时返回 null。
+function firstSuccess(jobs, ms) {
+  return new Promise(function (resolve) {
+    var done = false;
+    var settled = 0;
+    var total = jobs.length;
+    var timer = setTimeout(function () { if (!done) { done = true; resolve(null); } }, ms);
+    var onSettled = function () {
+      settled += 1;
+      if (!done && settled >= total) { done = true; clearTimeout(timer); resolve(null); }
+    };
+    if (total === 0) { done = true; clearTimeout(timer); resolve(null); return; }
+    for (var i = 0; i < jobs.length; i++) {
+      Promise.resolve(jobs[i]).then(function (v) {
+        if (done) return;
+        if (v) { done = true; clearTimeout(timer); resolve(v); return; }
+        onSettled();
+      }).catch(onSettled);
+    }
+  });
+}
+
+function isJinaMd(body) {
+  return typeof body === 'string' && body.length > 200 && body.indexOf('Markdown Content:') >= 0;
+}
+
+// jina Markdown → 列表 HTML（只供 parseList 用）：抽 /video/ 链接与封面图，
+// 合成 thumb-block 卡片。标题取链接文本；封面按顺序配最近的图片。
+// 注意标题里常含 [English Subtitle] 这类方括号，匹配必须用非贪婪 + URL 锚点，
+// 不能用 [^\]]+（会在第一个 ] 处断掉、丢条目）。
+function mdToListHtml(md) {
+  var text = String(md || '');
+  var items = [];
+  var seen = new Set();
+  var m, u;
+  var re1 = /\[!\[([\s\S]*?)\]\(([^)]+)\)\]\((https?:\/\/[^)\s]+\/video\/[^)\s]+|\/video\/[^)\s]+)\)/g;
+  while ((m = re1.exec(text)) !== null) {
+    u = m[3].indexOf('http') === 0 ? m[3].split('?')[0] : HOST + m[3].split('?')[0];
+    if (seen.has(u)) continue;
+    seen.add(u);
+    items.push({ url: u, title: cleanText(m[1] || ''), pic: m[2] || '', pos: m.index });
   }
-  return {};
+  var re2 = /\[([\s\S]*?)\]\((https?:\/\/[^)\s]+\/video\/[^)\s]+|\/video\/[^)\s]+)\)/g;
+  while ((m = re2.exec(text)) !== null) {
+    u = m[2].indexOf('http') === 0 ? m[2].split('?')[0] : HOST + m[2].split('?')[0];
+    if (seen.has(u)) continue;
+    seen.add(u);
+    items.push({ url: u, title: cleanText(m[1] || ''), pic: '', pos: m.index });
+  }
+  if (!items.length) return '';
+  // 封面：取每条链接之前最近的一张独立图片（位置最接近且在链接之前）
+  var imgs = [];
+  var re3 = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
+  while ((m = re3.exec(text)) !== null) imgs.push({ src: m[1], pos: m.index });
+  var out = [];
+  for (var i = 0; i < items.length; i++) {
+    var it = items[i];
+    var pic = it.pic || '';
+    if (!pic) {
+      var best = null;
+      for (var j = 0; j < imgs.length; j++) {
+        if (imgs[j].pos < it.pos && (!best || imgs[j].pos > best.pos)) best = imgs[j];
+      }
+      if (best) pic = best.src;
+    }
+    out.push('<div class="thumb-block"><a href="' + it.url + '" title="' + String(it.title || '').replace(/"/g, '') + '"><img src="' + pic + '"></a></div>');
+  }
+  return out.join('\n');
+}
+
+// 单条腿：返回 { body, kind }（kind: 'html' | 'md'）或 null（失败）。
+// kind=md 的腿只在 allowMd 时才被采纳，由调用方转 mdToListHtml。
+async function runLeg(leg, hdrs) {
+  try {
+    var body = '';
+    var status = 0;
+    if (leg.transport === 'fetch') {
+      var ctrl = null;
+      var abortTimer = null;
+      try {
+        if (typeof AbortController === 'function') ctrl = new AbortController();
+      } catch (e) { ctrl = null; }
+      var aborted = new Promise(function (resolve) {
+        abortTimer = setTimeout(function () {
+          try { if (ctrl) ctrl.abort(); } catch (e) {}
+          resolve(null);
+        }, leg.ms);
+      });
+      try {
+        var r = await Promise.race([
+          fetch(leg.u, { headers: hdrs, signal: ctrl ? ctrl.signal : undefined }),
+          aborted,
+        ]);
+        if (!r) return null;
+        status = r.status;
+        body = await withTimeout(r.text(), leg.ms, '');
+      } finally { clearTimeout(abortTimer); }
+    } else {
+      var r2 = await withTimeout(req.get(leg.u, { headers: hdrs, timeout: leg.ms }), leg.ms, null);
+      if (!r2) return null;
+      status = r2.status || 0;
+      body = (r2 && r2.data != null) ? String(r2.data) : '';
+    }
+    if (!body) return null;
+    if (leg.kind === 'md') {
+      if (!isJinaMd(body)) return null;
+      if (status !== 200) return null;
+      return { body: body, kind: 'md' };
+    }
+    if (isChallengePage(body)) return null;
+    if (status !== 200) return null;
+    return { body: body, kind: 'html' };
+  } catch (e) { return null; }
+}
+
+// 直连腿（带重试）：单次质询率高，内部最多 3 次、1s 间隔；
+// 其它腿先赢时本腿的后续重试自然被 firstSuccess 丢弃。
+async function runDirectLeg(url, hdrs) {
+  for (var i = 0; i < 3; i++) {
+    var got = await runLeg({ via: 'direct', ms: 12000, kind: 'html', u: url, transport: 'req' }, hdrs);
+    if (got) return got;
+    if (i < 2) await sleep(1000);
+  }
+  return null;
+}
+
+// 取页竞速：allowMd=true 时 jina 腿参与（列表用）；false 时只走 HTML 腿（详情/播放用）。
+async function fetchPage(url, referer, allowMd) {
+  var hdrs = headers(referer);
+  var legs = [
+    { via: 'worker', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'req' },
+  ];
+  if (allowMd) {
+    legs.push({ via: 'jina', ms: 20000, kind: 'md', u: JINA + url, transport: 'req' });
+  }
+  var hasFetch = (typeof fetch === 'function');
+  if (hasFetch) {
+    legs.push({ via: 'worker-fetch', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'fetch' });
+    legs.push({ via: 'direct-fetch', ms: 12000, kind: 'html', u: url, transport: 'fetch' });
+    if (allowMd) {
+      legs.push({ via: 'jina-fetch', ms: 20000, kind: 'md', u: JINA + url, transport: 'fetch' });
+    }
+  }
+  var jobs = legs.map(function (leg) { return runLeg(leg, hdrs); });
+  jobs.push(runDirectLeg(url, hdrs));
+  var won = await firstSuccess(jobs, 21000);
+  if (!won) return '';
+  if (won.kind === 'md') return mdToListHtml(won.body);
+  return won.body;
+}
+
+// 列表用（首页/分类/搜索）：HTML 腿 + jina 腿。
+async function getHtml(url, referer) {
+  return fetchPage(url, referer, true);
+}
+
+// 详情/播放/embed 用：只走 HTML 腿（jina 的 Markdown 没有 data-* 属性，解不出播放地址）。
+async function getHtmlOnly(url, referer) {
+  return fetchPage(url, referer, false);
+}
+
+// POST /api/play/ 多腿竞速：Worker POST 腿 + 直连 POST 腿（+ fetch 腿，有 fetch 才发）。
+// Worker 未部署时 Worker 腿速败；直连被质询时回挑战页、JSON 解析失败即算失败。
+function parsePlayResp(r) {
+  if (!r) return null;
+  var data = r.data;
+  var obj = {};
+  if (typeof data === 'string') {
+    try { obj = JSON.parse(data); } catch (e) { return null; }
+  } else if (data && typeof data === 'object') obj = data;
+  else return null;
+  if (obj && obj.status === true && obj.data) return obj;
+  if (obj && obj.data) return obj;
+  return null;
+}
+
+async function postForm(url, form, referer) {
+  var qs = new URLSearchParams(form).toString();
+  var hdrs = { ...headers(referer), 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' };
+  var jobs = [];
+  jobs.push((async function () {
+    try {
+      var r = await withTimeout(req.post(viaWorker(url), qs, { headers: hdrs, timeout: 15000 }), 15000, null);
+      return parsePlayResp(r);
+    } catch (e) { return null; }
+  })());
+  jobs.push((async function () {
+    for (var i = 0; i < 3; i++) {
+      try {
+        var r2 = await req.post(url, qs, { headers: hdrs, timeout: 12000 });
+        var o = parsePlayResp(r2);
+        if (o) return o;
+      } catch (e) {}
+      if (i < 2) await sleep(1000);
+    }
+    return null;
+  })());
+  if (typeof fetch === 'function') {
+    jobs.push((async function () {
+      try {
+        var ctrl = null;
+        try { if (typeof AbortController === 'function') ctrl = new AbortController(); } catch (e) {}
+        var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 15000);
+        try {
+          var r3 = await fetch(viaWorker(url), { method: 'POST', headers: hdrs, body: qs, signal: ctrl ? ctrl.signal : undefined });
+          var t3 = await r3.text();
+          return parsePlayResp({ data: t3 });
+        } finally { clearTimeout(timer); }
+      } catch (e) { return null; }
+    })());
+    jobs.push((async function () {
+      try {
+        var ctrl2 = null;
+        try { if (typeof AbortController === 'function') ctrl2 = new AbortController(); } catch (e) {}
+        var timer2 = setTimeout(function () { try { if (ctrl2) ctrl2.abort(); } catch (e) {} }, 12000);
+        try {
+          var r4 = await fetch(url, { method: 'POST', headers: hdrs, body: qs, signal: ctrl2 ? ctrl2.signal : undefined });
+          var t4 = await r4.text();
+          return parsePlayResp({ data: t4 });
+        } finally { clearTimeout(timer2); }
+      } catch (e) { return null; }
+    })());
+  }
+  var won = await firstSuccess(jobs, 20000);
+  return won || {};
 }
 
 function absUrl(u) {
@@ -165,7 +399,7 @@ function embedPathQuery(embedUrl) {
 async function resolveEmbed(embedUrl, referer) {
   try {
     var full = absUrl(embedUrl);
-    var html = await getHtml(full, referer);
+    var html = await getHtmlOnly(full, referer);
     if (!html) return '';
     var cm = html.match(/data-config="([^"]+)"/);
     if (!cm) return '';
@@ -193,7 +427,7 @@ async function resolveEmbed(embedUrl, referer) {
 
 // 详情页 → 最终播放地址（现取现播；主 embed 不行则按 reserve 顺序重试）
 async function resolvePlay(detailUrl) {
-  var html = await getHtml(detailUrl);
+  var html = await getHtmlOnly(detailUrl);
   if (!html) return '';
   var live = (html.match(/data-ts-live="([^"]+)"/) || [])[1] || '';
   var tid = (html.match(/data-ts-id="([^"]+)"/) || [])[1] || '';
@@ -289,7 +523,7 @@ async function detail(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var vid = String(body.id || '').trim();
   if (!vid) return { list: [] };
-  var html = await getHtml(vid);
+  var html = await getHtmlOnly(vid);
   var name = '';
   var tm = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i)
     || html.match(/<title>([\s\S]*?)<\/title>/i);
