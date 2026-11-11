@@ -1,22 +1,57 @@
-// JAV ASS LOVER (https://javass.love) -> CatPawOpen spider
+// Javass (https://javass.love) -> CatPawOpen spider
 // WordPress 视频站：首页 60 条/页（共 102 页），分类/标签 20 条/页，搜索 /?s= 20 条/页。
-// 播放源分四种（2026-11-12 实测）：
+// 播放源（2026-11-12 全分类扫查：32 分类、217 部详情抽样；Bunny 原生 132、Lulu 53、
+//   hgcloud 18、upns 10、playmogo 1、Bunny 嵌套 0、取页失败 3；无播放线 82/217 = 37.8%）：
 //   1. Bunny 原生：video-js data-settings 直给 b-cdn.net playlist.m3u8，主播单含 480p/720p/1080p/1440p/2160p
 //      多档（每片 3-4 档不等，以主播单实测为准），直取 200、无 UA 校验 —— 可播，多清晰度。
-//   2. Bunny 嵌套：iframe.mediadelivery.net 嵌套页里含同一 b-cdn.net 播单 —— 可播，多清晰度。
-//   3. Lulu 系嵌套（luluvido/luluvdo/lulust）：packed JS 解出 tnmr.org 签名 m3u8 单档 720p，但 CDN 全程
-//      只认浏览器 UA（AppleCoreMedia/Lavf/ExoPlayer 一律 403），App 播放器发媒体 UA，分片拿不到 —— 不列播放线。
-//   4. hgcloud 嵌套：JS 壳 + 混淆 main.js，解不出直链 —— 不列播放线。
-// 约 2/3 视频可播（Bunny 两路），其余点开无集数（非蜘蛛问题，是站方嵌套源在 App 里播不了）。
-// 封面直链（javass.love/wp-content/uploads）实测 200 无防盗链，无需代理；站方直连 200 无墙，无需 Worker。
+//   2. Bunny 嵌套：iframe.mediadelivery.net 嵌套页里含同一 b-cdn.net 播单 —— 可播，多清晰度
+//      （本次抽样 217 部里为 0，稀有；另有 home 探查中见到 1 部 mediadelivery，链路保留）。
+//   3. Lulu 系嵌套（luluvido/luluvdo/lulust）：嵌套页含 Dean Edwards packed JS，解出 tnmr.org
+//      签名 master.m3u8（单变体 720p，token 每次取嵌套页现生、8 小时有效、无 IP 成分），
+//      但 CDN 全程只认浏览器 UA（媒体 UA 在 master/变体/密钥/分片四级全部 403）——
+//      已修：蜘蛛现解签名 master，播放走自建 Cloudflare Worker javass-hls 中转
+//      （Worker 内用浏览器 UA 取数并改写播单，视频流量走 Cloudflare、不走 Railway），
+//      出线为单档 720p（只列真实档位，绝不硬编）。
+//      坑：tnmr.org 的 WAF 遇 Accept-Language: zh-CN 一律 403（UA+Referer 200，
+//      再加 Accept-Language 即 403）；蜘蛛取 master 必须用 getMediaText（不带
+//      Accept-Language），用 getHtml 取必 403、详情不出线（2026-11-12 实测坐实）。
+//      Worker 上游只带 UA+Referer，不带 Accept-Language，同样原因。
+//   4. hgcloud 嵌套：修不了（证据见下）。嵌套页仅 452 字节空壳（Loading + /main.js?v=1.1.9），
+//      main.js 71,214 字节 obfuscator.io 混淆（582 项字符串表 + RC4 解码 + 字符串切分 +
+//      反调试循环）；Node vm + DOM stub + 真实 fetch 跑 15 秒：零网络请求、零 DOM 写、
+//      未注册任何监听器，只见反调试定时器循环解码同一批约 146 个碎片（约 400 次）；
+//      播放器初始化依赖真实浏览器环境，无法在蜘蛛里复现；可猜的 API 端点
+//      （/dl、/api/file、/d）一律回同一空壳或 522；站方根域名还间歇 522。
+//      结论：无可用播放地址，不列线。
+//   5. upns.online 嵌套：修不了。嵌套页 JS 逻辑为取 hash 作 file1 调 /api/public/resolve?file1=
+//      取 {url} 后跳转；12 个不同 hash 全部回 {"ok":false,"error":"not found"} HTTP 404
+//      （换 cookie、换 Referer、重取新鲜 hash 均同），嵌套页无 cookie；详情页除 upns iframe
+//      外无第二播放源、无 m3u8/mp4 链接。结论：解析器后端记录已清空/过期，不列线。
+//   6. playmogo（DoodStream）：修不了。嵌套页点播放渲染 Cloudflare Turnstile 真人验证墙，
+//      按底线不绕真人验证墙，不列线。
+//   修后可播约 86%（Bunny 两路 62.2% + Lulu 24.4%）；剩余 13.4%（hgcloud 8.3% + upns 4.6% +
+//   playmogo 0.5%）为站方死嵌套，点开仍无集数，非蜘蛛问题。
+// 封面直链（javass.love/wp-content/uploads）实测 200 无防盗链，无需代理；站方直连 200 无墙。
+// Highlighted 翻页：站方该分类真实只有 24 部（p1 20 条 + p2 4 条，p3 为空）；
+//   旧蜘蛛乐观报 pagecount=page+1（p2 报 3），App 会去请求空的 p3。现改为取页验证法
+//   报真实 pagecount（见 truePagecount），p2 报 2，App 在 p2 后干净收尾。
+// Lulu 嵌套页 host 轮换：同一 file_code 在 luluvido/luluvdo/lulust 三 host 间尝试，
+//   详情页含双 iframe 时以文档顺序第一个 Lulu iframe 为主播放器（hgcloud 若在描述区，
+//   其 iframe 在 post-content 之后，不会被误取）。
 import req from '../../util/req.js';
 
 const KEY = 'py_javass';
-const NAME = 'JAV ASS LOVER';
+const NAME = 'Javass';
 const HOST = 'https://javass.love';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 // 本站 Bunny 拉流区（原生与嵌套多片实测一致，仅作嵌套页取不到播单时的兜底拼接用）
 const BUNNY_VZ = 'https://vz-9f2ab8d8-84b.b-cdn.net';
+// Lulu 系播放中转：自建 Cloudflare Worker javass-hls（部署名 javass-hls，
+//   根回 "javass hls ok"，代码见 javass-worker.js；视频流量走 Cloudflare、不走 Railway）。
+//   蜘蛛只把签名 master 地址交给 Worker，播放器全程只见 Worker 自身地址。
+const JAVASS_HLS = 'https://javass-hls.li768435813.workers.dev';
+const JAVASS_RELAY_KEY = 'lai-hls-1';
+const LULU_HOSTS = ['luluvido.com', 'luluvdo.com', 'lulust.com'];
 
 // 分类 32 个：首页最新 + 6 个站内顶级分类（/categories/ 下全部；站方拼写是 jav-censured，
 // jav-censored 是 404 死 slug）+ 25 个标签（首页 p1 出现 >=3 次的有意义标签）。
@@ -92,6 +127,25 @@ function headers() {
 async function getHtml(url) {
   try {
     const r = await req.get(url, { headers: headers(), timeout: 20000, responseType: 'text', transformResponse: [(d) => d] });
+    const data = r && r.data;
+    if (typeof data === 'string') return data;
+    if (data) return JSON.stringify(data);
+    return '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// 取播单类地址：只带浏览器 UA + Referer，不带 Accept-Language（tnmr.org 的 WAF 遇
+// Accept-Language: zh-CN 一律回 403；2026-11-12 实测：UA+Referer 200，
+// 再加 Accept-Language 即 403）。Lulu 签名 master 必须走这个取，否则 parseMaster
+// 拿到 403 页、解析不出档位、详情不出线。
+async function getMediaText(url, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
+      timeout: 20000, responseType: 'text', transformResponse: [(d) => d],
+    });
     const data = r && r.data;
     if (typeof data === 'string') return data;
     if (data) return JSON.stringify(data);
@@ -249,6 +303,103 @@ async function resolveMediadelivery(embedUrl) {
   return '';
 }
 
+
+// ---------- Lulu 系嵌套（Dean Edwards packed JS 现解 + javass-hls 中转） ----------
+// base64url 编解码（猫源沙箱有 Buffer，走 Buffer；无 Buffer 时走 TextEncoder+btoa 兜底）。
+function b64urlEncode(s) {
+  try {
+    if (typeof Buffer !== 'undefined') return Buffer.from(String(s), 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { /* 走兜底 */ }
+  const bytes = new TextEncoder().encode(String(s));
+  let bin = '';
+  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+// 详情页取第一个 Lulu iframe（文档顺序第一个即主播放器；描述区的 hgcloud iframe 在后，不误取）。
+function extractLuluEmbed(html) {
+  const iframes = html.match(/<iframe[^>]+src="([^"]+)"[^>]*>/gi) || [];
+  for (const tag of iframes) {
+    const um = tag.match(/src="([^"]+)"/i);
+    if (um && /lulu(?:vido|vdo|st)\.com\/e\//i.test(um[1])) return um[1].replace(/&amp;/g, '&');
+  }
+  return '';
+}
+
+// Dean Edwards packer 简化版反混淆（无 eval，纯字符串替换；Lulu 嵌套页实测结构）：
+//   eval(function(p,a,c,k,e,d){while(c--)if(k[c])p=p.replace(new RegExp('\\b'+c.toString(a)+'\\b','g'),k[c]);return p}
+//     ('PAYLOAD',36,291,'kw1|kw2|...'.split('|')))
+// 解开后含 jwplayer(...).setup({sources:[{file:"https://<sub>.tnmr.org/.../master.m3u8?t=...&s=...&e=28800&..."}]})。
+function unpackDeanEdwards(html) {
+  const m = html.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\)\)\)/);
+  if (!m) return '';
+  let p = m[1].replace(/\\"/g, '"').replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+  const a = parseInt(m[2], 10);
+  const k = m[4].split('|');
+  let c = parseInt(m[3], 10);
+  while (c--) {
+    if (k[c]) p = p.replace(new RegExp('\\b' + c.toString(a) + '\\b', 'g'), k[c]);
+  }
+  return p;
+}
+
+// 取 Lulu 签名 master：同一 file_code 在三 host 间按顺序尝试，解 packed JS 得 tnmr.org 签名播单。
+// 嵌套页取数用浏览器 UA + 详情页 Referer（Lulu 嵌套页本身不校验 UA，但保持一致）。
+async function resolveLulu(embedUrl, referer) {
+  const cm = String(embedUrl || '').match(/\/e\/([A-Za-z0-9]+)/);
+  if (!cm) return '';
+  const code = cm[1];
+  const firstHost = (String(embedUrl).match(/https?:\/\/([^\/]+)/) || [])[1] || '';
+  const hosts = [];
+  if (firstHost) hosts.push(firstHost);
+  for (const h of LULU_HOSTS) if (hosts.indexOf(h) < 0) hosts.push(h);
+  for (const host of hosts) {
+    let page = '';
+    try {
+      const r = await req.get('https://' + host + '/e/' + code, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
+        timeout: 15000, responseType: 'text', transformResponse: [(d) => d],
+      });
+      const data = r && r.data;
+      page = typeof data === 'string' ? data : (data ? JSON.stringify(data) : '');
+    } catch (e) { page = ''; }
+    if (!page) continue;
+    const unpacked = unpackDeanEdwards(page);
+    if (!unpacked) continue;
+    const um = unpacked.match(/https?:\/\/[a-z0-9\-.]+\.tnmr\.org\/[^\s"'\\]+\.m3u8[^\s"'\\]*/i);
+    if (um) return um[0];
+  }
+  return '';
+}
+
+// Lulu 签名 master 走 Worker /p/ 路由；ctx 带 Referer 与密钥（与 javass-worker.js 的 RELAY_KEY 一致）。
+function luluWorkerUrl(master) {
+  // ctx 必须带 ua（蜘蛛的 UA 常量，Chrome 131）：Worker 默认 UA 是 Chrome 128，
+  // tnmr.org 的 WAF 拦 Chrome 128（Worker 用默认 UA 取 master 一律 502），
+  // Chrome 131 则 200（2026-11-12 实测：128→502、131→200；iPhone Safari UA 也 502）。
+  const ctx = b64urlEncode(JSON.stringify({ r: HOST + '/', k: JAVASS_RELAY_KEY, ua: UA }));
+  return JAVASS_HLS + '/p/' + b64urlEncode(master) + '/' + ctx;
+}
+
+// ---------- 真实 pagecount（取页验证法，修 Highlighted 翻页） ----------
+// 旧逻辑 pagecount=page+1 是乐观估计：末页也会多报一页，App 去请求空页。
+// 新逻辑：当前页非空时取下一页验证——下一页真实返回了有效 HTML 且解析出 0 条，才认定
+//   本页就是末页（pagecount=page）；下一页有条目则 pagecount=page+1；下一页取页失败
+//   （空串）时不做判断，沿用乐观值 page+1（不让一次网络抖动截断大分类的翻页）。
+// 结果按 cat|page 缓存（会话内），App 随后请求下一页时不再重复验证。
+const pagecountCache = new Map();
+async function truePagecount(cat, page, list) {
+  if (!list.length) return page;
+  const key = cat + '|' + page;
+  if (pagecountCache.has(key)) return pagecountCache.get(key) ? page + 1 : page;
+  let hasNext = true;
+  const nextHtml = await getHtml(listUrl(cat, page + 1));
+  if (nextHtml) hasNext = parseList(nextHtml).length > 0;
+  if (pagecountCache.size > 200) pagecountCache.delete(pagecountCache.keys().next().value);
+  pagecountCache.set(key, hasNext);
+  return hasNext ? page + 1 : page;
+}
+
 async function init() {
   return {};
 }
@@ -263,7 +414,7 @@ async function category(reqIn) {
   const id = String(body.id || 'home');
   const html = await getHtml(listUrl(id, page));
   const list = parseList(html);
-  return { page, pagecount: list.length ? page + 1 : page, list };
+  return { page, pagecount: await truePagecount(id, page, list), list };
 }
 
 async function detail(reqIn) {
@@ -280,7 +431,8 @@ async function detail(reqIn) {
   const dm = html.match(/property=["']og:description["'][^>]*content=["']([^"']+)/i);
   if (dm) content = decodeHtml(dm[1]);
 
-  // 播放线：只取 Bunny 两路的真实档位。Lulu/hgcloud 嵌套不列线（见文件头说明）。
+  // 播放线：Bunny 两路取真实档位；Lulu 系现解签名 master 走 javass-hls Worker 出单档 720p
+  //   （master 需先实取一次确认档位，取不到不列线）；hgcloud/upns/playmogo 不列线（见文件头）。
   let master = extractBunnyMaster(html);
   if (!master) {
     const embed = extractMediadeliveryEmbed(html);
@@ -294,6 +446,23 @@ async function detail(reqIn) {
       for (const v of variants) eps.push(v.label + '$' + v.url);
     } else {
       eps.push('原画$' + master);
+    }
+  }
+  if (!eps.length) {
+    const luluEmbed = extractLuluEmbed(html);
+    if (luluEmbed) {
+      const luluMaster = await resolveLulu(luluEmbed, url);
+      if (luluMaster) {
+        // 实取 master 确认档位（Lulu 单变体，实测为 1280x720）；取不到则不列线。
+        // 注意：必须用 getMediaText（不带 Accept-Language），getHtml 会被 tnmr 403。
+        const luluText = await getMediaText(luluMaster, url);
+        const luluVariants = parseMaster(luluText, luluMaster);
+        if (luluVariants.length) {
+          // Lulu master 只有一个变体（实测 720p）；出线只列这一档，Worker 地址指向 master，
+          // 播放器在改写后的 master 里只见到这一个变体。绝不把同一地址按档位重复列。
+          eps.push(luluVariants[0].label + '$' + luluWorkerUrl(luluMaster));
+        }
+      }
     }
   }
   const playUrl = eps.join('#');
