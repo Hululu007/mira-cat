@@ -100,6 +100,7 @@ import wukong from './spider/video/wukong.js';
 import rdd22 from './spider/video/rdd22.js';
 import javass from './spider/video/javass.js';
 import pubjav from './spider/video/pubjav.js';
+import huangvideo from './spider/video/huangvideo.js';
 
 const spiders = [
     missav_xptv,
@@ -141,6 +142,7 @@ const spiders = [
     hornyjav,
     huangdou,
     huangguo,
+    huangvideo,
     sanjipian,
     ipornbase,
     jasex,
