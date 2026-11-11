@@ -16,6 +16,9 @@ const HOST = 'https://rou.video';
 // /api 取清单走官方镜像域名: 主站 rou.video 的 /api 拦 Cloudflare Workers 出口, 镜像不拦 (同后端同 id)。
 const API_MIRROR_HOST = 'https://rouvb1.xyz';
 const HLS_WORKER = 'https://rou-hls.li768435813.workers.dev';
+// 2026-11-11 修：站方下线 5 个标签（韩国/欧美/网红/动漫/无码 均 404），已删；
+// 新增站方现行主分类 麻豆傳媒/fc2 ppv/my amateur-z（各 26 部实测）与麻豆子分类 24 个
+// （麻豆傳媒页导航所列，逐个实测 9-26 部）；其余解析/详情/播放未动。
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0';
 
 const CLASSES = [
@@ -24,13 +27,35 @@ const CLASSES = [
   { type_id: 'https://rou.video/t/自拍流出', type_name: '自拍流出' },
   { type_id: 'https://rou.video/t/OnlyFans', type_name: 'OnlyFans' },
   { type_id: 'https://rou.video/t/日本', type_name: '日本' },
-  { type_id: 'https://rou.video/t/韩国', type_name: '韩国' },
-  { type_id: 'https://rou.video/t/欧美', type_name: '欧美' },
-  { type_id: 'https://rou.video/t/网红', type_name: '网红' },
-  { type_id: 'https://rou.video/t/动漫', type_name: '动漫' },
   { type_id: 'https://rou.video/t/偷拍', type_name: '偷拍' },
   { type_id: 'https://rou.video/t/主播', type_name: '主播' },
-  { type_id: 'https://rou.video/t/无码', type_name: '无码' },
+  { type_id: 'https://rou.video/t/麻豆傳媒', type_name: '麻豆傳媒' },
+  { type_id: 'https://rou.video/t/fc2 ppv', type_name: 'fc2 ppv' },
+  { type_id: 'https://rou.video/t/my amateur-z', type_name: 'my amateur-z' },
+  { type_id: 'https://rou.video/t/愛豆傳媒', type_name: '愛豆傳媒' },
+  { type_id: 'https://rou.video/t/MD', type_name: 'MD' },
+  { type_id: 'https://rou.video/t/MDX', type_name: 'MDX' },
+  { type_id: 'https://rou.video/t/麻豆US', type_name: '麻豆US' },
+  { type_id: 'https://rou.video/t/MSD', type_name: 'MSD' },
+  { type_id: 'https://rou.video/t/MCY', type_name: 'MCY' },
+  { type_id: 'https://rou.video/t/MKY', type_name: 'MKY' },
+  { type_id: 'https://rou.video/t/MPG', type_name: 'MPG' },
+  { type_id: 'https://rou.video/t/FLIXKO', type_name: 'FLIXKO' },
+  { type_id: 'https://rou.video/t/貓爪影像', type_name: '貓爪影像' },
+  { type_id: 'https://rou.video/t/國產麻豆AV節目', type_name: '國產麻豆AV節目' },
+  { type_id: 'https://rou.video/t/麻豆女神微愛視頻', type_name: '麻豆女神微愛視頻' },
+  { type_id: 'https://rou.video/t/麻豆番外', type_name: '麻豆番外' },
+  { type_id: 'https://rou.video/t/麻豆三十天特別企劃', type_name: '麻豆三十天特別企劃' },
+  { type_id: 'https://rou.video/t/麻豆導演系列', type_name: '麻豆導演系列' },
+  { type_id: 'https://rou.video/t/情趣K歌房', type_name: '情趣K歌房' },
+  { type_id: 'https://rou.video/t/MDWP', type_name: 'MDWP' },
+  { type_id: 'https://rou.video/t/突襲女優家', type_name: '突襲女優家' },
+  { type_id: 'https://rou.video/t/麻豆女優', type_name: '麻豆女優' },
+  { type_id: 'https://rou.video/t/麻豆達人秀', type_name: '麻豆達人秀' },
+  { type_id: 'https://rou.video/t/澀會', type_name: '澀會' },
+  { type_id: 'https://rou.video/t/MDS', type_name: 'MDS' },
+  { type_id: 'https://rou.video/t/MDSR', type_name: 'MDSR' },
+  { type_id: 'https://rou.video/t/麻豆女神微愛影片', type_name: '麻豆女神微愛影片' },
 ];
 
 function headers() {
@@ -150,6 +175,9 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   let url = String(body.id || CLASSES[0].type_id);
   if (page > 1) url += `?order=createdAt&page=${page}`;
+  // 标签含空格（如 fc2 ppv / my amateur-z）或中文时必须编码，否则请求失败回空；
+  // encodeURI 只编空格与非 ASCII，?order=… 查询串不受影响（已实测编码后日本/fc2 均 26 条）。
+  url = encodeURI(url);
   const html = await getHtml(url);
   const list = parseCards(html);
   return {

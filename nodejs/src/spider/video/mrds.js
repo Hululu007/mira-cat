@@ -1,11 +1,21 @@
 // 每日大赛 - CatPawOpen 格式
 // 转换自 REX rex.mrds，站点 https://www.mrds66.com (WordPress)
+// 2026-11-11 修：手机上全空（暂无数据），根因是手机直连疑似被 CloudFront 按出口/IP 指纹拦
+// （VM 直连正常、站方标记与解析均未变）；修法为 fetchHtml 加 Worker 兜底腿
+// （直连优先、失败或回非真页时走 mrds-fetch Worker，需用户部署），解析/详情/播放/搜索未动。
 import req from '../../util/req.js';
 
 const KEY = 'py_mrds';
 const NAME = '每日大赛';
 const BASE = 'https://www.mrds66.com';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+// 取页 Worker（Cloudflare 边缘代取，2026-11-11 修）：站方走 CloudFront，手机 App 的 req 直连
+// 疑似按出口/IP 指纹被拦（VM 侧 curl/Node 直连正常、手机上全空；Jina 等数据中心出口能取到
+// 真页，说明不是全站封禁）；直连失败或回非真页时走 Worker 兜底。
+// 部署名 mrds-fetch，地址 https://mrds-fetch.li768435813.workers.dev/（需用户部署，
+// 代码在 mrds-fetch-worker.js；根回 "mrds fetch ok" 即部署成功）。
+// Worker 只取 HTML（列表/详情/搜索），不碰视频流；解析仍在蜘蛛里（parseArticles 已验通）。
+const FETCH_WORKER = 'https://mrds-fetch.li768435813.workers.dev';
 // 封面代理按域路由（2026-10-29 实测）：本站封面已全迁 pic.nihmcl.cn，原图为加密密文；
 // bagua 代理对该域回 400 Invalid URL，51chigua 代理回 200 合法图片（png/jpeg/gif 均验）。
 // 故 pic.*.cn 域固定走 51chigua，其余域沿用 bagua——两代理各擅长域不同，写死单一代理迟早再坏。
@@ -49,12 +59,35 @@ function t(v) {
   return String(v == null ? '' : v).trim().replace(/\s+/g, ' ');
 }
 
+// 真页判定：列表/搜索页有 <article>，详情页有 data-config；
+// 质询页/403 错误页/空页一律算失败（触发 Worker 兜底），绝不把假页当内容解析。
+function looksReal(html) {
+  const s = String(html || '');
+  if (!s || s.length < 2000) return false;
+  if (/Just a moment|Attention Required|Access Denied|cf-challenge|challenges\.cloudflare\.com/i.test(s)) return false;
+  return /<article\b/i.test(s) || /data-config=/.test(s);
+}
+
+async function fetchViaReq(url, timeout) {
+  try {
+    const { data } = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': BASE + '/' },
+      timeout: timeout || 10000,
+    });
+    return String(data || '');
+  } catch (e) {
+    return '';
+  }
+}
+
 async function fetchHtml(url) {
-  const { data } = await req.get(url, {
-    headers: { 'User-Agent': UA, 'Referer': BASE + '/' },
-    timeout: 20000,
-  });
-  return String(data || '');
+  // 直连优先（短超时，免得在被拦的出口上空等 20 秒）
+  let html = await fetchViaReq(url, 10000);
+  if (looksReal(html)) return html;
+  // 直连失败或回非真页 → 走 Worker 兜底（Cloudflare 边缘代取）
+  html = await fetchViaReq(FETCH_WORKER + '/f/?u=' + encodeURIComponent(url), 15000);
+  if (looksReal(html)) return html;
+  return html || '';
 }
 
 function parseArticles(html) {

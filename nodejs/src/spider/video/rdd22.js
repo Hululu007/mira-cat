@@ -11,6 +11,8 @@
 //   + 25 个视频分类 + 刷视频 (竖屏 feed, 单页 12 条) + 153 个标签 (标签云原序, 走搜索 API)。
 // 不进分类: 成人小说/动图专区/美图写真/成人漫画 (图文无视频)、番号磁力/国产磁力 (磁力无流)。
 // 注意: 域名来自用户给的 https://www.rdd22.top/home; HOST 是文件顶部单一常量, 改一处即可; 未发现备用域, 未猜。
+// 2026-11-11 修: 全部 API 分类空、仅热门排行有内容, 根因是 API 回 application/json 导致 App 内 axios 把 data
+//   自动解析成对象, String(data) 得 "[object Object]", JSON.parse 失败回空; 修法见 rawGet (强制原始文本 + 对象兜底)。
 // 门: 本站当前无门; getHtml 内留了与悟空同款的 xk_gate 过门兜底 (若日后站方加门, 自动取 token 设 Cookie 再取), 未碰任何统计像素。
 import req from '../../util/req.js';
 
@@ -230,8 +232,15 @@ function extractGateToken(html) {
 
 async function rawGet(url, isJson) {
   try {
-    const { data } = await req.get(url, { headers: headers(isJson), timeout: 20000 });
-    return String(data || '');
+    // 2026-11-11 修: 根因是 API 回 application/json, App 内 req (axios) 会把 data 自动解析成对象,
+    // 旧版 String(data) 得到 "[object Object]", 后续 JSON.parse 失败, 全部 API 分类回空
+    // (只有走 HTML 的热门排行能出内容)。修法: responseType:'text' + transformResponse 强制拿原始文本,
+    // 再兜底: 若 data 已是对象则 JSON.stringify 回 JSON 文本, 两种返回形态都走得通。
+    const r = await req.get(url, { headers: headers(isJson), timeout: 20000, responseType: 'text', transformResponse: [(d) => d] });
+    const data = r && r.data;
+    if (typeof data === 'string') return data;
+    if (data) return JSON.stringify(data);
+    return '';
   } catch (e) { /* fall through to fetch */ }
   try {
     if (typeof fetch === 'function') {

@@ -16,8 +16,13 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 // 分类: 顶级 3 个 (国产/日本/AI短剧) + 子分类去重后 153 个 (同名只留最小 id, 共 156 个)
 // 236 个原始分类里 43 个名字重复, 已按名字去重
+// 2026-11-11 用户要求无码/大屁股分类放首页最新后: 站内无"无码流出/无码破解/大屁股"原名,
+//   最接近的真分类是 无码专区(351)/日本无码(58)/翹臀美尻(176), 均已实测有内容可播, 故提到最前 (原位已删, 不重复)
 const CLASSES = [
   { type_id: 'home', type_name: '首页最新' },
+  { type_id: '351', type_name: '无码专区' },
+  { type_id: '58', type_name: '日本无码' },
+  { type_id: '176', type_name: '翹臀美尻' },
   { type_id: '1', type_name: '国产' },
   { type_id: '2', type_name: '日本' },
   { type_id: '321', type_name: 'AI短剧' },
@@ -49,7 +54,6 @@ const CLASSES = [
   { type_id: '55', type_name: '乱伦' },
   { type_id: '56', type_name: '探花' },
   { type_id: '57', type_name: '日本有码' },
-  { type_id: '58', type_name: '日本无码' },
   { type_id: '59', type_name: '主播网红' },
   { type_id: '60', type_name: '日本素人' },
   { type_id: '62', type_name: '精品推荐' },
@@ -93,7 +97,6 @@ const CLASSES = [
   { type_id: '173', type_name: '女同性爱' },
   { type_id: '174', type_name: 'AI换脸' },
   { type_id: '175', type_name: '多人群交' },
-  { type_id: '176', type_name: '翹臀美尻' },
   { type_id: '177', type_name: '丝袜美腿' },
   { type_id: '178', type_name: '精选独家' },
   { type_id: '179', type_name: '貧乳小奶' },
@@ -123,7 +126,6 @@ const CLASSES = [
   { type_id: '318', type_name: '人妖系列' },
   { type_id: '319', type_name: '韩国主播' },
   { type_id: '348', type_name: '亚洲情色' },
-  { type_id: '351', type_name: '无码专区' },
   { type_id: '352', type_name: '欧美性爱' },
   { type_id: '353', type_name: '熟女人妻' },
   { type_id: '359', type_name: '卡通动画' },
