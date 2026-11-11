@@ -19,6 +19,13 @@
 //    （Worker + 直连 + fetch + jina，见 getHtml/fetchPage），主腿是待部署的
 //    javxxx-fetch Worker（代码见 javxxx-fetch-worker.js，用户自行部署）；
 //    Worker 未部署时行为与 v1 一致（直连重试），部署后无需重推即生效。
+//  - v3（2026-11-11）：v2 的并行竞速在手机上翻车——jina 腿常比 Worker 腿先赢，
+//    mdToListHtml 把 Markdown 转出假条目（封面文件名当标题、语言旗当封面、
+//    封面地址当详情地址），列表 1-4 条全假、点开播不了、最新全空。改两段式：
+//    HTML 腿先行竞速、全部落败才走 jina 兜底；mdToListHtml 加严校验（详情地址
+//    只认 javxxx.me 的 /video/<slug>/、标题/封面白名单），垃圾宁可返回空；
+//    parseList 封面改显式取 data-lazy-src（站方新上懒加载，主 img src 是
+//    data: 空占位）。解析、dex 链、字幕芯未动。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -79,13 +86,15 @@ function isChallengePage(body) {
 //  ② pornhub-fetch / duanju91-fetch：专用取页 Worker（CF 边缘代取），
 //     列表/详情/播放接口全走它。Worker 未部署时该腿速败（404），行为与
 //     旧版一致；部署后无需重推即生效。
-// 腿清单（getHtml，列表用；jina 只给列表，见 mdToListHtml）：
+// 腿清单（getHtml，列表用；jina 只作兜底，见 fetchPage 两段式）：
+//   第一段 HTML 腿：
 //   worker        req   FETCH_WORKER /f/<b64url>  15s
 //   direct        req   直连（内部最多 3 次，1s 间隔）  12s/次
 //   worker-fetch  fetch FETCH_WORKER /f/<b64url>  15s（有 fetch 才发）
 //   direct-fetch  fetch 直连                      12s（有 fetch 才发）
-//   jina          req   https://r.jina.ai/<目标>   20s（回 Markdown，转列表 HTML）
-//   jina-fetch    fetch 同上                       20s（有 fetch 才发）
+//   第二段 jina 腿（仅 HTML 全败时）：
+//   jina          req   https://r.jina.ai/<目标>   15s（回 Markdown，转列表 HTML）
+//   jina-fetch    fetch 同上                       15s（有 fetch 才发）
 // getHtmlOnly（详情/播放/embed 用，不走 jina）：jina 的 Markdown 丢掉了
 // data-ts-live / data-ts-id / data-config 这些 HTML 属性，解不出播放地址，
 // 故详情与播放链路只走 HTML 腿（Worker + 直连 + fetch），与 JavRate 的
@@ -135,38 +144,88 @@ function isJinaMd(body) {
   return typeof body === 'string' && body.length > 200 && body.indexOf('Markdown Content:') >= 0;
 }
 
-// jina Markdown → 列表 HTML（只供 parseList 用）：抽 /video/ 链接与封面图，
-// 合成 thumb-block 卡片。标题取链接文本；封面按顺序配最近的图片。
+// jina Markdown → 列表 HTML（只供 parseList 用）。v3 严校验（2026-11-11，
+// v2 教训：jina 腿在手机上先赢，mdToListHtml 把 Markdown 转出假条目）：
+//  ① 条目地址必须是 javxxx.me 的 /video/<slug>/ 详情页——封面图地址
+//     （pics.pornfhd.com /s/digital/video/...、i?.wp.com pics.dmm.co.jp）
+//     路径里也含 /video/，旧版正则只看路径含不含 /video/、不分 host，
+//     把封面地址当成详情地址，点开播不了；
+//  ② 标题必须是真标题：丢文件名（*.jpg 等）、丢 JSON/标记泄漏（含 {、}、
+//     "、data:image、http、](、![）、丢纯标签开头（English Subtitle /
+//     Uncensored Leaked…）、丢纯日期时长、丢超长（>200 字）；
+//  ③ 封面只认真封面 host（pics.pornfhd.com、i0-i3.wp.com、pics.dmm.co.jp、
+//     javxxx.me），语言旗标图（qtranslate/flags/）、data:、404.png 一律丢弃；
+//  ④ 任一校验失败即丢该条，宁缺毋滥——垃圾 Markdown 宁可返回空。
 // 注意标题里常含 [English Subtitle] 这类方括号，匹配必须用非贪婪 + URL 锚点，
 // 不能用 [^\]]+（会在第一个 ] 处断掉、丢条目）。
+function mdTitleOk(t) {
+  var s = String(t || '');
+  if (!s || s.length < 3 || s.length > 200) return false;
+  if (/\.(jpg|jpeg|png|gif|webp|svg|mp4|m3u8)(\?|#|$)/i.test(s)) return false;
+  if (/[{}\"]/.test(s)) return false;
+  if (/data:image|https?:\/\/|\]\[|!\[|\]\(/.test(s)) return false;
+  if (/^(English Subtitle|Chinese Subtitle|Uncensored Leak(ed)?|Japanese Subtitle|Indonesian? Subtitle|Subtitle Indonesia)\b/i.test(s)) return false;
+  if (/^\d{4}-\d{2}-\d{2}(\s+\d{1,2}:\d{2}(:\d{2})?)?$/.test(s)) return false;
+  if (!/[A-Za-z]/.test(s)) return false;
+  return true;
+}
+function mdPicOk(p) {
+  var s = String(p || '');
+  if (!s || /^data:/i.test(s)) return false;
+  if (/qtranslate|\/flags?\//i.test(s)) return false;
+  if (/404\.png/i.test(s)) return false;
+  try {
+    var h = new URL(s).hostname.toLowerCase();
+    if (h === 'pics.pornfhd.com' || h === 'pics.dmm.co.jp') return true;
+    if (/^i[0-3]\.wp\.com$/.test(h)) return true;
+    if (h === 'javxxx.me' || h === 'www.javxxx.me' || h === 'video.javxxx.me') return true;
+    return false;
+  } catch (e) { return false; }
+}
+function mdVideoUrl(u) {
+  // 只认 javxxx.me 的 /video/<slug>/ 详情页；其它 host（封面图站等）一律不要。
+  var s = String(u || '').split('?')[0].split('#')[0];
+  if (!s) return '';
+  var full = s.indexOf('http') === 0 ? s : HOST + s;
+  try {
+    var uu = new URL(full);
+    var h = uu.hostname.toLowerCase();
+    if (h !== 'javxxx.me' && h !== 'www.javxxx.me') return '';
+    if (!/^\/video\/[^\/]+\/?$/.test(uu.pathname)) return '';
+    return 'https://www.javxxx.me' + uu.pathname;
+  } catch (e) { return ''; }
+}
 function mdToListHtml(md) {
   var text = String(md || '');
   var items = [];
   var seen = new Set();
   var m, u;
-  var re1 = /\[!\[([\s\S]*?)\]\(([^)]+)\)\]\((https?:\/\/[^)\s]+\/video\/[^)\s]+|\/video\/[^)\s]+)\)/g;
+  var re1 = /\[!\[([\s\S]*?)\]\(([^)]+)\)\]\((https?:\/\/[^)\s]+|\/[^)\s]+)\)/g;
   while ((m = re1.exec(text)) !== null) {
-    u = m[3].indexOf('http') === 0 ? m[3].split('?')[0] : HOST + m[3].split('?')[0];
-    if (seen.has(u)) continue;
+    u = mdVideoUrl(m[3]);
+    if (!u || seen.has(u)) continue;
     seen.add(u);
-    items.push({ url: u, title: cleanText(m[1] || ''), pic: m[2] || '', pos: m.index });
+    items.push({ url: u, title: cleanText(m[1] || '').replace(/\\([\[\]])/g, '$1'), pic: m[2] || '', pos: m.index });
   }
-  var re2 = /\[([\s\S]*?)\]\((https?:\/\/[^)\s]+\/video\/[^)\s]+|\/video\/[^)\s]+)\)/g;
+  var re2 = /\[([\s\S]*?)\]\((https?:\/\/[^)\s]+|\/[^)\s]+)\)/g;
   while ((m = re2.exec(text)) !== null) {
-    u = m[2].indexOf('http') === 0 ? m[2].split('?')[0] : HOST + m[2].split('?')[0];
-    if (seen.has(u)) continue;
+    u = mdVideoUrl(m[2]);
+    if (!u || seen.has(u)) continue;
     seen.add(u);
-    items.push({ url: u, title: cleanText(m[1] || ''), pic: '', pos: m.index });
+    items.push({ url: u, title: cleanText(m[1] || '').replace(/\\([\[\]])/g, '$1'), pic: '', pos: m.index });
   }
   if (!items.length) return '';
-  // 封面：取每条链接之前最近的一张独立图片（位置最接近且在链接之前）
+  // 封面：取每条链接之前最近的一张独立图片（位置最接近且在链接之前），只认真封面
   var imgs = [];
   var re3 = /!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g;
-  while ((m = re3.exec(text)) !== null) imgs.push({ src: m[1], pos: m.index });
+  while ((m = re3.exec(text)) !== null) {
+    if (mdPicOk(m[1])) imgs.push({ src: m[1], pos: m.index });
+  }
   var out = [];
   for (var i = 0; i < items.length; i++) {
     var it = items[i];
-    var pic = it.pic || '';
+    if (!mdTitleOk(it.title)) continue;
+    var pic = mdPicOk(it.pic) ? it.pic : '';
     if (!pic) {
       var best = null;
       for (var j = 0; j < imgs.length; j++) {
@@ -180,7 +239,7 @@ function mdToListHtml(md) {
 }
 
 // 单条腿：返回 { body, kind }（kind: 'html' | 'md'）或 null（失败）。
-// kind=md 的腿只在 allowMd 时才被采纳，由调用方转 mdToListHtml。
+// kind=md 的腿只在第二段（allowMd）才发，见 fetchPage。
 async function runLeg(leg, hdrs) {
   try {
     var body = '';
@@ -235,32 +294,42 @@ async function runDirectLeg(url, hdrs) {
   return null;
 }
 
-// 取页竞速：allowMd=true 时 jina 腿参与（列表用）；false 时只走 HTML 腿（详情/播放用）。
+// 取页两段式（v3，2026-11-11）：先竞速 HTML 腿，全部落败才走 jina 腿。
+// v2 的教训：jina 与 HTML 腿并行竞速时，手机上 jina 常先赢（移动 IP 信誉好、
+// Worker 腿两跳较慢），mdToListHtml 把 Markdown 转出的假条目（封面文件名当
+// 标题、语言旗当封面、封面地址当详情地址）抢先返回，列表全是假条目、点开播不了。
+// v3 改为 HTML 腿先行、jina 只作兜底；且 mdToListHtml 已加严校验（见该函数），
+// 垃圾 Markdown 宁可返回空、也不出假条目。
 async function fetchPage(url, referer, allowMd) {
   var hdrs = headers(referer);
-  var legs = [
+  var hasFetch = (typeof fetch === 'function');
+  // 第一段：HTML 腿竞速（Worker + 直连 + fetch）
+  var htmlLegs = [
     { via: 'worker', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'req' },
   ];
-  if (allowMd) {
-    legs.push({ via: 'jina', ms: 20000, kind: 'md', u: JINA + url, transport: 'req' });
-  }
-  var hasFetch = (typeof fetch === 'function');
   if (hasFetch) {
-    legs.push({ via: 'worker-fetch', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'fetch' });
-    legs.push({ via: 'direct-fetch', ms: 12000, kind: 'html', u: url, transport: 'fetch' });
-    if (allowMd) {
-      legs.push({ via: 'jina-fetch', ms: 20000, kind: 'md', u: JINA + url, transport: 'fetch' });
-    }
+    htmlLegs.push({ via: 'worker-fetch', ms: 15000, kind: 'html', u: viaWorker(url), transport: 'fetch' });
+    htmlLegs.push({ via: 'direct-fetch', ms: 12000, kind: 'html', u: url, transport: 'fetch' });
   }
-  var jobs = legs.map(function (leg) { return runLeg(leg, hdrs); });
-  jobs.push(runDirectLeg(url, hdrs));
-  var won = await firstSuccess(jobs, 21000);
-  if (!won) return '';
-  if (won.kind === 'md') return mdToListHtml(won.body);
-  return won.body;
+  var htmlJobs = htmlLegs.map(function (leg) { return runLeg(leg, hdrs); });
+  htmlJobs.push(runDirectLeg(url, hdrs));
+  var won = await firstSuccess(htmlJobs, 15000);
+  if (won) return won.body;
+  // 第二段：HTML 全败且允许时才走 jina 腿（只给列表用；详情/播放不用，见 getHtmlOnly）
+  if (!allowMd) return '';
+  var mdLegs = [
+    { via: 'jina', ms: 15000, kind: 'md', u: JINA + url, transport: 'req' },
+  ];
+  if (hasFetch) {
+    mdLegs.push({ via: 'jina-fetch', ms: 15000, kind: 'md', u: JINA + url, transport: 'fetch' });
+  }
+  var mdJobs = mdLegs.map(function (leg) { return runLeg(leg, hdrs); });
+  var wonMd = await firstSuccess(mdJobs, 15000);
+  if (!wonMd) return '';
+  return mdToListHtml(wonMd.body);
 }
 
-// 列表用（首页/分类/搜索）：HTML 腿 + jina 腿。
+// 列表用（首页/分类/搜索）：HTML 腿先行、全部落败才走 jina 兜底（见 fetchPage）。
 async function getHtml(url, referer) {
   return fetchPage(url, referer, true);
 }
@@ -480,8 +549,18 @@ function parseList(html) {
     }
     if (!name) name = vodId.replace(/\/$/, '').split('/').pop();
     var pic = '';
-    var im = b.match(/<img[^>]+src="([^"]+)"/i);
-    if (im) pic = absUrl(im[1]);
+    // 封面：站方 2026-11-11 起用懒加载，主 img 的 src 是 data:image/svg+xml
+    // 空占位，真地址在 data-lazy-src（pics.pornfhd.com）/ noscript 兜底 /
+    // data-wpsrc（i?.wp.com）；按此顺序显式取，绝不取 data: 占位与 404.png。
+    // （旧版靠 <img[^>]+src= 的贪婪回溯恰好落到 data-lazy-src 上，换个属性
+    // 顺序就取错，v3 改显式。）
+    var pm = b.match(/data-lazy-src="(https?:\/\/[^"]+)"/i)
+      || b.match(/<noscript>[\s\S]*?<img[^>]+src="(https?:\/\/[^"]+)"/i)
+      || b.match(/data-wpsrc="(https?:\/\/[^"]+)"/i)
+      || b.match(/<img[^>]+src="(https?:\/\/[^"]+)"/i);
+    if (pm) pic = pm[1];
+    if (pic && /\/404\.png$/i.test(pic)) pic = '';
+    if (pic) pic = absUrl(pic);
     var remarks = '';
     var dm = b.match(/<span class="duration"[^>]*>([\s\S]*?)<\/span>/i);
     if (dm) remarks = cleanText(dm[1].replace(/<[^>]+>/g, ''));
