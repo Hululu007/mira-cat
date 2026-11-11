@@ -23,18 +23,14 @@ const PAGE_API = PROXY_BASE + '/page?u=';
 // v1 在岗时对 lk1 回 "host not allowed" 自动判败，v2 在岗时可手工跟跳转
 // 并提供 /wrap 包装页。部署状态不影响其余通道）
 const FETCH_WORKER = 'https://javsaga-fetch.li768435813.workers.dev';
-// 2026-11-11 实测（VM，supjav 同条件对照）：lk1 的 ?c= 能解 supjav 的
-// data-link hex（EVS/VOE/ST 三线均回真 embed），但对 javsaga 的 hex
-// 一律回 302 空 Location（两条 hex、反转/不反转、五种 Referer、
-// 蜘蛛原样头、新鲜 hex 全试过）。即 lk1 解不了 javsaga 的 hex，
-// javsaga 的真实 link 服务不在此（详情页按钮是 javascript:;，
-// 站内无 lk 地址；主题 JS pcmload.js 取不到——直连 CF 403、
-// 代理 502、Wayback 无快照）。手机上播放全灭与此一致。
-// 在拿到 javsaga 真实 link 服务地址前，play 链路走 lk1 注定失败；
-// 详情/列表不受影响（fetchPage 已修好，见 goodPage）。
-// 待确认：手机 Safari 开 javsaga 详情页、点任一线路，读播放器
-// iframe 的实际地址，即为真实 link 服务地址，届时把 LK_BASE 换过去。
-const LK_BASE = 'https://lk1.supremejav.com/supjav.php';
+// 2026-11-11 播放链路已打通（用户手机 Safari 详情页源码坐实，VM 实测复核）：
+// 播放器 iframe 是 https://lk1.supremejav.com/saga.php?l=<data-link hex 原样>；
+// 门页 JS 把 hex 反转后套 iframe saga.php?c=<反转 hex>；?c= 回 302 跳真嵌入页
+// （VAS→vvaassjjav.xyz，EVS→evsishere.xyz，VOE/ST/LUC 同理）。
+// 旧版错把 LK_BASE 写成 supjav.php（supjav 的端点），对 javsaga 的 hex
+// 一律回 302 空 Location——不是 lk1 解不了，是端点错了。现改为 saga.php，
+// lkResolveEmbed 原样复用（?c= 手工读 Location → resolveEmbed 解包）。
+const LK_BASE = 'https://lk1.supremejav.com/saga.php';
 
 // javsaga 分类（Wayback 2025-09-06 快照实测；站方导航原样）。
 // 视频分类 6 个 + 热门；子分类用标签页（/zh/tag/<slug>/），此处只挂
@@ -416,7 +412,7 @@ async function lkResolveEmbed(hex, detailUrl) {
     const w = await httpRaw(FETCH_WORKER + '/?u=' + encodeURIComponent(`${LK_BASE}?c=${reverseStr(hex)}`), { timeout: 30000, maxRedirects: 0 });
     const finalUrl = w.headers?.['x-final-url'] || '';
     const wbody = String(w.data || '');
-    if (finalUrl && !/supjav\.php/.test(finalUrl) && wbody.length > 300) {
+    if (finalUrl && !/supjav\.php|saga\.php/.test(finalUrl) && wbody.length > 300) {
       return { embedBody: wbody, embedUrl: finalUrl };
     }
     if (wbody.length > 800 && !/host not allowed|bad url|upstream blocked/.test(wbody) && !/OLID|start_player/.test(wbody)) {
@@ -895,7 +891,7 @@ async function play(reqIn) {
         return subAttach({ parse: 1, jx: 0, url: got.sniff, header: headers }, subsP);
       }
       // 嵌入页拿到了但没解出：嗅探嵌入页本身（不再回会自毁的门页）
-      if (lk.embedUrl && !/supjav\.php/.test(lk.embedUrl)) {
+      if (lk.embedUrl && !/supjav\.php|saga\.php/.test(lk.embedUrl)) {
         return subAttach({ parse: 1, jx: 0, url: lk.embedUrl, header: headers }, subsP);
       }
     }
