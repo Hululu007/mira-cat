@@ -101,6 +101,11 @@ import rdd22 from './spider/video/rdd22.js';
 import javass from './spider/video/javass.js';
 import pubjav from './spider/video/pubjav.js';
 import huangvideo from './spider/video/huangvideo.js';
+import av18 from './spider/video/py_18av.js';
+import asmrhoney from './spider/video/py_asmrhoney.js';
+import javheo from './spider/video/py_javheo.js';
+import javmove from './spider/video/py_javmove.js';
+import thzy1 from './spider/video/py_thzy1.js';
 
 const spiders = [
     missav_xptv,
@@ -108,6 +113,7 @@ const spiders = [
     chigua51,
     mmtv,
     rip17,
+    av18,
     jav24,
     shipin51,
     chigua57,
@@ -120,6 +126,7 @@ const spiders = [
     asian,
     asmr,
     asmrba,
+    asmrhoney,
     av01,
     avdb,
     avjoy,
@@ -153,9 +160,11 @@ const spiders = [
     javgg,
     javhd,
     javhdtoday,
+    javheo,
     javhey,
     javideo,
     javmit,
+    javmove,
     javmobile,
     javmost,
     javneon,
@@ -194,6 +203,7 @@ const spiders = [
     stripchat,
     supjav,
     taiav,
+    thzy1,
     tojav,
     topjav,
     ultra,
