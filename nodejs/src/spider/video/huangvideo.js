@@ -185,6 +185,34 @@ function parseMaxPage(html) {
   return max || 1;
 }
 
+// 创作者页元描述里的真实总数，如“黄视频收录黄豆魔改短剧的 25 部 AI 剧集”；
+// 视频库/短剧库/搜索页元描述无计数时回 0（调用方用 pc*24 估算）。
+function parseMetaTotal(html) {
+  if (!html) return 0;
+  const m = html.match(/收录[^"']*?的\s*(\d+)\s*部/);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    if (n > 0) return n;
+  }
+  return 0;
+}
+
+// 翻页信号（2026-11-12，用户报 8 个短剧分类都翻不出更多）：
+//   37aa3e5d 版报绝对真实页数（pagecount=14/2/1）在手机上仍翻不出更多；
+//   对照真机确认能翻页的丝瓜（相对页数：有下一页报 page+1、无则报 page），改用同款：
+//   有下一页 → pagecount = page + 1，无下一页 → pagecount = page，App 到末页即停；
+//   下一页是否存在只看导航（导航恒含末页链接、但不含当前页链接，故末页 navMax 会
+//   比真实页数小 1，用 navMax > page 判断即可）；空页一律报 pagecount = page。
+//   limit 恒为站方页容 24（不再用当页条数充数——满页的末页会被 App 当成还有下一页）；
+//   total 优先用元描述真实总数，无则用导航最大页*24 估算。
+function pageInfo(html, page, hasItems) {
+  const navMax = parseMaxPage(html);
+  const pc = (hasItems && navMax > page) ? page + 1 : page;
+  const meta = parseMetaTotal(html);
+  const total = meta > 0 ? meta : navMax * 24;
+  return { pc, total };
+}
+
 function parseList(html) {
   const out = [];
   const seen = new Set();
@@ -318,13 +346,14 @@ async function category(reqIn) {
   }
   const html = await getHtml(listUrl(id, page));
   const list = parseList(html);
-  const navMax = id === 'home' ? 1 : parseMaxPage(html);
-  const pc = list.length ? Math.max(navMax, page) : navMax;
+  const { pc, total } = id === 'home'
+    ? { pc: 1, total: list.length }
+    : pageInfo(html, page, list.length > 0);
   return {
     page,
     pagecount: pc,
-    limit: list.length || 24,
-    total: pc * (list.length || 24),
+    limit: 24,
+    total,
     list,
   };
 }
@@ -435,13 +464,12 @@ async function search(reqIn) {
   const url = HOST + '/search?q=' + encodeURIComponent(wd) + '&page=' + page;
   const html = await getHtml(url);
   const list = parseList(html);
-  const navMax = parseMaxPage(html);
-  const pc = list.length ? Math.max(navMax, page) : navMax;
+  const { pc, total } = pageInfo(html, page, list.length > 0);
   return {
     page,
     pagecount: pc,
-    limit: list.length || 24,
-    total: pc * (list.length || 24),
+    limit: 24,
+    total,
     list,
   };
 }
