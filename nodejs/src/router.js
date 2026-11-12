@@ -105,7 +105,6 @@ import av18 from './spider/video/py_18av.js';
 import asmrhoney from './spider/video/py_asmrhoney.js';
 import javheo from './spider/video/py_javheo.js';
 import javmove from './spider/video/py_javmove.js';
-import thzy1 from './spider/video/py_thzy1.js';
 import av77 from './spider/video/py_av77.js';
 import anysex from './spider/video/py_anysex.js';
 import beeg from './spider/video/py_beeg.js';
@@ -218,7 +217,6 @@ const spiders = [
     stripchat,
     supjav,
     taiav,
-    thzy1,
     tojav,
     topjav,
     ultra,
