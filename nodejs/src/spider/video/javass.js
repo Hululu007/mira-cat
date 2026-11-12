@@ -32,9 +32,9 @@
 //   修后可播约 86%（Bunny 两路 62.2% + Lulu 24.4%）；剩余 13.4%（hgcloud 8.3% + upns 4.6% +
 //   playmogo 0.5%）为站方死嵌套，点开仍无集数，非蜘蛛问题。
 // 封面直链（javass.love/wp-content/uploads）实测 200 无防盗链，无需代理；站方直连 200 无墙。
-// Highlighted 翻页：站方该分类真实只有 24 部（p1 20 条 + p2 4 条，p3 为空）；
-//   旧蜘蛛乐观报 pagecount=page+1（p2 报 3），App 会去请求空的 p3。现改为取页验证法
-//   报真实 pagecount（见 truePagecount），p2 报 2，App 在 p2 后干净收尾。
+// Highlighted 翻页：站方该分类真实只有 24 部（p1 20 条 + p2 4 条，p3 为空，实测）；
+//   pagecount 只看本页（见 localPagecount）：分类/标签短页即末页，p1 报 2、p2 报 2，
+//   App 在 p2 后干净收尾；首页取页内 /page/N/ 链接最大值。不再多取一次下一页验证。
 // Lulu 嵌套页 host 轮换：同一 file_code 在 luluvido/luluvdo/lulust 三 host 间尝试，
 //   详情页含双 iframe 时以文档顺序第一个 Lulu iframe 为主播放器（hgcloud 若在描述区，
 //   其 iframe 在 post-content 之后，不会被误取）。
@@ -381,23 +381,28 @@ function luluWorkerUrl(master) {
   return JAVASS_HLS + '/p/' + b64urlEncode(master) + '/' + ctx;
 }
 
-// ---------- 真实 pagecount（取页验证法，修 Highlighted 翻页） ----------
-// 旧逻辑 pagecount=page+1 是乐观估计：末页也会多报一页，App 去请求空页。
-// 新逻辑：当前页非空时取下一页验证——下一页真实返回了有效 HTML 且解析出 0 条，才认定
-//   本页就是末页（pagecount=page）；下一页有条目则 pagecount=page+1；下一页取页失败
-//   （空串）时不做判断，沿用乐观值 page+1（不让一次网络抖动截断大分类的翻页）。
-// 结果按 cat|page 缓存（会话内），App 随后请求下一页时不再重复验证。
-const pagecountCache = new Map();
-async function truePagecount(cat, page, list) {
-  if (!list.length) return page;
-  const key = cat + '|' + page;
-  if (pagecountCache.has(key)) return pagecountCache.get(key) ? page + 1 : page;
-  let hasNext = true;
-  const nextHtml = await getHtml(listUrl(cat, page + 1));
-  if (nextHtml) hasNext = parseList(nextHtml).length > 0;
-  if (pagecountCache.size > 200) pagecountCache.delete(pagecountCache.keys().next().value);
-  pagecountCache.set(key, hasNext);
-  return hasNext ? page + 1 : page;
+// ---------- pagecount（本页自证法，修 Highlighted 翻页） ----------
+// 旧取页验证法（当前页非空时再取下一页验证）已废弃：它让每次分类请求都多一次
+//   取页，耗时翻倍；更糟的是下一页取回 200 但解析 0 条时（截断/抖动/空页）会把
+//   pagecount 报成 page，App 从此不再给翻页——手机上 Highlighted 正是这么坏的
+//   （p1 出 20 条、p2 的 4 条永远翻不出来；VM 侧取页次次成功，复现不了）。
+// 新逻辑只看本页，无二次取页、无状态、无缓存，分两路：
+//   分类/标签：站方 widget 自报 posts_per_page=20，解析条数与 raw 条数一致，
+//     短页即末页（条数 < 20 报 page，满 20 报 page+1）；满页恰为末页的极少数
+//     情况（总数整除 20）会多报一页，App 要一次空页即收尾，与丝瓜/黄视频同款。
+//   首页：每页解析条数不固定（实测 47/48/36/26），不能用条数判断；改取页内
+//     /page/N/ 链接的最大值（WP 分页链接含末页号，p1/p2/p25/p50/p75/p101/p102
+//     七页实测均为 102），无链接则报 page。
+const PAGE_SIZE = 20;  // 分类/标签：widget posts_per_page=20（实测）
+function localPagecount(id, page, html, list) {
+  if (id === 'home' || id === '') {
+    let max = page;
+    const re = /href="[^"]*\/page\/(\d+)\/?[^"]*"/g;
+    let m;
+    while ((m = re.exec(html))) { const n = parseInt(m[1], 10); if (n > max) max = n; }
+    return max;
+  }
+  return list.length < PAGE_SIZE ? page : page + 1;
 }
 
 async function init() {
@@ -414,7 +419,7 @@ async function category(reqIn) {
   const id = String(body.id || 'home');
   const html = await getHtml(listUrl(id, page));
   const list = parseList(html);
-  return { page, pagecount: await truePagecount(id, page, list), list };
+  return { page, pagecount: localPagecount(id, page, html, list), list };
 }
 
 async function detail(reqIn) {
