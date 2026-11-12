@@ -106,6 +106,7 @@ import asmrhoney from './spider/video/py_asmrhoney.js';
 import javheo from './spider/video/py_javheo.js';
 import javmove from './spider/video/py_javmove.js';
 import thzy1 from './spider/video/py_thzy1.js';
+import av77 from './spider/video/py_av77.js';
 
 const spiders = [
     missav_xptv,
@@ -128,6 +129,7 @@ const spiders = [
     asmrba,
     asmrhoney,
     av01,
+    av77,
     avdb,
     avjoy,
     avporn,
