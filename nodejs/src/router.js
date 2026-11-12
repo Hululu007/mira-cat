@@ -112,6 +112,8 @@ import beeg from './spider/video/py_beeg.js';
 import javday from './spider/video/py_javday.js';
 import manko from './spider/video/py_manko.js';
 import porno4k from './spider/video/py_4kporno.js';
+import pimpbunny from './spider/video/py_pimpbunny.js';
+import yesporn from './spider/video/py_yesporn.js';
 
 const spiders = [
     missav_xptv,
@@ -202,6 +204,7 @@ const spiders = [
     one,
     pandalive,
     perverzija,
+    pimpbunny,
     porncgw,
     pornhub,
     ppp,
@@ -227,6 +230,7 @@ const spiders = [
     xvideos,
     xxxfollow,
     yeguo,
+    yesporn,
     youzidj,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
