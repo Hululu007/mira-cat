@@ -107,11 +107,17 @@ import javheo from './spider/video/py_javheo.js';
 import javmove from './spider/video/py_javmove.js';
 import thzy1 from './spider/video/py_thzy1.js';
 import av77 from './spider/video/py_av77.js';
+import anysex from './spider/video/py_anysex.js';
+import beeg from './spider/video/py_beeg.js';
+import javday from './spider/video/py_javday.js';
+import manko from './spider/video/py_manko.js';
+import porno4k from './spider/video/py_4kporno.js';
 
 const spiders = [
     missav_xptv,
     av123,
     chigua51,
+    porno4k,
     mmtv,
     rip17,
     av18,
@@ -124,6 +130,7 @@ const spiders = [
     dycg66,
     hl818,
     animesex,
+    anysex,
     asian,
     asmr,
     asmrba,
@@ -135,6 +142,7 @@ const spiders = [
     avporn,
     hyjx0817,
     bagua,
+    beeg,
     bianfu,
     bigbuttshub,
     brazz,
@@ -158,6 +166,7 @@ const spiders = [
     javass,
     javcc,
     javct,
+    javday,
     javfeed,
     javgg,
     javhd,
@@ -184,6 +193,7 @@ const spiders = [
     lissav,
     madou,
     madouai,
+    manko,
     mrds,
     mitao,
     littlepervert,
