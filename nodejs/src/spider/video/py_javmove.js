@@ -27,28 +27,46 @@
 //     play() 按 part 地址现取 data-id 再调 /watch, 不复用详情时 token。
 //     注意播放器另有 MSE + /decryptor.wasm + /api/session-ticket 加密分支,
 //     只在 /watch 不回直链 http(s) 地址时走, 本批 /watch 均回直链, 不走该分支。
-//   2026-11-13 复验新增 (封面/播放断点定位):
-//   - /watch 必须带 Referer 头 (任意值都行, 例 example.com 也通; 不带则 200 但正文
-//     仅 "re" 2 字节、无可用地址; 带 Referer 4 次全回 63 字节直链)。蜘蛛 play() 与
-//     getHtml 均显式带 Referer, VM 侧链路通; App 侧若 req 层剥 Referer 则 /watch
-//     必空 —— VM 无法验证 App 的头透传, 需设备侧定性 (见报告)。
-//   - data-id 每次加载都轮换 (同 URL 两次取到不同 token), 故 play() 必须现取,
-//     不可复用详情 token; /watch 对同一 token 确定性回同一 mp4, mp4 直链取后
-//     20+ 分钟仍 206 (非秒级过期); ?type=FULLHDFIXED 与 ?type=FULLHD_UPDATED
-//     回同一 mp4 (站方忽略未知 type、回默认 part), 但 '#' 按钮的 type 仍以组内
-//     兄弟链接的 ?type= 为准 (见 parseFormats), 不再用标题剥出来的臆测值。
-//   - 站方慢: 首页 4.6s、题材/制作商索引 6.2-6.4s、详情 3.9-11s、/watch 2.6-7s、
-//     封面单张 4-6s、mp4 Range 2.7-6s; play() 链 (part 页 + /watch + 字幕串行
-//     6s) 在 harness 实测 24-66s。play() 内字幕搜索改为与取页并行, 省掉串行
-//     6s; 封面本身 URL 形态无错 (绝对地址、ie2 host、无 Referer 也 200
-//     image/jpeg、无替代 host), VM 侧全通, 手机侧全灭未在 VM 复现。
+//   2026-11-13 第二轮真机反馈 (R2, 全部三项在 VM 侧复现并坐实):
+//   - 封面 1/12: 站方用 lazysizes, 每页只有第 1 张卡是 eager (img.movie-image
+//     src=真地址), 第 2-12 张全是 lazyload: src=1×1 透明占位 data-URI,
+//     真地址在 data-srcset 里 (上一轮 parseList 只取 src=, 故 11/12 条的
+//     vod_pic 是 data:image/png;base64,... 占位, App 永远显示灰块; 上一轮
+//     "VM 20/20" 只验了 pic 非空、没验是不是 data: URI, 结论作废)。
+//     修法: pickImg() 优先 data-srcset/data-src/data-original/srcset,
+//     拒收一切 data: URI, 只收 http(s) 真地址; 详情海报同理取首个
+//     data-srcset (详情页共 13 个 data-srcset: 海报 1 + 相关卡 12, 首个即海报)。
+//   - 筛选卡片重复两行: 每类下两张卡共用 key 'sub' (题材 + 制作商)。
+//     av123 所谓"同款"是误读 —— av123 是每类只挂一张 'sub' 卡 (genres/
+//     actresses/makers/series 各自一类一卡); 两张卡共用一个 key 时 extend
+//     只能存一个值 (选制作商会冲掉题材, 反之亦然), App 按 key 解析时两行
+//     显示同一组选项。修法: 两张卡改不同 key ('genre'/'maker'),
+//     category() 同时认 genre/maker 与旧 sub (兼容旧版 App 已存的筛选态)。
+//   - 播放全死: /watch 本身没坏 (带 Referer 63 字节直链, mp4 Range 带/不带
+//     Referer 均 206, 直链 1.79GB 真 mp4), 死因是 play() 太慢: part 页
+//     TTFB 12s + /watch 3s + 字幕并行搜索搅局, harness 实测 24-66s,
+//     远超 App 侧点播等待, 且站方现更慢 (首页 522、题材页 21.5s、
+//     /release 25s 超时)。修法三件套: (a) detail() 把当前 part (active
+//     按钮) 的 data-id 嵌进该集播放 id, play() 快径单次 /watch 直取直链
+//     (~3s, token 实测 8 分钟仍有效、约 20 分钟失效, 失效即回落); (b) 字幕改缓存只读 ——
+//     play() 只挂 detail() 预热已入缓存的命中, 不再现搜、不再等 6s、
+//     不再并发冲站方; (c) Worker 腿 javmove-fetch /resolve (整链代取 +
+//     10 分钟缓存, 见 JAVMOVE_WORKER), token 失效时先走 Worker 再直连。
+//     Worker 只做解析 (取页 + /watch), 不代理 mp4 字节 (直链本身通,
+//     1.8GB 走免费 Worker 既无必要也扛不住)。
 // 字幕: 接 sextb.js 定版字幕芯 (Layer A), 详情页地址为键登记片名、后台预热,
-//   play() 有命中才挂 subs。
+//   play() 只挂缓存命中 (无命中不现搜, 播放优先)。
 import req from '../../util/req.js';
 
 const KEY = 'py_javmove';
 const NAME = 'JavMove';
 const HOST = 'https://javmove.com';
+// 整链代取 Worker (用户部署, 见同目录 javmove-fetch-worker-v1.js):
+//   /resolve?mid=&slug=&type=&p= 取 part 页 -> data-id -> /watch 回直链 JSON,
+//   10 分钟缓存。未部署/失败/超时时 play() 自动回落直连, 不阻塞播放。
+//   部署名须与此一致 (https://javmove-fetch.li768435813.workers.dev),
+//   改名部署时只改这一行。
+const JAVMOVE_WORKER = 'https://javmove-fetch.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1';
 
 const CLASSES = [
@@ -147,12 +165,13 @@ const MAKERS = [
   { n: 'BIGMORKAL', v: 'maker/GSUAIJU/bigmorkal' },
 ];
 
-// 两张筛选卡共用 key 'sub' (123AV 同款): 值前缀 genres/ 与 maker/ 区分维度
+// 两张筛选卡必须用不同 key (R2: 共用 'sub' 时两行显示同一组选项, 且
+// extend 只能存一个值、互冲。av123 每类只挂一张卡, 不是两张共用 key)
 const FILTERS = {};
 for (const c of CLASSES) {
   FILTERS[c.type_id] = [
-    { key: 'sub', name: '题材', value: GENRES },
-    { key: 'sub', name: '制作商', value: MAKERS },
+    { key: 'genre', name: '题材', value: GENRES },
+    { key: 'maker', name: '制作商', value: MAKERS },
   ];
 }
 
@@ -170,6 +189,33 @@ function decodeHtml(s) {
 
 function cleanText(s) {
   return decodeHtml(t(String(s || '').replace(/<[^>]*>/g, ' ')));
+}
+
+// 封面取法 (R2 坐实): 站方用 lazysizes, 只有每页第 1 张卡是 eager
+// (src=真地址), 其余全是 src=1×1 透明占位 data-URI、真地址在
+// data-srcset 里。只取 src= 会让 11/12 条封面永远是占位灰块。
+// 顺序: data-srcset > data-src/data-original > srcset > src,
+// 一律只收 http(s), data: URI 与相对地址一律拒收。
+function attrVal(tag, name) {
+  const m = String(tag || '').match(new RegExp(name + '\\s*=\\s*"([^"]*)"', 'i'))
+    || String(tag || '').match(new RegExp(name + "\\s*=\\s*'([^']*)'", 'i'));
+  return m ? m[1] : '';
+}
+function pickImg(tag) {
+  if (!tag) return '';
+  const s = String(tag);
+  const fromSet = attrVal(s, 'data-srcset') || attrVal(s, 'srcset');
+  if (fromSet) {
+    const u = fromSet.split(/[\s,]+/).filter(Boolean)[0] || '';
+    if (/^https?:\/\//i.test(u)) return u;
+  }
+  for (const n of ['data-src', 'data-original']) {
+    const u = attrVal(s, n);
+    if (/^https?:\/\//i.test(u)) return u;
+  }
+  const src = attrVal(s, 'src');
+  if (/^https?:\/\//i.test(src)) return src;
+  return '';
 }
 
 async function getHtml(url, headers, timeoutMs) {
@@ -202,17 +248,19 @@ function parseList(html) {
     const slug = m[3];
     const body = m[4] || '';
     if (!mid || !slug) continue;
-    // 只收卡片锚点: 含 movie-image 或标题文本 (排除导航/相关区空锚)
-    const im = body.match(/<img[^>]+src="([^"]+)"/i);
+    // 只收卡片锚点: 含 img 或标题文本 (排除导航/相关区空锚);
+    // 封面走 pickImg() (data-srcset 优先, 占位 data-URI 拒收)
+    const imTag = body.match(/<img[^>]*>/i);
+    const pic = pickImg(imTag ? imTag[0] : '');
     const text = cleanText(body);
-    if (!im && !text) continue;
+    if (!imTag && !text) continue;
     let item = byId.get(mid);
     if (!item) {
       item = { vod_id: HOST + path, vod_name: '', vod_pic: '', vod_remarks: '' };
       byId.set(mid, item);
       out.push(item);
     }
-    if (im && !item.vod_pic) item.vod_pic = im[1];
+    if (pic && !item.vod_pic) item.vod_pic = pic;
     if (text && (!item.vod_name || text.length > item.vod_name.length)) item.vod_name = text;
   }
   for (const item of out) {
@@ -230,7 +278,8 @@ function parsePagecount(html) {
 }
 
 async function home() {
-  const html = await getHtml(HOST + '/');
+  // 站方现慢 (题材页 21.5s、首页曾 522), 单次 25s 不重试
+  const html = await getHtml(HOST + '/', null, 25000);
   return { class: CLASSES, filters: FILTERS, list: parseList(html).slice(0, 30) };
 }
 
@@ -239,7 +288,8 @@ async function category(reqIn) {
   const tid = t(body.tid || body.id) || 'latest';
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const extend = body.filters || body.extend || {};
-  const sub = t(extend.sub || '');
+  // R2: 两张卡分 key (genre/maker); 旧 'sub' 仅作兼容 (旧版 App 已存筛选态)
+  const sub = t(extend.genre || extend.maker || extend.sub || '');
   let url;
   let single = false;
   if (sub && (sub.startsWith('genres/') || sub.startsWith('maker/'))) {
@@ -259,7 +309,7 @@ async function category(reqIn) {
     url = page <= 1 ? HOST + '/' : HOST + '/?page=' + page;
   }
   if (single && page > 1) return { page, pagecount: 1, limit: 20, total: 20, list: [] };
-  const html = await getHtml(url);
+  const html = await getHtml(url, null, 25000);
   const list = parseList(html);
   const pc = single ? 1 : Math.max(parsePagecount(html), page);
   return {
@@ -278,7 +328,7 @@ async function search(reqIn) {
   if (!wd) return { page, pagecount: page, limit: 0, total: 0, list: [] };
   let url = HOST + '/search?q=' + encodeURIComponent(wd);
   if (page > 1) url += '&page=' + page;
-  const html = await getHtml(url);
+  const html = await getHtml(url, null, 25000);
   const list = parseList(html);
   const pc = Math.max(parsePagecount(html), page);
   return {
@@ -296,10 +346,14 @@ function movieOf(durl) {
 }
 
 // 详情页格式区: <h3 class="video-format-header">FullHD</h3> + 其后 part 按钮
-// (href="#" 为当前 part, 否则 ?type=<TYPE>&p=<N>); 每组每 part 出一线
-function parseFormats(html, mv) {
+// (href="#" 为当前 part, 否则 ?type=<TYPE>&p=<N>); 每组每 part 出一线。
+// token: 详情页 <video data-id> 只属于当前 part —— 页内唯一带
+// video-source-active 类的按钮就是它, 只有那一行嵌 token (其他 part
+// 各有自己的 token, 嵌错会播错片); 无按钮时默认单 part 也嵌 token。
+function parseFormats(html, mv, token) {
   const lines = [];
   if (!html) return lines;
+  const tok = token ? ':' + token : '';
   const heads = [...html.matchAll(/video-format-header[^>]*>\s*([^<]+?)\s*<\/h3>/g)];
   for (let i = 0; i < heads.length; i++) {
     const fmt = t(heads[i][1]);
@@ -314,20 +368,22 @@ function parseFormats(html, mv) {
     // 忽略未知 type 回默认 part, 与 FULLHD_UPDATED 回同一 mp4, 但仍以实值为准)。
     const typeInSeg = seg.match(/[?&]type=([A-Za-z0-9_-]+)/i);
     const canonType = typeInSeg ? typeInSeg[1].toUpperCase() : type;
-    const bre = /<a[^>]*class="[^"]*video-source-btn[^"]*"[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/g;
+    const bre = /<a[^>]*video-source-btn[^>]*>([^<]*)<\/a>/g;
     let bm;
     let hasBtn = false;
     while ((bm = bre.exec(seg)) !== null) {
       hasBtn = true;
-      const href = bm[1] || '';
-      const part = t(bm[2]) || '1';
+      const tag = bm[0] || '';
+      const href = attrVal(tag, 'href');
+      const part = t(bm[1]) || '1';
+      const isActive = /video-source-active/.test(tag);
       let ptype = canonType;
       let pnum = part;
       const qm = href.match(/[?&]type=([^&]+)&p=(\d+)/i);
       if (qm) { ptype = qm[1].toUpperCase(); pnum = qm[2]; }
-      lines.push(fmt + '·P' + pnum + '$move:' + mv.id + ':' + mv.slug + ':' + ptype + ':' + pnum);
+      lines.push(fmt + '·P' + pnum + '$move:' + mv.id + ':' + mv.slug + ':' + ptype + ':' + pnum + (isActive ? tok : ''));
     }
-    if (!hasBtn) lines.push(fmt + '·P1$move:' + mv.id + ':' + mv.slug + ':' + canonType + ':1');
+    if (!hasBtn) lines.push(fmt + '·P1$move:' + mv.id + ':' + mv.slug + ':' + canonType + ':1' + tok);
   }
   return lines;
 }
@@ -339,22 +395,30 @@ async function detail(reqIn) {
   if (!durl) return { list: [] };
   if (!/^https?:\/\//i.test(durl)) durl = HOST + durl;
   const mv = movieOf(durl);
-  const html = await getHtml(durl);
+  const html = await getHtml(durl, null, 25000);
   if (!html) return { list: [] };
 
   let name = '';
   const tm = html.match(/<title>([^<]*)<\/title>/i);
   if (tm) name = cleanText(tm[1]).replace(/\s*\|\s*JAVMove\s*$/i, '').trim();
+  // 海报: 首个 data-srcset (详情页 13 个 data-srcset 里第 1 个即海报,
+  // 其余 12 个是相关卡); 退路为首张截图 (splide, 真 src)。
   let pic = '';
-  const sm = html.match(/<li class="splide__slide">[\s\S]{0,600}?<img[^>]+src="([^"]+)"/i);
-  if (sm) pic = sm[1];
-  if (!pic) {
-    const im = html.match(/<img[^>]+src="(https:\/\/ie2\.javmove\.com\/media\/[^"]+)"/i);
-    if (im) pic = im[1];
+  const pm = html.match(/data-srcset\s*=\s*"([^"]+)"/i);
+  if (pm) {
+    const u = pm[1].split(/[\s,]+/).filter(Boolean)[0] || '';
+    if (/^https?:\/\//i.test(u)) pic = u;
   }
+  if (!pic) {
+    const sm = html.match(/<li class="splide__slide">[\s\S]{0,600}?<img[^>]*>/i);
+    if (sm) pic = pickImg(sm[0]);
+  }
+  // 当前 part 的 data-id (页内唯一, 归属 active 按钮的 part)
+  const dm0 = html.match(/data-id="([^"]+)"/);
+  const token = dm0 ? dm0[1] : '';
 
-  let lines = parseFormats(html, mv);
-  if (!lines.length) lines = ['正片$move:' + mv.id + ':' + mv.slug + '::1'];
+  let lines = parseFormats(html, mv, token);
+  if (!lines.length) lines = ['正片$move:' + mv.id + ':' + mv.slug + '::1' + (token ? ':' + token : '')];
 
   const vod = {
     vod_id: durl,
@@ -367,36 +431,87 @@ async function detail(reqIn) {
   return { list: [vod] };
 }
 
+// /watch 直取 (必须带 Referer, 任意值都行; 不带则 200 但正文仅 "re")。
+// 成功回 http(s) 直链, 否则回 ''。
+async function watchByToken(token, referer) {
+  try {
+    const txt = await getHtml(HOST + '/watch?token=' + encodeURIComponent(token), { 'Referer': referer }, 10000);
+    const url = t(txt);
+    return /^https?:\/\//i.test(url) ? url : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// Worker 整链代取: /resolve 在 Worker 内做 part 页 -> data-id -> /watch,
+// 回 {ok, url} JSON (10 分钟缓存)。未部署/失败/超时回 '', 不阻塞直连回落。
+async function watchByWorker(mid, slug, type, part) {
+  if (!JAVMOVE_WORKER) return '';
+  try {
+    const u = JAVMOVE_WORKER + '/resolve?mid=' + encodeURIComponent(mid)
+      + '&slug=' + encodeURIComponent(slug)
+      + '&type=' + encodeURIComponent(type || '')
+      + '&p=' + encodeURIComponent(part || '1');
+    const r = await req.get(u, { timeout: 8000, responseType: 'text', transformResponse: [(d) => d] });
+    const j = JSON.parse(typeof r.data === 'string' ? r.data : '');
+    if (j && j.ok && /^https?:\/\//i.test(j.url || '')) return j.url;
+    return '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// play 收尾: 只挂 detail() 预热已入缓存的字幕命中 (R2: 不再现搜、不再等
+// 6s、不再并发冲站方; 无缓存命中即无字幕返回, 播放优先)。
+function playFinish(url, durl) {
+  const res = {
+    parse: 0,
+    url,
+    header: { 'User-Agent': UA, 'Referer': HOST + '/' },
+  };
+  try {
+    const hit = subResultCache.get(durl);
+    if (hit && Date.now() - hit.ts < SUB_TTL && hit.subs && hit.subs.length) res.subs = hit.subs;
+  } catch (e) { /* 缓存读取失败不影响播放 */ }
+  return res;
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.indexOf('$') >= 0) id = id.split('$').pop().trim();
-  const m = id.match(/^move:([A-Za-z0-9]+):([^:]*):([^:]*):(\d+)$/);
-  if (!m) return { parse: 0, url: '' };
-  const mid = m[1];
-  const slug = m[2];
-  const type = m[3];
-  const part = m[4];
+  // 播放 id: move:<mid>:<slug>:<type>:<part>[:<token>]
+  // token 仅在 detail() 时当前 (active) part 的那一行里有。
+  // 注意 token 字符集不止 [A-Za-z0-9_-] (实测有 "~VWGLFyn"、"~4O6kjvJ"),
+  // 不用正则收尾、用 split 取第 6 段及之后全部 (token 内即使含 ':' 也不炸)。
+  const parts = id.split(':');
+  if (parts.length < 5 || parts[0] !== 'move') return { parse: 0, url: '' };
+  const mid = parts[1] || '';
+  const slug = parts[2] || '';
+  const type = parts[3] || '';
+  const part = parts[4] || '';
+  const token = parts.length > 5 ? parts.slice(5).join(':') : '';
+  if (!mid || !slug || !/^\d+$/.test(part)) return { parse: 0, url: '' };
   const durl = HOST + '/movie/' + mid + '/' + slug;
-  // 字幕搜索先启动、与下面两次站方请求并行 (旧版串行等 6s 预算, 站方单请求已
-  // 3-7s, play 全程在 harness 实测 24-66s); detail() 预热未完成时这里也已在途。
-  const subsP = subSearchAll(subNormKey(durl)).catch(() => []);
-  // 按 part 地址现取 data-id (各 part token 不同, 且每次加载都轮换), 再调 /watch
-  // 取直链。/watch 必须带 Referer 头 (任意值都行; 不带则 200 但正文仅 "re")。
   const partUrl = type ? durl + '?type=' + type + '&p=' + part : durl;
-  const html = await getHtml(partUrl);
+  // (1) 快径: detail 时嵌的 token, 单次 /watch 直取直链 (~3s)。
+  //     token 每次加载轮换、但同一 token 至少数分钟有效; 失效即回落。
+  if (token) {
+    const u = await watchByToken(token, durl);
+    if (u) return playFinish(u, durl);
+  }
+  // (2) Worker 整链代取 (已部署时)。
+  const wu = await watchByWorker(mid, slug, type, part);
+  if (wu) return playFinish(wu, durl);
+  // (3) 直连: 按 part 地址现取 data-id (各 part token 不同), 再调 /watch。
+  const html = await getHtml(partUrl, null, 15000);
   if (!html) return { parse: 0, url: '' };
   const dm = html.match(/data-id="([^"]+)"/);
   if (!dm) return { parse: 0, url: '' };
-  const watchTxt = await getHtml(HOST + '/watch?token=' + encodeURIComponent(dm[1]), { 'Referer': partUrl }, 15000);
-  const url = t(watchTxt);
-  if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '' };
-  return subAttach({
-    parse: 0,
-    url,
-    header: { 'User-Agent': UA, 'Referer': HOST + '/' },
-  }, subsP);
+  const url = await watchByToken(dm[1], partUrl);
+  if (!url) return { parse: 0, url: '' };
+  return playFinish(url, durl);
 }
 
 // ---------------- 字幕聚合 (Layer A 铺开, 2026-10-23) ----------------
@@ -471,23 +586,15 @@ function subRegister(detailIds, vod) {
       }
     }
     for (const k of keys) subCacheName(k, name);
-    // v7: 预热键必须与 play() 的 subSearchAll 键一致（裸详情 URL）。
+    // v7: 预热键必须与 playFinish() 的缓存查找键一致（裸详情 URL）。
     // 旧版用 eps[0]（形如 F4$<durl>@F4），play 侧先剥 $ 前缀与 @hint
-    // 再查，键永远对不上 → 预热白做，每次点播都重跑最多 6s 的字幕
-    // 搜索，play() 在 App 超时内回不来。vod_id 即 play 侧的裸 durl。
+    // 再查，键永远对不上 → 预热白做。vod_id 即 play 侧的裸 durl。
     const warmKey = vod.vod_id ? String(vod.vod_id) : (eps[0] || '');
     if (warmKey) subWarm(warmKey);
   } catch (e) { /* 字幕登记失败不影响详情 */ }
 }
 
-// play 侧挂载: 仅当结果带非空 url 且字幕有命中时才加 subs 键。
-async function subAttach(res, subsP) {
-  try {
-    const subs = await subsP;
-    if (subs && subs.length && res && typeof res === 'object' && res.url) res.subs = subs;
-  } catch (e) { /* 字幕挂载失败不影响播放结果 */ }
-  return res;
-}
+// (play 侧字幕挂载已改为 playFinish() 的缓存只读, 不再现搜。)
 
 // ---------------- 字幕聚合 (Layer A 重写, 2026-10-23) ----------------
 // 按用户自有迅雷看看 REX 组件 (xunlei.subtitle) 的方法重写: 旧版把

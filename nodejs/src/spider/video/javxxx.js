@@ -55,6 +55,18 @@
 //    蜘蛛 v5 改动仅三处：getJson 超时 20s→30s（Worker 内含上游+jina 两段）；
 //    新增 getResolve（Worker /resolve 优先）；play() 先试 /resolve、失败回落 v4 本地链。
 //    其余（分类/详情/搜索、dex、字幕芯）一字未动；Worker 未部署 v3 时自动走本地链。
+//  - v6（2026-11-13）：v5 推后 14:38 用户报列表“暂无数据”（分类可见、内容全空）。
+//    定性（VM 实测，见 diag-1113-r2-javxxx/REPORT_R2.md）：列表腿本身没换，
+//    但 Worker /j/list 是单发单中——同一 URL，curl 20/20 通（via direct），
+//    Node/undici 栈 6/6 间隔探针全回 {ok:false,error:"challenge"}（突发 7/16 通，
+//    通的走 jina）；即“谁去取页”决定 Worker 上游能否过站方挑战，App 的 req
+//    （axios 沙箱，非 curl 栈）撞上坏路径即单次失败、蜘蛛直接回 []，App 显空。
+//    v5 唯一改动的列表返回形（首页 pagecount 1）也一并恢复成 v4 已验好的形
+//    （pagecount 2 / total 999），排除 App 分页口径变量。
+//    修法（只改蜘蛛，Worker v4 不动）：getJsonList 改三段顺序 Worker→jina→Worker，
+//    Worker 单腿 15s、上限两发；中间夹蜘蛛直连 jina HTML 腿（VM node 实测 4/4 通，
+//    0.3~1.8s，含 data-lazy-src 真封面），本地解析复用 Worker v4 同款 parseListHtml；
+//    三段全败才回 []。详情/播放/字幕芯一字未动。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -244,9 +256,10 @@ async function fetchPage(url, referer) {
 function viaJsonList(url) { return FETCH_WORKER + '/j/list/' + b64url(url); }
 function viaJsonDetail(url) { return FETCH_WORKER + '/j/detail/' + b64url(url); }
 
-async function getJson(url) {
+async function getJson(url, ms) {
+  var timeoutMs = ms || 30000;
   try {
-    var r = await withTimeout(req.get(url, { headers: headers(), timeout: 30000 }), 30000, null);
+    var r = await withTimeout(req.get(url, { headers: headers(), timeout: timeoutMs }), timeoutMs, null);
     if (!r || r.status !== 200) return null;
     var data = r.data;
     var obj = null;
@@ -259,14 +272,13 @@ async function getJson(url) {
   } catch (e) { return null; }
 }
 
-// 列表 JSON：只认 vod_id 为 javxxx.me /video/<slug>/、标题非空非文件名的条目。
-async function getJsonList(url) {
-  var obj = await getJson(viaJsonList(url));
-  if (!obj || !Array.isArray(obj.list)) return [];
+// 列表 JSON 校验：只认 vod_id 为 javxxx.me /video/<slug>/、标题非空非文件名的条目。
+function filterJsonList(arr) {
+  if (!Array.isArray(arr)) return [];
   var out = [];
   var seen = new Set();
-  for (var i = 0; i < obj.list.length; i++) {
-    var it = obj.list[i] || {};
+  for (var i = 0; i < arr.length; i++) {
+    var it = arr[i] || {};
     var id = String(it.vod_id || '');
     var name = String(it.vod_name || '').trim();
     if (!/^https:\/\/www\.javxxx\.me\/video\/[^\/]+\/?$/.test(id)) continue;
@@ -278,6 +290,113 @@ async function getJsonList(url) {
     out.push({ vod_id: id, vod_name: name.substring(0, 120) || '未知', vod_pic: pic, vod_remarks: String(it.vod_remarks || '') });
   }
   return out;
+}
+
+// 列表 HTML 解析（与已部署 Worker v4 的 parseListHtml 同款逻辑，蜘蛛侧复刻）：
+// 卡片 <a href="/video/<slug>/" title="...">…<img data-lazy-src="...">；
+// 条目 <3 时再试 Markdown 链接回落（jina 有时回 Markdown，封面为空）。
+function parseListHtml(html) {
+  var out = [];
+  var seen = new Set();
+  var push = function (id, name, pic, remarks) {
+    id = String(id || '').trim();
+    if (!/^https:\/\/www\.javxxx\.me\/video\/[^\/]+\/?$/.test(id)) return;
+    name = clean(String(name || '')).substring(0, 120);
+    if (!name || /\.(jpg|jpeg|png|gif|webp|svg)(\?|#|$)/i.test(name)) return;
+    if (seen.has(id)) return;
+    seen.add(id);
+    pic = String(pic || '');
+    if (/^data:/i.test(pic) || /\/404\.png$/i.test(pic)) pic = '';
+    out.push({ vod_id: id, vod_name: name, vod_pic: pic, vod_remarks: String(remarks || '') });
+  };
+  var reA = /<a[^>]+href="(https?:\/\/www\.javxxx\.me\/video\/[^"\/]+\/?|\/video\/[^"\/]+\/?)"[^>]*>/gi;
+  var m;
+  while ((m = reA.exec(html)) && out.length < 40) {
+    var href = m[1];
+    var id = href.indexOf('http') === 0 ? href : HOST + href;
+    var tag = m[0];
+    var seg = html.slice(m.index, Math.min(html.length, m.index + 4000));
+    var name = '';
+    var tm = tag.match(/title="([^"]*)"/i);
+    if (tm) name = tm[1];
+    if (!name) {
+      var endA = seg.search(/<\/a>/i);
+      var innerHtml = endA >= 0 ? seg.slice(tag.length, endA) : '';
+      name = clean(innerHtml);
+    }
+    var pic = '';
+    var pm = seg.match(/data-lazy-src="(https?:[^"]+)"/i);
+    if (pm) pic = pm[1];
+    if (!pic) {
+      var sm = seg.match(/<img[^>]+src="(https?:[^"]+)"/i);
+      if (sm) pic = sm[1];
+    }
+    var remarks = '';
+    var dm = seg.match(/(\d{1,2}:\d{2}:\d{2})/);
+    if (dm) remarks = dm[1];
+    push(id, name, pic, remarks);
+  }
+  if (out.length >= 3) return out;
+  var reMd = /\[([^\]\n]{3,150})\]\((https:\/\/www\.javxxx\.me\/video\/[^)\s"]+\/?)(?:\s+"[^"]*")?\)/g;
+  var mm;
+  while ((mm = reMd.exec(html)) && out.length < 40) {
+    push(mm[2], mm[1], '', '');
+  }
+  return out;
+}
+
+// 蜘蛛直连 jina 腿：r.jina.ai 回完整 HTML（x-respond-with: html），不走 Worker，
+// 故不受“Worker 上游撞挑战”影响。req 腿与 fetch 腿并行竞速，先解析出真条目者赢。
+async function getJinaList(url, minN) {
+  var min = minN || 3;
+  var jinaUrl = 'https://r.jina.ai/' + url;
+  var hdrs = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'x-respond-with': 'html' };
+  var jobs = [];
+  jobs.push((async function () {
+    try {
+      var r = await withTimeout(req.get(jinaUrl, { headers: hdrs, timeout: 15000 }), 15000, null);
+      if (!r || r.status !== 200) return null;
+      var body = (r && r.data != null) ? String(r.data) : '';
+      if (!body || isChallengePage(body)) return null;
+      var list = parseListHtml(body);
+      return list.length >= min ? list : null;
+    } catch (e) { return null; }
+  })());
+  if (typeof fetch === 'function') {
+    jobs.push((async function () {
+      try {
+        var ctrl = null;
+        try { if (typeof AbortController === 'function') ctrl = new AbortController(); } catch (e) {}
+        var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 15000);
+        try {
+          var r2 = await fetch(jinaUrl, { headers: hdrs, signal: ctrl ? ctrl.signal : undefined });
+          if (!r2 || r2.status !== 200) return null;
+          var body2 = await withTimeout(r2.text(), 15000, '');
+          if (!body2 || isChallengePage(body2)) return null;
+          var list2 = parseListHtml(body2);
+          return list2.length >= min ? list2 : null;
+        } finally { clearTimeout(timer); }
+      } catch (e) { return null; }
+    })());
+  }
+  var won = await firstSuccess(jobs, 15000);
+  return won || [];
+}
+
+// 列表取数（v6）：Worker /j/list 单发即回 [] 是本轮空列表的直接原因，改三段顺序：
+// Worker → 蜘蛛直连 jina HTML → Worker 再一发；任一段出 >=3 条真条目即返回。
+// 单腿上限 15s；三段全败才回 []（不出假条目）。
+async function getJsonList(url, minN) {
+  var min = minN || 3;
+  var obj = await getJson(viaJsonList(url), 15000);
+  var list = filterJsonList(obj && obj.list);
+  if (list.length >= min) return list;
+  var jinaList = await getJinaList(url, min);
+  if (jinaList.length >= min) return jinaList;
+  var obj2 = await getJson(viaJsonList(url), 15000);
+  var list2 = filterJsonList(obj2 && obj2.list);
+  if (list2.length >= min) return list2;
+  return list.length ? list : (jinaList.length ? jinaList : list2);
 }
 
 // 详情 JSON：{name, pic, desc, live, tid}；失败返回 null（调用方回落 /f/ 原样取页）。
@@ -526,7 +645,6 @@ async function category(reqIn) {
   }
   var list = await getJsonList(url);
   var pc = list.length >= 20 ? page + 1 : page;
-  if (tid === 'home') pc = 1;
   return { page: page, pagecount: pc, limit: 20, total: 999, list: list };
 }
 async function detail(reqIn) {
@@ -600,7 +718,8 @@ async function search(reqIn) {
   var url = page > 1
     ? HOST + '/search/' + encodeURIComponent(wd) + '/page/' + page + '/'
     : HOST + '/search/' + encodeURIComponent(wd) + '/';
-  var list = await getJsonList(url);
+  // 搜索结果可能只有 1 条（如 SSNI-229），下限放 1；分类/首页仍用默认 3。
+  var list = await getJsonList(url, 1);
   return { page: page, pagecount: list.length >= 20 ? page + 1 : page, limit: 20, total: 999, list: list };
 }
 
@@ -964,3 +1083,4 @@ export default function createSpider() {
     },
   };
 }
+

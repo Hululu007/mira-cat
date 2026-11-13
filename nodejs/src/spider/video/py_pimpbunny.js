@@ -20,6 +20,18 @@
 //     Abbie、Kwini 抽样均为单个 <hash>_720p.mp4（get_file 直链，
 //     带 v-acctoken + rnd 参数）。故本站无真实多档可出：详情只给
 //     一条"正片"，不把 1 条流展开成 4 档假菜单。
+//   【v3 修正 2026-11-13 15:00：上一轮"单档"结论是错的——它只看了 .net
+//     详情页的 <source>（确为同一 /stream URL 的假菜单）和 .com 页的
+//     JSON-LD contentUrl（只有一条无 token 的 720p）。本轮实测 .com
+//     视频页（/videos/<slug>/，经 jina 取 HTML）的 kt_player 内联配置
+//     真有四档真文件（各档 hash 与 v-acctoken 均不同）：
+//       video_url       = 360p（默认档）
+//       video_alt_url   = 480p（文件名无后缀 .mp4）
+//       video_alt_url2  = 720p
+//       video_alt_url3  = 1080p
+//     4 部抽样（Abbie/Kwini/Madiiitay/Anna）全有 360/480/720/1080p，
+//     Madiiitay 另有 video_alt_url4 = 1440p。故 v3 起详情出真实档位
+//     菜单（按档位数字降序，集名即档位），不再只出一条"正片"。】
 //   - /stream/video.mp4 本身同样被 Bunny Shield 拦（VM 下 403 +
 //     挑战页，换桌面 UA / video Accept / Referer=详情页 / Range /
 //     Sec-Fetch-Dest: video / 带详情页 cookie 均无效；新式
@@ -43,6 +55,35 @@
 //     则退回 parse:1，把详情页交给播放器嗅探（manko Upload18
 //     同款做法），由 App 内浏览器环境复现 Safari 站内播放。
 //     不解 PoW、不伪造凭证、不拿用户 cookie。
+//   - 【v3 换思路 2026-11-13 15:00，Worker 腿实测已死——不要再走：
+//     已部署的 sextb-hls v4 Worker（https://sextb-hls.li768435813.
+//     workers.dev，其 /s 路由无宿主白名单、可当 Cloudflare 出口
+//     探针）实测：/s 取 .net 详情页 200/67087 字节（探针本身工作，
+//     CF 出口能取 .net HTML）；但 /s 取 /stream → 403 + 1861 字节
+//     Bunny Shield 挑战页（与 VM 一字不差），/s 取带新鲜 token 的
+//     get_file 720p → 403 0 字节（有无 token 同样死）。结论：
+//     Cloudflare Workers 出口同样被 Bunny Shield 按机房 IP 拦，
+//     Worker 侧整链代取 + 字节代理此站无解，故 v3 不写 pimpbunny
+//     Worker、不推 Worker 腿。Railway 同为机房出口且用户禁播放
+//     流量走 Railway，同样不走。jina 出口取 /stream 同样 403
+//     （jina 只能取 HTML，不能代播）。
+//     v3 新腿（jina 铸档位，手机直连播）：.com 视频页走 jina
+//     HTML 腿可取（VM 下 200/350KB、无 Shield，4 部全通），页内
+//     kt_player 配置即含四档带 token 的 get_file 直链；蜘蛛在
+//     detail() 时用 jina 取 .com 页、解析出档位菜单，play() 把
+//     某档的最终直链 + Safari UA + Referer=.com 视频页直接交给
+//     播放器（与 Safari 站内播放的最后一次请求等价，不再经过
+//     /stream 跳转、不要 Worker 中转）。token 形态：
+//     v-acctoken=<base64>，解开为 "<码率?>|<站内 id>|0|<32 位 hex
+//     签名>"，不含 IP、不含过期时间戳；同一视频两次 jina 抓取
+//     token 字节相同（4 部全同），属稳定铸造、非一次一换。
+//     token 是否绑取页方 IP，VM/CF 两边都因出口被拦而无法鉴别，
+//     只能由手机真机定性：若手机播 jina 铸的 token 直链能播，
+//     则 v3 成立；若手机同样 403，则 token 绑 jina IP，此路亦死，
+//     届时只剩 parse:1 嗅探（手机端内浏览器现场铸 token）。
+//     jina 腿失败（429/超时/无档位）时 detail() 原样退回 v2 单
+//     "正片"集串，play() 保留 HEAD 解析 + parse:1 兜底，
+//     不比 v2 差。】
 //   - 列表分页必须带 ?filter=latest：默认排序首页 30 条/页、翻页在边界
 //     处重复 1-2 条（anal p1/p2、home p1/p2/p3 实测）；带 filter=latest
 //     后一律 20 条/页，p1/p2 零重叠（anal、home、tag、search 实测）。
@@ -353,7 +394,9 @@ async function detail(reqIn) {
   if (!name) return { list: [] };
   // 播放源：<video id="wpst-video"> 块内全部 <source>；多档页的 4 条
   // label（1080p/720p/480p/360p）src 字节相同，去重后只剩 1 条
-  // 真实流（见文件头档位核查），故只出一条"正片"，不编假档位。
+  // 真实流（见文件头档位核查），故 .net 页本身只给一条 /stream；
+  // 真实档位菜单在 .com 视频页的 kt_player 配置里，v3 由
+  // fetchLadder() 经 jina 取回（见下）。
   // 集串同时带详情页与直链，供 play() 先解析、后嗅探。
   const vBlock = html.match(/<video[^>]*id="wpst-video"[^>]*>([\s\S]*?)<\/video>/)
     || html.match(/<video[^>]*>([\s\S]*?)<\/video>/);
@@ -377,6 +420,17 @@ async function detail(reqIn) {
     || html.match(/property="og:image"\s+content="([^"]+)"/);
   const durMeta = html.match(/itemprop="duration"\s+content="([^"]+)"/);
   const desc = html.match(/<meta\s+itemprop="description"\s+content="([^"]+)"/);
+  // v3：jina 铸档位。成功则出真实档位菜单（集串三段：
+  // pbplay:<.net 详情页>|<.com 视频页>|<某档 get_file 直链>，
+  // play() 直接交播放器）；失败则退回 v2 单"正片"集串。
+  let playUrl = '正片$pbplay:' + url + '|' + stream;
+  const comVideo = comVideoFromStream(stream);
+  if (comVideo) {
+    const ladder = await fetchLadder(comVideo);
+    if (ladder.length) {
+      playUrl = ladder.map((q) => q.label + '$pbplay:' + url + '|' + comVideo + '|' + q.url).join('#');
+    }
+  }
   return {
     list: [{
       vod_id: url,
@@ -385,9 +439,71 @@ async function detail(reqIn) {
       vod_content: desc ? clean(desc[1]).slice(0, 200) : '',
       vod_remarks: durMeta ? isoDurToStr(durMeta[1]) : '',
       vod_play_from: NAME,
-      vod_play_url: '正片$pbplay:' + url + '|' + stream,
+      vod_play_url: playUrl,
     }],
   };
+}
+
+// ---------- v3：jina 铸档位 ----------
+// /stream URL 内 base64 解开即 .com 视频页地址（新旧两种形态通用）。
+function b64decode(s) {
+  try {
+    s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+    while (s.length % 4) s += '=';
+    return Buffer.from(s, 'base64').toString('utf8');
+  } catch (e) { return ''; }
+}
+
+function comVideoFromStream(stream) {
+  try {
+    const u = new URL(stream);
+    let b64 = '';
+    if (u.pathname === '/stream/video.mp4') b64 = u.searchParams.get('v') || '';
+    else if (u.pathname.indexOf('/stream/') === 0) b64 = u.pathname.split('/').pop().replace(/\.mp4$/i, '');
+    const dec = b64decode(b64);
+    if (/^https:\/\/pimpbunny\.com\/videos\/[^/]+\/$/.test(dec)) return dec;
+  } catch (e) { /* 不是可解的 /stream 形态 */ }
+  return '';
+}
+
+// 经 jina 取 .com 视频页 HTML，解析 kt_player 内联配置的档位菜单：
+//   video_url: '<360p 直链>'（+ video_url_text: '360p'）
+//   video_alt_url[N]: '<高档直链>'（+ video_alt_url[N]_text: '720p' 等）
+// 只收带 v-acctoken 的 pimpbunny.com/get_file 直链，按档位数字降序。
+// 任何一步失败返回 []，调用方原样退回 v2 单"正片"集串。
+async function fetchLadder(comVideo) {
+  try {
+    const r = await req.get('https://r.jina.ai/' + comVideo, {
+      headers: { 'User-Agent': UA, 'x-respond-with': 'html', 'Accept': 'text/html,*/*' },
+      timeout: 8000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+    });
+    const data = r && r.data;
+    const html = typeof data === 'string' ? data : '';
+    if (!html || html.indexOf('video_url:') < 0 || html.indexOf('get_file/') < 0) return [];
+    const texts = {};
+    const tre = /(video_url|video_alt_url\d*)_text\s*:\s*'([^']+)'/g;
+    let tm;
+    while ((tm = tre.exec(html)) !== null) texts[tm[1]] = tm[2];
+    const out = [];
+    const seen = new Set();
+    const ure = /(video_url|video_alt_url\d*)\s*:\s*'([^']+)'/g;
+    let um;
+    while ((um = ure.exec(html)) !== null) {
+      const furl = um[2];
+      if (!/^https:\/\/pimpbunny\.com\/get_file\/[^']*v-acctoken=[A-Za-z0-9%_-]+/.test(furl)) continue;
+      if (seen.has(furl)) continue;
+      seen.add(furl);
+      const label = texts[um[1]] || '';
+      const num = parseInt((label.match(/(\d+)/) || [])[1] || '0', 10) || 0;
+      out.push({ label: label || (num ? num + 'p' : '正片'), num, url: furl });
+    }
+    out.sort((a, b) => b.num - a.num);
+    return out;
+  } catch (e) {
+    return [];
+  }
 }
 
 // /stream 是代理：站内播放时它应 302 到 .com get_file 真实文件。
@@ -419,9 +535,21 @@ async function play(reqIn) {
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (!id) return { parse: 0, url: '' };
   if (id.indexOf('$') >= 0) id = id.split('$').pop().trim();
-  // 新式集串：pbplay:<详情页>|<直链>
+  // 新式集串：pbplay:<详情页>|<直链>（v2 单"正片"）或
+  // pbplay:<详情页>|<.com 视频页>|<某档 get_file 直链>（v3 档位菜单）
   if (id.indexOf('pbplay:') === 0) {
     const rest = id.slice('pbplay:'.length);
+    const parts = rest.split('|');
+    // v3 档位集串：已是最终文件地址，直接交给播放器（Safari UA +
+    // Referer=.com 视频页，与 Safari 站内播放最后一次请求等价；
+    // 不再经过 /stream 跳转，不走 Worker）。
+    if (parts.length >= 3 && /^https:\/\/pimpbunny\.com\/get_file\//.test(parts[2])) {
+      return {
+        parse: 0,
+        url: parts[2],
+        header: { 'User-Agent': UA, 'Referer': parts[1] || COM + '/' },
+      };
+    }
     const bar = rest.indexOf('|');
     const detailUrl = bar >= 0 ? rest.slice(0, bar) : rest;
     const stream = bar >= 0 ? rest.slice(bar + 1) : '';
@@ -448,6 +576,14 @@ async function play(reqIn) {
       };
     }
     return { parse: 0, url: '' };
+  }
+  // 裸 get_file 直链（v3 档位 URL 被直接点播时）→ 直接交播放器。
+  if (/^https:\/\/pimpbunny\.com\/get_file\//i.test(id)) {
+    return {
+      parse: 0,
+      url: id,
+      header: { 'User-Agent': UA, 'Referer': COM + '/' },
+    };
   }
   // 旧缓存集串：裸 /stream 直链 → 老行为原样直出。
   if (/^https?:\/\//i.test(id) && /\/stream\//i.test(id)) {
