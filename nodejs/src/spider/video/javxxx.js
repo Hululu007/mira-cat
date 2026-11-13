@@ -101,6 +101,12 @@
 //    VM 侧现相位下直连 POST 亦被 403/掐断、无法代验，只差手机真机一验。
 //    另修 v9 的 detail() bug：entryP 定义后从未被 await，却仍在后台跑完一整条分段链，
 //    与下面的第二次 getMasterEntrySplit 调用重复——每开一次详情页向上游发两套铸造请求。
+// v12（2026-11-14 第八轮）：R8 坐实 Worker /j/detail 与 /resolve 对新片均活
+//    （DASS-027/SAME-155/CMV-214 皆 ok:true），v10/v11 手机端死的两点是：① Worker
+//    token 腿 2.5s 封顶，手机上 1.5-3s 的 /j/detail 常被掐死；② SVCAO-032 长
+//    slug 站方已改短（现为 /video/svcao-032/），旧长链回 404/挑战，拿不到 token
+//    是站方链接变了不是蜘蛛坏。本版只改 getTokenAll：Worker 腿 8s + 一次重试，
+//    jina 共用承诺无 token 时再现取一次；其余一字未动。
 //    分段铸造本身、8 秒预算、/resolve 单次第二路、mp4 直连兜底、字幕行为一字未动；
 //    无新 Worker、不部署任何东西（R4 的 v6 草稿只加 embed 重试，修不了 token 源与 apiPlay 403，不部署）。
 //  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
@@ -576,8 +582,17 @@ async function getTokenAll(vid, deadlineMs, jinaDetailP) {
   var jobs = [];
   jobs.push((async function () {
     try {
-      var jd = await withTimeout(getJsonDetail(vid), 2500, null);
+      // v12：2.5s 封顶是手机端杀手——Worker /j/detail 实测 1.5-3s，手机上常超
+      // 2.5s 即被掐死（R8 坐实：对新片 /j/detail 与 /resolve 均活，死的是旧
+      // slug；SVCAO-032 长 slug 已改短，站方对旧 slug 回 404/挑战）。
+      // 放宽到 8s；首试无 token 且时间有余时再试一次（偶发挑战/超时）。
+      var capW = deadlineMs ? Math.max(1500, Math.min(8000, deadlineMs - Date.now())) : 8000;
+      var jd = await withTimeout(getJsonDetail(vid), capW, null);
       if (jd && jd.live && jd.tid) return { live: jd.live, tid: jd.tid, via: 'worker' };
+      if (deadlineMs && Date.now() < deadlineMs - 2000) {
+        var jd2 = await withTimeout(getJsonDetail(vid), Math.max(1500, Math.min(8000, deadlineMs - Date.now())), null);
+        if (jd2 && jd2.live && jd2.tid) return { live: jd2.live, tid: jd2.tid, via: 'worker-retry' };
+      }
     } catch (e) {}
     return null;
   })());
@@ -585,6 +600,11 @@ async function getTokenAll(vid, deadlineMs, jinaDetailP) {
     try {
       var jt = jinaDetailP ? await jinaDetailP : await getJinaDetail(vid, deadlineMs);
       if (jt && jt.live && jt.tid) return { live: jt.live, tid: jt.tid, via: 'jina' };
+      // 共用承诺无 token（旧缓存/429/超时）时再现取一次，仍在 deadline 内才发。
+      if (jinaDetailP && deadlineMs && Date.now() < deadlineMs - 2000) {
+        var jt2 = await getJinaDetail(vid, deadlineMs);
+        if (jt2 && jt2.live && jt2.tid) return { live: jt2.live, tid: jt2.tid, via: 'jina-retry' };
+      }
     } catch (e) {}
     return null;
   })());

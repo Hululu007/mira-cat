@@ -99,17 +99,17 @@ function extractEps(html) {
 }
 
 // V2 双集 (中转组只包 .m3u8, 直连组全直链; 假线路无视频时保持单源原样)。
-// 2026-11-10：直连放第一线（中转放第二线保底）。之前中转在前时，Railway 免费档
-// 冷启动会让播放器建时间轴不可靠，出现“不从头播、无法快进”；直连若在个别手机上
-// 被拦，可手动切第二线“91吃瓜·中转”。
+// 2026-11-14（用户令）：中转放第一线，直连放第二线（直连留着不删，只换顺序）。
+// 用户真机：直连一个内容都播不了，只有中转能播。2026-11-10 直连在前的原因
+// （中转冷启动致播放器时间轴不可靠）现已让位于“直连播不了”这一实测结论。
 function buildPlayUrl(eps, rawId) {
   const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
   if (eps.length === 1) {
-    return { playUrl: ('播放$' + eps[0].url) + '$$$' + ('播放$' + wrapEp(eps[0].url)), playFrom: '91吃瓜·直连$$$91吃瓜·中转' };
+    return { playUrl: ('播放$' + wrapEp(eps[0].url)) + '$$$' + ('播放$' + eps[0].url), playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
   } else if (eps.length > 1) {
     const direct = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
     const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
-    return { playUrl: direct + '$$$' + relay, playFrom: '91吃瓜·直连$$$91吃瓜·中转' };
+    return { playUrl: relay + '$$$' + direct, playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
   }
   return { playUrl: '未找到视频源$' + rawId, playFrom: '91吃瓜' };
 }

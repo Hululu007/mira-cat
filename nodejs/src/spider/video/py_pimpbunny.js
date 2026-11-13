@@ -190,6 +190,12 @@ const NAME = 'PimpBunny';
 //   ④ Worker 腿：腿 2（新鲜令牌）已在 v7，新增腿 3.5（详情时刻令牌
 //      跟链失败时也走 Worker /stream）；STREAM_WORKER 部署并 /diag
 //      验绿后才填，未部署时两腿自动跳过。
+// v9 (2026-11-14, 第八轮)：换思路——Worker /play 自铸整链（pimpbunny-stream v2）。
+//   R8 坐实：App 不把 Set-Cookie 交给蜘蛛，蜘蛛在手机上永远拿不到有效 cookie；
+//   v8 的重铸/跟链/Worker /stream 全腿都死于无 cookie（无 cookie 的 get_file 必
+//   403，/diag 对照组已坐实；封面/档位不用 cookie 所以能出）。/play 让 Worker
+//   自己取详情页、自己拿 cookie、自己跟链、自己流；蜘蛛只交地址 + 档位。
+//   play() 腿 0 先探 /play（Range 0-1023，206 即回），探不通回落 v8 旧腿。
 const SITE = 'https://pimpbunny.net';
 const COM = 'https://pimpbunny.com';
 // pimpbunny-stream Worker（v7 腿 2 备选，未部署前留空；部署后填入地址）：
@@ -826,6 +832,28 @@ async function remintBest(comVideo) {
   }
 }
 
+// v9 腿 0：Worker /play 自铸整链探路（pimpbunny-stream v2 /play）。
+//   探路 Range 0-1023（5s 封顶）：206 且 content-type 为 video 即回该地址
+//   （Worker 60 秒缓存，播放器跟进即命中）；探不通回 ''，调用方回落 v8 旧腿。
+async function probeWorkerPlay(comVideo, labelNum) {
+  if (!STREAM_WORKER || !comVideo) return '';
+  try {
+    const q = labelNum > 0 ? ('&q=' + labelNum) : '';
+    const playUrl = STREAM_WORKER + '/play?u=' + encodeURIComponent(comVideo) + q;
+    const r = await req.get(playUrl, {
+      headers: { 'User-Agent': UA, 'Referer': comVideo, 'Range': 'bytes=0-1023', 'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8' },
+      timeout: 5000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+    });
+    if (!r) return '';
+    const ct = String((r.headers && (r.headers['content-type'] || r.headers['Content-Type'])) || '');
+    if ((r.status === 206 || r.status === 200) && /video\//i.test(ct)) return playUrl;
+  } catch (e) {}
+  return '';
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
@@ -851,6 +879,14 @@ async function play(reqIn) {
       const comVideo = parts[1] || '';
       const fileUrl = parts[2];
       const cookie = parts[3] || '';
+      // v9 腿 0：Worker /play 自铸整链（先探，206 即回；探不通回落旧腿）。
+      if (comVideo) {
+        const q0 = parseInt((String(label || '').match(/(\d+)/) || [])[1] || '0', 10) || 0;
+        const wp = await probeWorkerPlay(comVideo, q0);
+        if (wp) {
+          return { parse: 0, url: wp, header: { 'User-Agent': UA, 'Referer': comVideo } };
+        }
+      }
       // 腿 1：点播时重铸（yesporn 同款）+ 蜘蛛侧跟链——重取 .com
       // 页按集名现铸同档新令牌 + 新 cookie（6 秒超时），再由
       // resolveChain 手动跟 302 到 st32，把最终直链交播放器
@@ -940,6 +976,11 @@ async function play(reqIn) {
     // → Worker → 嗅探（无详情时刻令牌，腿 3/4 跳过）。
     const comVideo = parts[2] || (stream ? comVideoFromStream(stream) : '');
     if (comVideo) {
+      // v9 腿 0：Worker /play 自铸整链（最高档；探不通回落旧腿）。
+      const wp0 = await probeWorkerPlay(comVideo, 0);
+      if (wp0) {
+        return { parse: 0, url: wp0, header: { 'User-Agent': UA, 'Referer': comVideo } };
+      }
       const fresh = await remintBest(comVideo);
       if (fresh) {
         const chained = await resolveChain(fresh.url, comVideo, fresh.cookie);
