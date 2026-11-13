@@ -55,18 +55,20 @@
 //    蜘蛛 v5 改动仅三处：getJson 超时 20s→30s（Worker 内含上游+jina 两段）；
 //    新增 getResolve（Worker /resolve 优先）；play() 先试 /resolve、失败回落 v4 本地链。
 //    其余（分类/详情/搜索、dex、字幕芯）一字未动；Worker 未部署 v3 时自动走本地链。
-//  - v6（2026-11-13）：v5 推后 14:38 用户报列表“暂无数据”（分类可见、内容全空）。
-//    定性（VM 实测，见 diag-1113-r2-javxxx/REPORT_R2.md）：列表腿本身没换，
-//    但 Worker /j/list 是单发单中——同一 URL，curl 20/20 通（via direct），
-//    Node/undici 栈 6/6 间隔探针全回 {ok:false,error:"challenge"}（突发 7/16 通，
-//    通的走 jina）；即“谁去取页”决定 Worker 上游能否过站方挑战，App 的 req
-//    （axios 沙箱，非 curl 栈）撞上坏路径即单次失败、蜘蛛直接回 []，App 显空。
-//    v5 唯一改动的列表返回形（首页 pagecount 1）也一并恢复成 v4 已验好的形
-//    （pagecount 2 / total 999），排除 App 分页口径变量。
-//    修法（只改蜘蛛，Worker v4 不动）：getJsonList 改三段顺序 Worker→jina→Worker，
-//    Worker 单腿 15s、上限两发；中间夹蜘蛛直连 jina HTML 腿（VM node 实测 4/4 通，
-//    0.3~1.8s，含 data-lazy-src 真封面），本地解析复用 Worker v4 同款 parseListHtml；
-//    三段全败才回 []。详情/播放/字幕芯一字未动。
+//  - v7（2026-11-13）：修点播“直接视频加载失败”。定性（见 diag-1113-r3-javxxx/REPORT.md）：
+//    ① /resolve 是单发抽奖——同一分钟 Node 栈 0/11 通（10×E_DETAIL、1×E_API_HTTP403），
+//       curl 栈 6/6 通；v6 只给列表加了三段冗余，播放仍是单发，失败即落到本地链；
+//    ② 本地链回落是死路：HLS embed 回的是未改写的裸 m3u8（VM 直取 403，分片不过 /s、
+//       PNG 头不剥），mp4 绑取 embed 方 IP， 全败则回 parse:1 详情页地址——三者
+//       在手机上都是立刻加载失败，与用户症状一致。修法（只改蜘蛛）：
+//    a) getResolve 改 3 次顺序重试，每次 req 腿与 fetch 腿竞速（先 ok 者赢），
+//       单次 20s、三次最坏 60s（失败多为 0.1~2.5s 速败，典型 3~10s 结算；
+//       成功实测 2.4~7.8s，20s 有余量）；
+//    b) 本地链 / 直链分支拿到的 HLS（pianopic/streamhls 的 .m3u8）一律包一层
+//       Worker /h?u=b64url，让变体/分片走 /h、/s（PNG 剥头），不再裸奔；
+//       mp4 保持原样（直连腿赢时绑手机 IP，仍有机会播）。
+//    列表/详情/搜索/字幕芯一字未动。Worker 侧另有 v5（/s Range 剥头、fetchHtml
+//    重试、probeHls 走真实改写地址），见 javxxx-fetch-worker-v5.js，蜘蛛不依赖它。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -408,20 +410,68 @@ async function getJsonDetail(url) {
 
 // Worker v3 /resolve：服务端全链解析，回 {ok:true, url: Worker /v 代理地址} 或 null。
 // v3 未部署（404/非 JSON）或上游 embed 被拦时返回 null，调用方回落 v4 本地链。
+// v7：单发是抽奖（本轮实测 Node 栈 0/11、curl 栈 9/9，见 REPORT.md），改 3 次顺序重试；
+// 每次 req 腿与 fetch 腿竞速，先拿到 ok:true 者赢；单次 20s。任一次 ok 即回，
+// 三次全败才回 null（调用方走本地链）。失败多为速败（0.1~2.5s），典型 3~10s 结算。
 function viaResolve(detailUrl) { return FETCH_WORKER + '/resolve?u=' + encodeURIComponent(detailUrl); }
+function parseResolveObj(data) {
+  var obj = null;
+  if (typeof data === 'string') {
+    try { obj = JSON.parse(data); } catch (e) { return null; }
+  } else if (data && typeof data === 'object') obj = data;
+  else return null;
+  if (!obj || obj.ok !== true || !obj.url) return null;
+  return { url: String(obj.url), expires: String(obj.expires || '') };
+}
+async function getResolveOnce(detailUrl) {
+  var target = viaResolve(detailUrl);
+  var jobs = [];
+  jobs.push((async function () {
+    try {
+      var r = await withTimeout(req.get(target, { headers: headers(), timeout: 20000 }), 20000, null);
+      if (!r || r.status !== 200) return null;
+      return parseResolveObj(r.data);
+    } catch (e) { return null; }
+  })());
+  if (typeof fetch === 'function') {
+    jobs.push((async function () {
+      try {
+        var ctrl = null;
+        try { if (typeof AbortController === 'function') ctrl = new AbortController(); } catch (e) {}
+        var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 20000);
+        try {
+          var r2 = await fetch(target, { headers: headers(), signal: ctrl ? ctrl.signal : undefined });
+          if (!r2 || r2.status !== 200) return null;
+          var t2 = await withTimeout(r2.text(), 20000, '');
+          return parseResolveObj(t2);
+        } finally { clearTimeout(timer); }
+      } catch (e) { return null; }
+    })());
+  }
+  var won = await firstSuccess(jobs, 20000);
+  return won || null;
+}
 async function getResolve(detailUrl) {
-  try {
-    var r = await withTimeout(req.get(viaResolve(detailUrl), { headers: headers(), timeout: 45000 }), 45000, null);
-    if (!r || r.status !== 200) return null;
-    var data = r.data;
-    var obj = null;
-    if (typeof data === 'string') {
-      try { obj = JSON.parse(data); } catch (e) { return null; }
-    } else if (data && typeof data === 'object') obj = data;
-    else return null;
-    if (!obj || obj.ok !== true || !obj.url) return null;
-    return { url: String(obj.url), expires: String(obj.expires || '') };
-  } catch (e) { return null; }
+  for (var i = 0; i < 3; i++) {
+    var rv = null;
+    try { rv = await getResolveOnce(detailUrl); } catch (e) { rv = null; }
+    if (rv && rv.url) return rv;
+  }
+  return null;
+}
+
+// 本地链 / 直链分支拿到的 HLS 裸地址包一层 Worker /h（只认 Worker /h 白名单里的
+// HLS 宿主 pianopic/streamhls/cloudatacdn——/h 的 isVideoHost 三家都认；其余宿主
+// /h 会 400，不如裸奔，故只包这三家；已是 /h 地址的不重复包）。
+// 作用：变体/分片走 /h、/s，分片 PNG 头由 /s 剥，不再把裸 m3u8 交给播放器。
+function wrapHlsViaWorker(rawUrl) {
+  var u = String(rawUrl || '');
+  if (!u || /\/h\?u=/.test(u)) return u;
+  if (!/\.m3u8(\?|#|$)/i.test(u)) return u;
+  var host = '';
+  try { host = new URL(u).hostname.toLowerCase(); } catch (e) { return u; }
+  if (host !== 'pianopic.com' && host !== 'streamhls.click' && host !== 'cloudatacdn.com' && !host.endsWith('.cloudatacdn.com')) return u;
+  return FETCH_WORKER + '/h?u=' + b64url(u);
 }
 
 // 详情/播放/embed 用：只走 HTML 腿（Worker /f/ + 直连 + fetch）。
@@ -690,11 +740,14 @@ async function play(reqIn) {
   if (id.indexOf('$') !== -1) id = id.split('$').pop().trim();
   // 字幕：按 vid（detail 地址）早启动搜索，与 resolvePlay 并行跑；直链分支查不到缓存时 subs 为空，不挂 subs 键
   var subsP = subSearchAll(subNormKey(id)).catch(() => []);
-  // 已是直链（m3u8/mp4，或 streamtape 的 get_video 直链，URL 里无 .mp4 后缀）则直接播
+  // 已是直链（m3u8/mp4，或 streamtape 的 get_video 直链，URL 里无 .mp4 后缀）则直接播；
+  // v7：裸 .m3u8（pianopic/streamhls）包一层 Worker /h 再播，分片走 /s 剥 PNG 头。
   if (/\.(m3u8|mp4)(\?|$)/i.test(id) || /streamtape\.(com|net)\/get_video/i.test(id)) {
-    return subAttach({ parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
+    var directUrl = /\.m3u8(\?|#|$)/i.test(id) ? wrapHlsViaWorker(id) : id;
+    return subAttach({ parse: 0, url: directUrl, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
   }
   // v5：先走 Worker v3 /resolve（服务端全链 + /v 字节代理）；失败回落 v4 本地链。
+  // v7：/resolve 改 3 次重试（req/fetch 双腿竞速）；本地链拿到的 HLS 裸地址包 /h 再播。
   try {
     var rv = await getResolve(id);
     if (rv && rv.url) {
@@ -704,7 +757,8 @@ async function play(reqIn) {
   try {
     var r = await resolvePlay(id);
     if (r && r.url) {
-      return subAttach({ parse: 0, url: r.url, header: { 'User-Agent': UA, 'Referer': r.referer || (HOST + '/') } }, subsP);
+      var fbUrl = /\.m3u8(\?|#|$)/i.test(r.url) ? wrapHlsViaWorker(r.url) : r.url;
+      return subAttach({ parse: 0, url: fbUrl, header: { 'User-Agent': UA, 'Referer': r.referer || (HOST + '/') } }, subsP);
     }
   } catch (e) {}
   return subAttach({ parse: 1, url: id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);

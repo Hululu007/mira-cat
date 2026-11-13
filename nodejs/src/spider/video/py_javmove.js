@@ -54,6 +54,21 @@
 //     10 分钟缓存, 见 JAVMOVE_WORKER), token 失效时先走 Worker 再直连。
 //     Worker 只做解析 (取页 + /watch), 不代理 mp4 字节 (直链本身通,
 //     1.8GB 走免费 Worker 既无必要也扛不住)。
+//   2026-11-13 第三轮真机反馈 (R3, 用户重导第二轮包仍转圈, VM 侧坐实):
+//   直链本身在 curl/Range 下通, 但源站 mp4 host (*.cfd) 对「无 Range」
+//   与「Range: bytes=A-」(无尾端) 只回前 3 MiB (206, Content-Range
+//   bytes 0-3145728, 干净 EOF), 而每部片 moov 都在 3.4-4.2MB (文件头);
+//   播放器 FFmpeg/ijkplayer 首请求即 Range: bytes=0-, 永远拿不全 moov,
+//   ffprobe/ffmpeg 直连复现 "error reading header / End of file" (0 重试)。
+//   只有带明确尾端的 Range (bytes=A-B, 单次上限 12 MiB+1) 才按数回传。
+//   故 v2 "回直链即播" 的前提不成立: 直链只对显式 Range 的播放器可用。
+//   修法 (v3, 最小改动): play() 解析链一个字不动, 只把最终直链包进
+//   Worker /stream (javmove-fetch v2): 显式 Range 原样透传, 无尾端/
+//   无 Range 回首个 12,582,913 字节 chunk 的 206 (FFmpeg 实测会续接
+//   下一段 Range, 60 秒解码已验); Worker 不缓存视频字节、只做流转。
+//   流量账与部署门见同目录 REPORT.md §六-§七: 必须先部署 Worker v2
+//   再推蜘蛛 v3 (v1 Worker 没有 /stream 路由); Worker 未部署时
+//   JAVMOVE_WORKER 为空即回直链 (旧行为, 手机侧仍转圈, 仅作退路)。
 // 字幕: 接 sextb.js 定版字幕芯 (Layer A), 详情页地址为键登记片名、后台预热,
 //   play() 只挂缓存命中 (无命中不现搜, 播放优先)。
 import req from '../../util/req.js';
@@ -463,10 +478,18 @@ async function watchByWorker(mid, slug, type, part) {
 
 // play 收尾: 只挂 detail() 预热已入缓存的字幕命中 (R2: 不再现搜、不再等
 // 6s、不再并发冲站方; 无缓存命中即无字幕返回, 播放优先)。
+// R3: 最终直链包进 Worker /stream 再回 (源站对无 Range / 无尾端 Range
+// 只回前 3 MiB, moov 3.4-4.2MB 永远拿不全, FFmpeg 直连复现打不开;
+// /stream 把请求翻译成明确尾端 Range 再流回, 显式 Range 原样透传)。
+// Worker 未部署 (JAVMOVE_WORKER 为空) 时回直链 (旧行为, 仅作退路)。
+function streamUrl(url) {
+  if (!JAVMOVE_WORKER || !/^https?:\/\/[^/]+\.cfd\/vs\//i.test(url || '')) return url;
+  return JAVMOVE_WORKER + '/stream?u=' + encodeURIComponent(url);
+}
 function playFinish(url, durl) {
   const res = {
     parse: 0,
-    url,
+    url: streamUrl(url),
     header: { 'User-Agent': UA, 'Referer': HOST + '/' },
   };
   try {

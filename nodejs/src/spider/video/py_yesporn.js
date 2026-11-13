@@ -6,14 +6,21 @@
 // 其余 16 条是懒加载（src 为 1x1 gif data URI，真封面在 data-original，
 // 另有 data-webp）；旧代码只读 src，故 16/20 无封面——正对用户反馈
 // “有的可以加载出封面、有的不能”。已改读 data-original 优先。
-// 播放（2026-11-13 坐实）：详情页 flashvars 三档（480p/720p/1080p）
-// get_file/5/<hash>/… 令牌按取详情页时的出口 IP 铸造；VM 出口经代理池，
-// 每条新连接换一个 IPv6（curl 连测 4 次 4 个不同地址），故 VM 侧任何
-// get_file 请求都 404——VM 永远验不了播放，只能验逻辑。手机 Safari
-// 站内自带播放能播，说明站本身在他手机上可播；断点在令牌的新鲜度：
-// 旧代码把详情时刻铸的令牌一直存到点播时刻，中间隔几分钟、IP 一变
-// 即失效。play() 现改为点播时重取详情页、现铸令牌（同 IP、同会话
-// cookie），再把新令牌交给播放器；重铸失败则回落旧令牌（不比原来差）。
+// 播放 v2（2026-11-13 坐实，走下载腿）：
+// 令牌是 42 位 hex（不是 48 位）：前 32 位按文件恒定、后 10 位随出口 IP
+// 变；详情页 flashvars 令牌取 /5/ 文件在 VM/Worker/真机三侧全灭
+// （12 次循环 + 全部变体 + embed 腿 + Worker /diag 三档全 404），
+// 与 UA/Range/Referer/Cookie/方法无关，详情腿判死。
+// 下载页 view_video_download.php?id=<id>&format=<档位> 里现铸的令牌
+// 取文件全通：76639 三档（480p 272MB / 720p 516MB / 1080p 985MB，
+// 全片 206 + 真 ftyp）、16937 的 720p（206，296MB）；下载腿取文件
+// 13 次全部 206。下载页不带 cookie/Referer 也能出链接（链接已在
+// HTML 里，20 秒倒计时只是装饰）；文件请求必须带任一有效匿名会话
+// cookie（无 cookie → 410）。集名携带视频 id + 档位，play() 点播时
+// 现取下载页、现铸现播；无此档位时回退次档，绝不回空 url（空 url＝
+// 无限转圈）。残留风险唯一一项：令牌疑似绑出口 IP（旧令牌+新 IP →
+// 410，但时间亦变，未完全分离）——蜘蛛与播放器同在手机上、同出口、
+// 相隔数秒，真机是最后一步。
 // 字幕：不接。
 import req from '../../util/req.js';
 
@@ -23,21 +30,11 @@ const HOST = 'https://yesporn.vip';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const PAGE_SIZE = 20;
 const SEARCH_SIZE = 20;
+const DL_TIMEOUT = 12000;
+const DL_FALLBACK_TIMEOUT = 8000;
 
-// 与 anysex 同款：detail 登记详情页会话 cookie，play() 随地址带上
-// （KVS get_file 常要会话 cookie；VM 侧 404 主因是 IP 绑定，cookie
-// 救不了 VM，但手机单 IP 下缺 cookie 可能照样 410/404，故照 anysex 补齐）。
-// playAuthCache 另存详情页 URL（referer）：play() 点播时重取详情页现铸
-// 令牌用；重铸失败回落存量令牌。
-const playAuthCache = new Map();
-
-function cacheAuth(url, cookie, referer) {
-  // referer（详情页 URL）是点播重铸的钥匙：即使本次没拿到 set-cookie
-  // 也要登记，否则重铸无从下手；新鲜 cookie 由重铸那次的取页补回。
-  if (!url || !referer) return;
-  playAuthCache.set(url, { cookie: cookie || '', referer });
-  if (playAuthCache.size > 200) playAuthCache.delete(playAuthCache.keys().next().value);
-}
+// 下载页的档位号（format 参数）：只认这三个；站内没有的档位不硬编。
+const DL_FMTS = [1080, 720, 480];
 
 const CLASSES = [
   { type_id: 'latest', type_name: '最新' },
@@ -130,13 +127,14 @@ async function detail(reqIn) {
     || html.match(/content="([^"]+)"[^>]*property="og:image"/i)
     || html.match(/property='og:image'[^>]*content='([^']+)'/i);
   if (pm) pic = absUrl(pm[1]);
-  // 播放：flashvars 三档（video_url / video_alt_url / video_alt_url2），
-  // 值带 function/0/ 前缀，剥掉后即播放地址；档位名取 *_text。有几档出几档。
+  // 播放 v2：集名携带视频 id + 档位 + 详情页 URL（供 play() 现取下载页
+  // 现铸令牌、失败时回退嗅探用）。档位只出 flashvars 里有的，有几档出
+  // 几档；详情页的直链令牌已死，不再放进集名。
   const tiers = parseTiers(html);
-  // 登记会话 cookie：无 cookie 时播放地址可能 410/404，play() 须带上（同 anysex）。
-  const ck = cookieHeader(pg.cookies);
-  for (const q of tiers) cacheAuth(q.url, ck, url);
-  const playUrl = tiers.map((q) => q.label + '$' + q.url).join('#');
+  const vm = url.match(/\/video\/(\d+)\//);
+  const vid = vm ? vm[1] : '';
+  if (!vid || !tiers.length) return { list: [{ vod_id: url, vod_name: name || url, vod_pic: pic, vod_play_from: NAME, vod_play_url: '' }] };
+  const playUrl = tiers.map((q) => q.label + '$yp:' + vid + '|' + q.label + '|' + url).join('#');
   return {
     list: [{
       vod_id: url,
@@ -152,36 +150,27 @@ function t(v) {
   return String(v == null ? '' : v).trim();
 }
 
-// flashvars 三档解析（detail 与 play 重铸共用）：video_url /
-// video_alt_url / video_alt_url2，值带 function/0/ 前缀，剥掉后即播放
-// 地址；档位名取 *_text。返回按清晰度数字从高到低排好的 [{label, url}]。
+// flashvars 三档解析（只用于详情的档位清单）：video_url /
+// video_alt_url / video_alt_url2，档位名取 *_text。返回按清晰度数字
+// 从高到低排好的 [{label}]。直链本身已死，不再取 url。
 function parseTiers(html) {
   const tiers = [];
   const seen = new Set();
-  const push = (u, label) => {
-    u = t(u);
+  const push = (label) => {
     label = t(label);
-    if (!u || !label || seen.has(label)) return;
+    if (!label || seen.has(label)) return;
     seen.add(label);
-    tiers.push({ label, url: u.replace(/&amp;/g, '&') });
+    tiers.push({ label });
   };
   const g = (re) => {
     const mm = html.match(re);
     return mm ? mm[1] : '';
   };
-  push(g(/video_url:\s*'function\/0\/([^']+)'/), g(/video_url_text:\s*'([^']+)'/));
-  push(g(/video_alt_url:\s*'function\/0\/([^']+)'/), g(/video_alt_url_text:\s*'([^']+)'/));
-  push(g(/video_alt_url2:\s*'function\/0\/([^']+)'/), g(/video_alt_url2_text:\s*'([^']+)'/));
+  if (/video_url:\s*'function\/0\//.test(html)) push(g(/video_url_text:\s*'([^']+)'/));
+  if (/video_alt_url:\s*'function\/0\//.test(html)) push(g(/video_alt_url_text:\s*'([^']+)'/));
+  if (/video_alt_url2:\s*'function\/0\//.test(html)) push(g(/video_alt_url2_text:\s*'([^']+)'/));
   tiers.sort((a, b) => parseInt(b.label, 10) - parseInt(a.label, 10));
   return tiers;
-}
-
-// get_file 令牌地址去掉“模式/令牌”段后剩下的文件路径（用于新旧令牌
-// 同档匹配）：https://host/get_file/5/<hash>/76000/76263/76263_1080p_trim.mp4/
-// -> /76000/76263/76263_1080p_trim.mp4/（去掉 ?br= 查询串）。
-function fileTail(url) {
-  const m = String(url || '').match(/\/get_file\/\d+\/[^/]+(\/[^?#]*)/);
-  return m ? m[1] : '';
 }
 
 function decodeHtml(s) {
@@ -212,8 +201,8 @@ function headers(referer) {
 
 // 取页：强制拿原始文本（axios 在站方回 JSON 时会自动解析成对象，
 // String(data) 得 "[object Object]"；responseType:'text' + 恒等
-// transformResponse 可防住）。同时回 set-cookie（anysex 的播放地址
-// 必须带详情页会话 cookie 才能取到 200，无 cookie 一律 410）。
+// transformResponse 可防住）。同时回 set-cookie（文件请求必须带任一
+// 有效匿名会话 cookie，无 cookie → 410；下载页自己会 set-cookie）。
 async function getPage(url, referer, timeout) {
   try {
     const r = await req.get(url, { headers: headers(referer), timeout: timeout || 20000, responseType: 'text', transformResponse: [(d) => d] });
@@ -223,6 +212,7 @@ async function getPage(url, referer, timeout) {
     if (r && r.headers) {
       const sc = r.headers['set-cookie'] || r.headers['Set-Cookie'];
       if (Array.isArray(sc)) cookies = sc;
+      else if (typeof sc === 'string' && sc) cookies = [sc];
       else if (typeof r.headers.getSetCookie === 'function') {
         try { cookies = r.headers.getSetCookie(); } catch (e) { /* 忽略 */ }
       }
@@ -240,6 +230,45 @@ async function getHtml(url, referer) {
 
 function cookieHeader(cookies) {
   return (cookies || []).map((c) => String(c).split(';')[0].trim()).filter(Boolean).join('; ');
+}
+
+// 从下载页 HTML 提取下载链接：接受任意类型号（/3/ 或 /5/，16937 的
+// 720p 是 /3/）。链接可能带 ?download_filename=…&download=true，
+// 有无均可，保留原样。每档下载页只含该档一条链接，优先按档位文件名
+// 匹配（_720p/_1080p），否则取第一条。
+function extractDlLink(html, wantFmt) {
+  if (!html) return '';
+  const links = [];
+  const re = /href="([^"]*get_file[^"]*)"/gi;
+  let m;
+  while ((m = re.exec(html))) links.push(m[1].replace(/&amp;/g, '&'));
+  if (!links.length) {
+    const re2 = /(https?:\/\/yesporn\.vip)?\/get_file\/\d\/[0-9a-f]{42}\/\d+\/\d+\/[\w.-]+\/?(\?[^"'\s<>]*)?/gi;
+    while ((m = re2.exec(html))) links.push(m[0]);
+  }
+  if (!links.length) return '';
+  const pick = (pred) => links.find((u) => pred(u));
+  if (wantFmt === 720) return absUrl(pick((u) => /_720p\.mp4/i.test(u)) || links[0]);
+  if (wantFmt === 1080) return absUrl(pick((u) => /_1080p\.mp4/i.test(u)) || links[0]);
+  return absUrl(pick((u) => !/_720p\.mp4/i.test(u) && !/_1080p\.mp4/i.test(u)) || links[0]);
+}
+
+// 下载腿：取下载页现铸令牌。wantFmt 无链接时（站内无此档，如 16937
+// 无 1080p）按档位递减回退到实际有的最高档；全部无链接返回 ''。
+async function downloadLeg(vid, wantFmt, timeoutMs) {
+  const order = DL_FMTS.filter((f) => f <= wantFmt);
+  for (let i = 0; i < order.length; i++) {
+    const fmt = order[i];
+    const dlUrl = HOST + '/view_video_download.php?id=' + vid + '&format=' + fmt;
+    try {
+      const pg = await getPage(dlUrl, HOST + '/', i === 0 ? timeoutMs : DL_FALLBACK_TIMEOUT);
+      const link = extractDlLink(pg.html, fmt);
+      if (link) {
+        return { url: link, fmt, dlUrl, cookie: cookieHeader(pg.cookies) };
+      }
+    } catch (e) { /* 下一档 */ }
+  }
+  return null;
 }
 
 // 页数：优先取分页块里的最大页码（KVS 分页含末页链接，4kporno/anysex
@@ -301,42 +330,45 @@ async function search(reqIn) {
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
-  const dollar = id.indexOf('$');
-  const label = dollar >= 0 ? t(id.slice(0, dollar)) : '';
-  const m = id.match(/\$?(https?:\/\/[^\s$#]+)/);
-  const url = m ? m[1] : (/^https?:\/\//i.test(id) ? id : '');
-  if (!url) return { parse: 0, url: '' };
-  const result = { parse: 0, url, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
-  const hit = playAuthCache.get(url);
-  if (hit) {
-    if (hit.referer) result.header.Referer = hit.referer;
-    if (hit.cookie) result.header.Cookie = hit.cookie;
+  const raw = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
+  const dollar = raw.indexOf('$');
+  const rest = dollar >= 0 ? raw.slice(dollar + 1) : raw;
+  const ym = rest.match(/^yp:(\d+)\|([^|]+)(?:\|(.+))?$/);
+  // 旧版集名（v1 的详情令牌直链）已死，不再重铸：能从中抠出视频 id 与
+  // 档位就走下载腿，抠不出则原样透传（快败不断圈）。
+  let vid = '';
+  let tierLabel = '';
+  let detailUrl = '';
+  if (ym) {
+    vid = ym[1];
+    tierLabel = ym[2];
+    detailUrl = t(ym[3] || '');
+  } else {
+    const um = rest.match(/\/get_file\/\d+\/[0-9a-f]{42}\/\d+\/(\d+)\/([\w.-]+)/i);
+    if (um) {
+      vid = um[1];
+      const fn = um[2];
+      tierLabel = /_1080p/i.test(fn) ? '1080p' : (/_720p/i.test(fn) ? '720p' : '480p');
+      detailUrl = HOST + '/video/' + vid + '/';
+    }
   }
-  // 点播时重铸令牌：get_file 令牌按取详情页时的出口 IP 铸造，详情时刻
-  // 的令牌到点播时可能已失效（IP 变了 / 隔太久）。点播瞬间重取详情页，
-  // 用同一出口 IP、同会话 cookie 现铸同档新令牌交给播放器——手机上
-  // 详情与播放只隔几秒、同 IP，新令牌才有效。单次 8 秒超时，不重试；
-  // 重铸失败（无登记、取页失败、同档缺失）回落存量令牌，不比原来差。
-  if (hit && hit.referer) {
-    try {
-      const pg = await getPage(hit.referer, HOST + '/', 8000);
-      if (pg.html) {
-        const fresh = parseTiers(pg.html);
-        const tail = fileTail(url);
-        const tier = fresh.find((q) => (label && q.label === label) || (tail && fileTail(q.url) === tail))
-          || (label ? fresh.find((q) => q.label === label) : null);
-        if (tier && tier.url && tier.url !== url) {
-          const ck = cookieHeader(pg.cookies);
-          cacheAuth(tier.url, ck, hit.referer);
-          result.url = tier.url;
-          result.header.Referer = hit.referer;
-          if (ck) result.header.Cookie = ck;
-        }
-      }
-    } catch (e) { /* 回落存量令牌 */ }
+  if (!detailUrl && vid) detailUrl = HOST + '/video/' + vid + '/';
+  if (vid) {
+    const wantFmt = parseInt(tierLabel, 10) || 720;
+    const hit = await downloadLeg(vid, DL_FMTS.includes(wantFmt) ? wantFmt : 720, DL_TIMEOUT);
+    if (hit) {
+      const header = { 'User-Agent': UA, 'Referer': hit.dlUrl };
+      if (hit.cookie) header.Cookie = hit.cookie;
+      return { parse: 0, url: hit.url, header };
+    }
+    // 该片下载页上没有任何可播档位：走嗅探兜底（方案 B），不回空 url。
+    return { parse: 1, url: detailUrl || HOST + '/', msg: '该片暂无可播的清晰度，已转站内播放' };
   }
-  return result;
+  // 非 yp: 且非直链：原样透传（旧缓存集名），否则嗅探兜底，绝不回空 url。
+  if (/^https?:\/\//i.test(rest)) {
+    return { parse: 0, url: rest, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+  }
+  return { parse: 1, url: HOST + '/', msg: '播放地址解析失败，请重试' };
 }
 
 export default function spider() {
@@ -352,4 +384,3 @@ export default function spider() {
     },
   };
 }
-
