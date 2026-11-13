@@ -2,6 +2,12 @@
 // KVS 站。探查 2026-11-13（VM）：列表 24 条/页（搜索 50 条/页），p1/p2
 // 零重叠；分类 79 个真实分类（/videos/categories/ 单页全量，带计数）；
 // /videos/best/ 是按月归档页（/best/2/ 404），不作顶级分类。
+// 顶级分类（2026-11-13 现查站内导航）：最新/最热/评分最高（/videos/top-rated/）/
+// 4K（/videos/4k/，43 页）/全部类别（79 分类筛选卡片）/频道（/channels/ 首页前 30，
+// 2.7k~33.9k 部）/女优（/models/?sort=total_videos 前 40，210~486 部；页内混入的
+// 1~2 部杂项如 joli-st/horny/latina/tiny/sweet 已剔除）。类别 79 个与上一轮逐字
+// 一致，无增减。精选（/videos/best/<月份>/）已试：月页 p1/p2 重叠 2/25，分页不稳，
+// 按验收口径不列为顶级分类；/videos/best/ 总页是 12 个月合集（120 条），也不作列表用。
 // 播放：详情页 <source> 直给三至四档 mp4（720p/480p/240p，部分新片另有 1080p，H.264，实测 206）。
 // 注意：播放地址必须带详情页会话 cookie，无 cookie 时新鲜 token 立刻 410，
 // 故 detail 把 Set-Cookie 按播放地址登记，play() 带上 Cookie + Referer。
@@ -29,28 +35,47 @@ function cacheAuth(url, cookie, referer) {
 const CLASSES = [
   { type_id: 'new', type_name: '最新' },
   { type_id: 'popular', type_name: '最热' },
+  { type_id: 'toprated', type_name: '评分最高' },
+  { type_id: '4k', type_name: '4K' },
   { type_id: 'categories', type_name: '全部类别' },
+  { type_id: 'channels', type_name: '频道' },
+  { type_id: 'models', type_name: '女优' },
 ];
 
 // 79 个真实分类：/videos/categories/ 单页全量抓取（2026-11-13），站方原文名，不编造。
 const SUBS = [{"n":"Step Family","v":"step-family"},{"n":"Mom","v":"mom"},{"n":"Old+Young (18-25)","v":"old-young"},{"n":"Homemade","v":"homemade"},{"n":"Hot Teen 18+","v":"teen"},{"n":"Black porn","v":"black-porn"},{"n":"Granny","v":"granny"},{"n":"Compilation","v":"compilation"},{"n":"Amateur","v":"amateur"},{"n":"Anal","v":"anal"},{"n":"Vintage","v":"vintage"},{"n":"Lesbian","v":"lesbian"},{"n":"Cheating","v":"cheating"},{"n":"Milf","v":"milf"},{"n":"Big Dick","v":"big-dick"},{"n":"Cum in mouth","v":"cum-in-mouth"},{"n":"Celebrities","v":"celebrities"},{"n":"Housewife","v":"housewive"},{"n":"Threesome","v":"threesome"},{"n":"Mature","v":"mature"},{"n":"Close-up","v":"close-up"},{"n":"Cuckold","v":"cuckold"},{"n":"Reality","v":"reality"},{"n":"AI Generated","v":"ai"},{"n":"Japanese","v":"japanese"},{"n":"Cream Pie","v":"cream-pie"},{"n":"Masturbation","v":"masturbation"},{"n":"BBW","v":"bbw"},{"n":"Hentai","v":"hentai"},{"n":"Bisexual","v":"bisexual"},{"n":"Beauty","v":"beauty"},{"n":"Orgasm","v":"orgasm"},{"n":"Hairy","v":"hairy"},{"n":"Upskirt","v":"upskirt"},{"n":"Gangbang","v":"gangbang"},{"n":"Latina","v":"latina"},{"n":"Interracial","v":"interracial"},{"n":"BDSM","v":"bdsm"},{"n":"Erotic","v":"erotic"},{"n":"Swingers","v":"swingers"},{"n":"Teacher","v":"teacher"},{"n":"Hardcore","v":"hardcore"},{"n":"Massage","v":"massage"},{"n":"Big Tits","v":"big-tits"},{"n":"POV","v":"pov"},{"n":"Sex Toys","v":"sex-toys"},{"n":"Thick Ass","v":"ass"},{"n":"Indian","v":"indian"},{"n":"Femdom","v":"femdom"},{"n":"College","v":"college"},{"n":"Squirting","v":"squirting"},{"n":"Ebony","v":"ebony"},{"n":"Double Penetration","v":"dp"},{"n":"Public","v":"public"},{"n":"Handjob","v":"handjob"},{"n":"Party","v":"party"},{"n":"Small Tits","v":"small-tits"},{"n":"Cumshot","v":"cumshot"},{"n":"Lingerie","v":"lingerie"},{"n":"Arab","v":"arab"},{"n":"Orgy","v":"orgy"},{"n":"Russian Girl","v":"russian"},{"n":"Asian","v":"asian"},{"n":"Blowjob","v":"blowjob"},{"n":"Webcam","v":"webcam"},{"n":"Beach","v":"beach"},{"n":"Uniform","v":"uniform"},{"n":"Fisting","v":"fisting"},{"n":"Doggystyle","v":"doggystyle"},{"n":"Office","v":"office"},{"n":"Brazilian","v":"brazilian"},{"n":"Outdoor","v":"outdoor"},{"n":"British 🇬🇧","v":"british"},{"n":"Stockings","v":"stockings"},{"n":"German","v":"german"},{"n":"French","v":"french"},{"n":"Pantyhose","v":"pantyhose"},{"n":"Italian","v":"italian"},{"n":"Footjob","v":"footjob"}];
+
+
+// 30 个频道：/channels/ 首页（默认 rank 序），站方原文名，不编造。
+const CHANNELS = [{"n": "Fame Digital", "v": "fame-digital"}, {"n": "21 Sextury", "v": "21-sextury"}, {"n": "JAVHD", "v": "jav-hd"}, {"n": "Naughty America", "v": "naughty-america"}, {"n": "All Adult Pass", "v": "all-adult-pass"}, {"n": "Pornstar", "v": "pornstar"}, {"n": "All Porn Sites Pass", "v": "all-porn-sites-pass"}, {"n": "My XXX Pass", "v": "my-xxx-pass"}, {"n": "Evil Angel", "v": "evil-angel"}, {"n": "Reality Kings", "v": "reality-kings"}, {"n": "WTF Pass", "v": "wtf-pass"}, {"n": "Team Skeet", "v": "team-skeet"}, {"n": "Bangbros Network", "v": "bang-bros-network"}, {"n": "Brazzers", "v": "brazzers-network"}, {"n": "Av Idolz", "v": "avidolz"}, {"n": "DDF Network", "v": "ddf-network"}, {"n": "The Classic Porn", "v": "the-classic-porn"}, {"n": "Wicked", "v": "wicked"}, {"n": "All Of Gfs", "v": "all-of-gfs"}, {"n": "Mofos", "v": "mofos-network"}, {"n": "Pornstar Network", "v": "pornstar-network"}, {"n": "Private", "v": "private"}, {"n": "1 Pass For All Sites", "v": "1-pass-for-all-sites"}, {"n": "New Sensations", "v": "new-sensations"}, {"n": "Jav HQ", "v": "jav-hq"}, {"n": "CumLouder", "v": "cum-louder"}, {"n": "Babes", "v": "babes"}, {"n": "Dogfart Network", "v": "dog-fart-network"}, {"n": "Mile High Media", "v": "mile-high-media"}, {"n": "Open Life", "v": "open-life"}];
+
+// 40 位女优：/models/?sort=total_videos 首页按片量降序，210~486 部。
+const MODELS = [{"n": "India Summer", "v": "india-summer"}, {"n": "Bridgette B", "v": "bridgette-b"}, {"n": "Aletta Ocean", "v": "aletta-ocean"}, {"n": "Britney Amber", "v": "britney-amber"}, {"n": "Sunny Leone", "v": "sunny-leone"}, {"n": "Jennifer White", "v": "jennifer-white"}, {"n": "Cory Chase", "v": "cory-chase"}, {"n": "Anissa Kate", "v": "anissa-kate"}, {"n": "Asa Akira", "v": "asa-akira"}, {"n": "Lauren Phillips", "v": "lauren-phillips"}, {"n": "Sophie Moone", "v": "sophie-moone"}, {"n": "Alektra Blue", "v": "alektra-blue"}, {"n": "Francesca Le", "v": "francesca-le"}, {"n": "Chanel Preston", "v": "chanel-preston"}, {"n": "Lisa Ann", "v": "lisa-ann"}, {"n": "Brandi Love", "v": "brandi-love"}, {"n": "Krissy Lynn", "v": "krissy-lynn"}, {"n": "Sarah Vandella", "v": "sarah-vandella"}, {"n": "Bree Olson", "v": "bree-olson"}, {"n": "Ava Addams", "v": "ava-addams"}, {"n": "Valentina Nappi", "v": "valentina-nappi"}, {"n": "Julia Ann", "v": "julia-ann"}, {"n": "Kenzie Reeves", "v": "kenzie-reeves"}, {"n": "Casey Calvert", "v": "casey-calvert"}, {"n": "Whitney Wright", "v": "whitney-wright"}, {"n": "Rachel Roxxx", "v": "rachel-roxxx"}, {"n": "Tina Kay", "v": "tina-kay"}, {"n": "Adriana Chechik", "v": "adriana-chechik"}, {"n": "Cherie Deville", "v": "cherie-deville"}, {"n": "Angela White", "v": "angela-white"}, {"n": "Riley Reid", "v": "riley-reid"}, {"n": "Madison Ivy", "v": "madison-ivy"}, {"n": "Emily Willis", "v": "emily-willis"}, {"n": "Alexis Fawx", "v": "alexis-fawx"}, {"n": "Nicole Aniston", "v": "nicole-aniston"}, {"n": "Ava Devine", "v": "ava-devine"}, {"n": "Aaliyah Love", "v": "aaliyah-love"}, {"n": "Eliza Ibarra", "v": "eliza-ibarra"}, {"n": "Alexis Crystal", "v": "alexis-crystal"}, {"n": "Rachel Starr", "v": "rachel-starr"}];
 const FILTERS = {
   categories: [{ key: 'sub', name: '类别', value: SUBS }],
+  channels: [{ key: 'sub', name: '频道', value: CHANNELS }],
+  models: [{ key: 'sub', name: '女优', value: MODELS }],
 };
 
-function effCat(tid, sub) {
-  if (tid === 'categories') {
-    if (sub && SUBS.some((s) => s.v === sub)) return sub;
-    return SUBS[0].v;
-  }
-  return tid;
+const SUBLISTS = { categories: SUBS, channels: CHANNELS, models: MODELS };
+
+function resolveSub(tid, sub) {
+  const lst = SUBLISTS[tid];
+  if (!lst) return '';
+  if (sub && lst.some((s) => s.v === sub)) return sub;
+  return lst[0].v;
 }
 
-function listUrl(eff, page) {
+function listUrl(tid, sub, page) {
   let base;
-  if (eff === 'new') base = HOST + '/videos/new/';
-  else if (eff === 'popular') base = HOST + '/videos/most-viewed/';
-  else base = HOST + '/videos/categories/' + eff + '/';
+  if (tid === 'new') base = HOST + '/videos/new/';
+  else if (tid === 'popular') base = HOST + '/videos/most-viewed/';
+  else if (tid === 'toprated') base = HOST + '/videos/top-rated/';
+  else if (tid === '4k') base = HOST + '/videos/4k/';
+  else if (tid === 'categories') base = HOST + '/videos/categories/' + sub + '/';
+  else if (tid === 'channels') base = HOST + '/channels/' + sub + '/';
+  else if (tid === 'models') base = HOST + '/models/' + sub + '/';
+  else base = HOST + '/videos/new/';
   return page > 1 ? base + page + '/' : base;
 }
 
@@ -247,8 +272,8 @@ async function category(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const tid = String(body.id || body.tid || CLASSES[0].type_id);
   const extend = body.filters || body.extend || {};
-  const eff = effCat(tid, String(extend.sub || ''));
-  const html = await getHtml(listUrl(eff, page));
+  const sub = resolveSub(tid, String(extend.sub || ''));
+  const html = await getHtml(listUrl(tid, sub, page));
   const list = parseList(html);
   return { page, pagecount: pagecountFromHtml(html, page, list, PAGE_SIZE), list };
 }

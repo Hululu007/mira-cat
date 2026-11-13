@@ -6,17 +6,43 @@
 //     首页 meta 自述 .net 为 "the official PimpBunny Net mirror"，
 //     详情页视频地址即指向 pimpbunny.com/videos/...，故蜘蛛走 .net
 //     镜像取 HTML（VM 下 200），与 .com 同源同内容。
-//   - 详情页唯一播放源: <video id="wpst-video"> 内单条
-//     <source src="https://pimpbunny.net/stream/video.mp4?v=<base64>">
-//     （base64 解开即 https://pimpbunny.com/videos/<slug>/），单 MP4，
-//     页内无多档、无 m3u8；下载按钮旁 "HD 1080p" 字样是外站广告
-//     （rustydrawer.com），不是可验证的流清晰度，故只出一条"正片"，
-//     不编 1080p/720p 档位。
-//   - /stream/video.mp4 本身同样被 Bunny Shield 拦（VM 下 403 + 挑战页，
-//     换桌面 UA / video Accept / Referer 均无效；此前探查的 4 个分片
-//     样本全是 1861 字节挑战页）。即 VM 侧只能验到播放地址结构，
-//     拉不到首分片字节；手机住宅出口是否过墙须真机定性（同 javrate
+//   - 详情页唯一播放源: <video id="wpst-video"> 内单条或多条
+//     <source src="https://pimpbunny.net/stream/...">
+//     （两种 URL 形态：旧式 /stream/video.mp4?v=<base64>，新式
+//     /stream/<base64>.mp4；base64 解开即
+//     https://pimpbunny.com/videos/<slug>/）。
+//     页内无 m3u8。下载按钮旁 "HD 1080p" 字样是外站广告
+//     （rustydrawer.com），不是可验证的流清晰度。
+//   - 档位核查（2026-11-13 实测，不编档位）：部分详情页（如 Kwini Kim）
+//     有 4 条 <source>，label 分别为 1080p/720p/480p/360p，但 4 条
+//     src 字节完全相同——站内"四档菜单"是同一 URL 的重复 label。
+//     站源（.com 视频页，经 jina 诊断取文本）每部只有 1 个真实文件：
+//     Abbie、Kwini 抽样均为单个 <hash>_720p.mp4（get_file 直链，
+//     带 v-acctoken + rnd 参数）。故本站无真实多档可出：详情只给
+//     一条"正片"，不把 1 条流展开成 4 档假菜单。
+//   - /stream/video.mp4 本身同样被 Bunny Shield 拦（VM 下 403 +
+//     挑战页，换桌面 UA / video Accept / Referer=详情页 / Range /
+//     Sec-Fetch-Dest: video / 带详情页 cookie 均无效；新式
+//     /stream/<b64>.mp4 同样 403；.com 的 get_file 直链即使带
+//     新鲜 v-acctoken，VM 下同样 403 0 字节——机房出口被拦与
+//     token 无关）。即 VM 侧只能验到播放地址结构，拉不到首分片
+//     字节；手机住宅出口是否过墙须真机定性（同 javrate
 //     的 Bunny 墙先例：只拦机房出口、不拦手机）。
+//   - 断点定位（2026-11-13，用户手机 Safari 站内自带播放能播，
+//     App 内点播失败）：详情页 HTML 本身不走 Shield（VM 下 200，
+//     页内无 shield 脚本、无 Set-Cookie），断点不在取页；断在播
+//     放请求一步——Safari 以浏览器身份（Safari UA + Referer=详情
+//     页 + Sec-Fetch-Dest: video + 浏览器 TLS 指纹）请求 /stream
+//     能过，而 App 把裸 URL 交给原生播放器时请求上下文不同
+//     （播放器自带 UA / 可能丢 Referer / 302 跳到 .com get_file
+//     时头丢失），被 Shield 拦。蜘蛛侧修法（本文件 v2）：
+//     ① play() 先用 HEAD（6s，maxRedirects:0）探 /stream 是否
+//     302 到最终 get_file 直链，拿到就把最终地址 + Safari UA +
+//     Referer=详情页直接交给播放器（与 Safari 跳转后的请求等价，
+//     不再经过会丢头的跳转）；② 探不到（挑战页/超时/非 3xx）
+//     则退回 parse:1，把详情页交给播放器嗅探（manko Upload18
+//     同款做法），由 App 内浏览器环境复现 Safari 站内播放。
+//     不解 PoW、不伪造凭证、不拿用户 cookie。
 //   - 列表分页必须带 ?filter=latest：默认排序首页 30 条/页、翻页在边界
 //     处重复 1-2 条（anal p1/p2、home p1/p2/p3 实测）；带 filter=latest
 //     后一律 20 条/页，p1/p2 零重叠（anal、home、tag、search 实测）。
@@ -325,11 +351,28 @@ async function detail(reqIn) {
   const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/);
   const name = h1 ? clean(h1[1]) : '';
   if (!name) return { list: [] };
-  // 唯一播放源：<source src="https://pimpbunny.net/stream/video.mp4?v=...">
-  const src = html.match(/<source[^>]*src="([^"]+stream\/video\.mp4[^"]*)"/)
-    || html.match(/<source[^>]*src="([^"]+\.mp4[^"]*)"/);
-  if (!src) return { list: [] };
-  const stream = fixUrl(src[1]);
+  // 播放源：<video id="wpst-video"> 块内全部 <source>；多档页的 4 条
+  // label（1080p/720p/480p/360p）src 字节相同，去重后只剩 1 条
+  // 真实流（见文件头档位核查），故只出一条"正片"，不编假档位。
+  // 集串同时带详情页与直链，供 play() 先解析、后嗅探。
+  const vBlock = html.match(/<video[^>]*id="wpst-video"[^>]*>([\s\S]*?)<\/video>/)
+    || html.match(/<video[^>]*>([\s\S]*?)<\/video>/);
+  const srcs = [];
+  if (vBlock) {
+    const re = /<source[^>]*src="([^"]+)"[^>]*>/g;
+    let m;
+    while ((m = re.exec(vBlock[1])) !== null) {
+      const u = fixUrl(m[1]);
+      if (u && srcs.indexOf(u) < 0) srcs.push(u);
+    }
+  }
+  let stream = srcs[0] || '';
+  if (!stream) {
+    const src = html.match(/<source[^>]*src="([^"]+stream\/video\.mp4[^"]*)"/)
+      || html.match(/<source[^>]*src="([^"]+\.mp4[^"]*)"/);
+    if (src) stream = fixUrl(src[1]);
+  }
+  if (!stream) return { list: [] };
   const poster = html.match(/<video[^>]*poster="([^"]+)"/)
     || html.match(/property="og:image"\s+content="([^"]+)"/);
   const durMeta = html.match(/itemprop="duration"\s+content="([^"]+)"/);
@@ -342,9 +385,33 @@ async function detail(reqIn) {
       vod_content: desc ? clean(desc[1]).slice(0, 200) : '',
       vod_remarks: durMeta ? isoDurToStr(durMeta[1]) : '',
       vod_play_from: NAME,
-      vod_play_url: '正片$' + stream,
+      vod_play_url: '正片$pbplay:' + url + '|' + stream,
     }],
   };
+}
+
+// /stream 是代理：站内播放时它应 302 到 .com get_file 真实文件。
+// 用 HEAD（不拉 body）+ maxRedirects:0 只读跳转目标；拿到最终地址
+// 就交给播放器直连（等价于 Safari 跳转后的那次请求，不再经过会
+// 丢头的跳转）。任何失败（挑战页/超时/非 3xx/无 Location）都返回
+// ''，由 play() 退回 parse:1 嗅探线。本地已验：axios 1.6.7
+// maxRedirects:0 + validateStatus 恒真时 302 响应可正常返回，
+// headers.location 完整。
+async function resolveFinal(stream, referer) {
+  try {
+    const r = await req.head(stream, {
+      headers: { 'User-Agent': UA, 'Referer': referer || SITE + '/' },
+      timeout: 6000,
+      maxRedirects: 0,
+      validateStatus: () => true,
+    });
+    const loc = r && r.headers && (r.headers.location || r.headers.Location);
+    if (r && r.status >= 300 && r.status < 400 && loc) {
+      const u = new URL(String(loc), stream).href;
+      if (/^https?:\/\//i.test(u)) return u;
+    }
+  } catch (e) { /* 解析失败即退回嗅探线 */ }
+  return '';
 }
 
 async function play(reqIn) {
@@ -352,15 +419,53 @@ async function play(reqIn) {
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (!id) return { parse: 0, url: '' };
   if (id.indexOf('$') >= 0) id = id.split('$').pop().trim();
-  if (!/^https?:\/\//i.test(id)) return { parse: 0, url: '' };
-  // 单 MP4 直链（/stream/video.mp4?v=<base64>，站方代理回源 .com）。
-  // 注意：该地址在机房出口会被 Bunny Shield 拦（VM 实测 403），
-  // 手机住宅出口是否过墙须真机定性；此处只返地址，不做嗅探。
-  return {
-    parse: 0,
-    url: id,
-    header: { 'User-Agent': UA, 'Referer': SITE + '/' },
-  };
+  // 新式集串：pbplay:<详情页>|<直链>
+  if (id.indexOf('pbplay:') === 0) {
+    const rest = id.slice('pbplay:'.length);
+    const bar = rest.indexOf('|');
+    const detailUrl = bar >= 0 ? rest.slice(0, bar) : rest;
+    const stream = bar >= 0 ? rest.slice(bar + 1) : '';
+    // 腿 1：解析出最终文件地址，直接交给播放器（Safari UA +
+    // Referer=详情页，与 Safari 跳转后的请求等价）。
+    if (stream) {
+      const final = await resolveFinal(stream, detailUrl);
+      if (final) {
+        return {
+          parse: 0,
+          url: final,
+          header: { 'User-Agent': UA, 'Referer': detailUrl },
+        };
+      }
+    }
+    // 腿 2：解析不到（挑战页/超时）→ 把详情页交给播放器嗅探，
+    // 由 App 内浏览器环境复现 Safari 站内播放（manko Upload18
+    // 同款 parse:1 做法；不解 PoW、不伪造凭证）。
+    if (detailUrl) {
+      return {
+        parse: 1,
+        url: detailUrl,
+        header: { 'User-Agent': UA, 'Referer': SITE + '/' },
+      };
+    }
+    return { parse: 0, url: '' };
+  }
+  // 旧缓存集串：裸 /stream 直链 → 老行为原样直出。
+  if (/^https?:\/\//i.test(id) && /\/stream\//i.test(id)) {
+    return {
+      parse: 0,
+      url: id,
+      header: { 'User-Agent': UA, 'Referer': SITE + '/' },
+    };
+  }
+  // 裸详情页 → 嗅探线。
+  if (/^https?:\/\/pimpbunny\.net\//i.test(id)) {
+    return {
+      parse: 1,
+      url: id,
+      header: { 'User-Agent': UA, 'Referer': SITE + '/' },
+    };
+  }
+  return { parse: 0, url: '' };
 }
 
 async function search(reqIn) {

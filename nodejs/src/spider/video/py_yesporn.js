@@ -2,11 +2,19 @@
 // KVS 站。探查 2026-11-13（VM）：列表 20 条/页，p1/p2 零重叠；分类 58 个
 // 真实分类（/categories/ 分 3 页：20+20+18，p4 404）；搜索翻页走
 // ?from_videos=<页码>（/search/<q>/2/ 是 404）。
-// 播放注意：详情页 flashvars 三档（480p/720p/1080p）VM 侧实测全部 404，
-// 原因已坐实（2026-11-13 复验）：get_file 令牌绑定 kt_ips 里的出口 IP，
-// 而 VM 出口 IPv6 每次连接都换（连抓三次 kt_ips 各不相同），详情与播放
-// 永远不在同一 IP 上，故一律 404；同页截图 206、预览经 302 到 cdn3 可
-// 200 播，站未死、未被墙。手机单 IP 应可播，须真机定性。字幕：不接。
+// 封面（2026-11-13 坐实）：列表前 4 条是 eager 图（img src 即真封面），
+// 其余 16 条是懒加载（src 为 1x1 gif data URI，真封面在 data-original，
+// 另有 data-webp）；旧代码只读 src，故 16/20 无封面——正对用户反馈
+// “有的可以加载出封面、有的不能”。已改读 data-original 优先。
+// 播放（2026-11-13 坐实）：详情页 flashvars 三档（480p/720p/1080p）
+// get_file/5/<hash>/… 令牌按取详情页时的出口 IP 铸造；VM 出口经代理池，
+// 每条新连接换一个 IPv6（curl 连测 4 次 4 个不同地址），故 VM 侧任何
+// get_file 请求都 404——VM 永远验不了播放，只能验逻辑。手机 Safari
+// 站内自带播放能播，说明站本身在他手机上可播；断点在令牌的新鲜度：
+// 旧代码把详情时刻铸的令牌一直存到点播时刻，中间隔几分钟、IP 一变
+// 即失效。play() 现改为点播时重取详情页、现铸令牌（同 IP、同会话
+// cookie），再把新令牌交给播放器；重铸失败则回落旧令牌（不比原来差）。
+// 字幕：不接。
 import req from '../../util/req.js';
 
 const KEY = 'py_yesporn';
@@ -19,11 +27,15 @@ const SEARCH_SIZE = 20;
 // 与 anysex 同款：detail 登记详情页会话 cookie，play() 随地址带上
 // （KVS get_file 常要会话 cookie；VM 侧 404 主因是 IP 绑定，cookie
 // 救不了 VM，但手机单 IP 下缺 cookie 可能照样 410/404，故照 anysex 补齐）。
+// playAuthCache 另存详情页 URL（referer）：play() 点播时重取详情页现铸
+// 令牌用；重铸失败回落存量令牌。
 const playAuthCache = new Map();
 
 function cacheAuth(url, cookie, referer) {
-  if (!url || !cookie) return;
-  playAuthCache.set(url, { cookie, referer });
+  // referer（详情页 URL）是点播重铸的钥匙：即使本次没拿到 set-cookie
+  // 也要登记，否则重铸无从下手；新鲜 cookie 由重铸那次的取页补回。
+  if (!url || !referer) return;
+  playAuthCache.set(url, { cookie: cookie || '', referer });
   if (playAuthCache.size > 200) playAuthCache.delete(playAuthCache.keys().next().value);
 }
 
@@ -77,8 +89,16 @@ function parseList(html) {
     const title = decodeHtml(m[2]);
     const tail = html.slice(m.index, m.index + 2000);
     let pic = '';
-    const im = tail.match(/<img[^>]+src="(https?:\/\/[^"]+)"/i);
-    if (im) pic = im[1];
+    // 封面：懒加载图真地址在 data-original（data-webp 为次选），只有前几
+    // 条 eager 图才有真 src；旧代码只读 src，16/20 的图是 1x1 gif data URI。
+    const imgTag = tail.match(/<img[^>]*>/i);
+    if (imgTag) {
+      const tag = imgTag[0];
+      const dm = tag.match(/data-original="(https?:\/\/[^"]+)"/i)
+        || tag.match(/data-webp="(https?:\/\/[^"]+)"/i)
+        || tag.match(/\ssrc="(https?:\/\/[^"]+)"/i);
+      if (dm) pic = dm[1];
+    }
     const qm = tail.match(/class="qualtiy">\s*([^<]+?)\s*<\/div>/i);
     const tm = tail.match(/class="time">\s*([^<]+?)\s*<\/div>/i);
     const remarks = [qm ? t(qm[1]) : '', tm ? t(tm[1]) : ''].filter(Boolean).join(' ');
@@ -112,23 +132,7 @@ async function detail(reqIn) {
   if (pm) pic = absUrl(pm[1]);
   // 播放：flashvars 三档（video_url / video_alt_url / video_alt_url2），
   // 值带 function/0/ 前缀，剥掉后即播放地址；档位名取 *_text。有几档出几档。
-  const tiers = [];
-  const seen = new Set();
-  const push = (u, label) => {
-    u = t(u);
-    label = t(label);
-    if (!u || !label || seen.has(label)) return;
-    seen.add(label);
-    tiers.push({ label, url: u.replace(/&amp;/g, '&') });
-  };
-  const g = (re) => {
-    const mm = html.match(re);
-    return mm ? mm[1] : '';
-  };
-  push(g(/video_url:\s*'function\/0\/([^']+)'/), g(/video_url_text:\s*'([^']+)'/));
-  push(g(/video_alt_url:\s*'function\/0\/([^']+)'/), g(/video_alt_url_text:\s*'([^']+)'/));
-  push(g(/video_alt_url2:\s*'function\/0\/([^']+)'/), g(/video_alt_url2_text:\s*'([^']+)'/));
-  tiers.sort((a, b) => parseInt(b.label, 10) - parseInt(a.label, 10));
+  const tiers = parseTiers(html);
   // 登记会话 cookie：无 cookie 时播放地址可能 410/404，play() 须带上（同 anysex）。
   const ck = cookieHeader(pg.cookies);
   for (const q of tiers) cacheAuth(q.url, ck, url);
@@ -146,6 +150,38 @@ async function detail(reqIn) {
 
 function t(v) {
   return String(v == null ? '' : v).trim();
+}
+
+// flashvars 三档解析（detail 与 play 重铸共用）：video_url /
+// video_alt_url / video_alt_url2，值带 function/0/ 前缀，剥掉后即播放
+// 地址；档位名取 *_text。返回按清晰度数字从高到低排好的 [{label, url}]。
+function parseTiers(html) {
+  const tiers = [];
+  const seen = new Set();
+  const push = (u, label) => {
+    u = t(u);
+    label = t(label);
+    if (!u || !label || seen.has(label)) return;
+    seen.add(label);
+    tiers.push({ label, url: u.replace(/&amp;/g, '&') });
+  };
+  const g = (re) => {
+    const mm = html.match(re);
+    return mm ? mm[1] : '';
+  };
+  push(g(/video_url:\s*'function\/0\/([^']+)'/), g(/video_url_text:\s*'([^']+)'/));
+  push(g(/video_alt_url:\s*'function\/0\/([^']+)'/), g(/video_alt_url_text:\s*'([^']+)'/));
+  push(g(/video_alt_url2:\s*'function\/0\/([^']+)'/), g(/video_alt_url2_text:\s*'([^']+)'/));
+  tiers.sort((a, b) => parseInt(b.label, 10) - parseInt(a.label, 10));
+  return tiers;
+}
+
+// get_file 令牌地址去掉“模式/令牌”段后剩下的文件路径（用于新旧令牌
+// 同档匹配）：https://host/get_file/5/<hash>/76000/76263/76263_1080p_trim.mp4/
+// -> /76000/76263/76263_1080p_trim.mp4/（去掉 ?br= 查询串）。
+function fileTail(url) {
+  const m = String(url || '').match(/\/get_file\/\d+\/[^/]+(\/[^?#]*)/);
+  return m ? m[1] : '';
 }
 
 function decodeHtml(s) {
@@ -178,9 +214,9 @@ function headers(referer) {
 // String(data) 得 "[object Object]"；responseType:'text' + 恒等
 // transformResponse 可防住）。同时回 set-cookie（anysex 的播放地址
 // 必须带详情页会话 cookie 才能取到 200，无 cookie 一律 410）。
-async function getPage(url, referer) {
+async function getPage(url, referer, timeout) {
   try {
-    const r = await req.get(url, { headers: headers(referer), timeout: 20000, responseType: 'text', transformResponse: [(d) => d] });
+    const r = await req.get(url, { headers: headers(referer), timeout: timeout || 20000, responseType: 'text', transformResponse: [(d) => d] });
     const data = r && r.data;
     const html = typeof data === 'string' ? data : (data ? JSON.stringify(data) : '');
     let cookies = [];
@@ -266,6 +302,8 @@ async function search(reqIn) {
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
+  const dollar = id.indexOf('$');
+  const label = dollar >= 0 ? t(id.slice(0, dollar)) : '';
   const m = id.match(/\$?(https?:\/\/[^\s$#]+)/);
   const url = m ? m[1] : (/^https?:\/\//i.test(id) ? id : '');
   if (!url) return { parse: 0, url: '' };
@@ -274,6 +312,29 @@ async function play(reqIn) {
   if (hit) {
     if (hit.referer) result.header.Referer = hit.referer;
     if (hit.cookie) result.header.Cookie = hit.cookie;
+  }
+  // 点播时重铸令牌：get_file 令牌按取详情页时的出口 IP 铸造，详情时刻
+  // 的令牌到点播时可能已失效（IP 变了 / 隔太久）。点播瞬间重取详情页，
+  // 用同一出口 IP、同会话 cookie 现铸同档新令牌交给播放器——手机上
+  // 详情与播放只隔几秒、同 IP，新令牌才有效。单次 8 秒超时，不重试；
+  // 重铸失败（无登记、取页失败、同档缺失）回落存量令牌，不比原来差。
+  if (hit && hit.referer) {
+    try {
+      const pg = await getPage(hit.referer, HOST + '/', 8000);
+      if (pg.html) {
+        const fresh = parseTiers(pg.html);
+        const tail = fileTail(url);
+        const tier = fresh.find((q) => (label && q.label === label) || (tail && fileTail(q.url) === tail))
+          || (label ? fresh.find((q) => q.label === label) : null);
+        if (tier && tier.url && tier.url !== url) {
+          const ck = cookieHeader(pg.cookies);
+          cacheAuth(tier.url, ck, hit.referer);
+          result.url = tier.url;
+          result.header.Referer = hit.referer;
+          if (ck) result.header.Cookie = ck;
+        }
+      }
+    } catch (e) { /* 回落存量令牌 */ }
   }
   return result;
 }

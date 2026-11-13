@@ -3,6 +3,13 @@
 //   顶级: 最新 (首页 / , 24 条/页, 翻页 /?page=N, p8 仍有 12 条新内容, 页数不止
 //     导航栏显示的 7 页, 故用 999 形态)、新发布 (/release 单页 10 条, 无翻页)、
 //     即将上映 (/upcoming 单页 13 条, 无翻页)。
+//   2026-11-13 用户反馈顶级分类太少: 站内导航只有 / /release /upcoming /genres
+//     /makers, 无更多站方顶级栏; /genres 索引实录 361 个题材, 其中无 "无码流出"
+//     标签 (grep leak 全站 0 命中), 最接近的是 JAV Uncensored
+//     (genres/javuncensored/jav-uncensored)。故把用户点名的无码流出/巨乳/
+//     大屁股 + 人气前列 5 个题材 (中出/人妻/熟女/单体作品/素人) 提为顶级分类,
+//     各页 p1/p2 均 12 条、0 重叠 (curl 串行实测); 40 题材 + 20 制作商筛选卡片保留,
+//     12 个曾报 0 的制作商串行复核全是 200/12 条 (并行尾段 stall 误报, 一个不删)。
 //   子分类走顶级 + filters 筛选卡片 (123AV 形态): 题材 361 个、制作商 947 个,
 //     全量既无法逐个验、App 里也没法翻, 只取 /genres 与 /makers 索引页顺序 (人气序)
 //     前 40 题材 + 前 20 制作商; 题材页与制作商页翻页均为 ?page=N
@@ -20,6 +27,21 @@
 //     play() 按 part 地址现取 data-id 再调 /watch, 不复用详情时 token。
 //     注意播放器另有 MSE + /decryptor.wasm + /api/session-ticket 加密分支,
 //     只在 /watch 不回直链 http(s) 地址时走, 本批 /watch 均回直链, 不走该分支。
+//   2026-11-13 复验新增 (封面/播放断点定位):
+//   - /watch 必须带 Referer 头 (任意值都行, 例 example.com 也通; 不带则 200 但正文
+//     仅 "re" 2 字节、无可用地址; 带 Referer 4 次全回 63 字节直链)。蜘蛛 play() 与
+//     getHtml 均显式带 Referer, VM 侧链路通; App 侧若 req 层剥 Referer 则 /watch
+//     必空 —— VM 无法验证 App 的头透传, 需设备侧定性 (见报告)。
+//   - data-id 每次加载都轮换 (同 URL 两次取到不同 token), 故 play() 必须现取,
+//     不可复用详情 token; /watch 对同一 token 确定性回同一 mp4, mp4 直链取后
+//     20+ 分钟仍 206 (非秒级过期); ?type=FULLHDFIXED 与 ?type=FULLHD_UPDATED
+//     回同一 mp4 (站方忽略未知 type、回默认 part), 但 '#' 按钮的 type 仍以组内
+//     兄弟链接的 ?type= 为准 (见 parseFormats), 不再用标题剥出来的臆测值。
+//   - 站方慢: 首页 4.6s、题材/制作商索引 6.2-6.4s、详情 3.9-11s、/watch 2.6-7s、
+//     封面单张 4-6s、mp4 Range 2.7-6s; play() 链 (part 页 + /watch + 字幕串行
+//     6s) 在 harness 实测 24-66s。play() 内字幕搜索改为与取页并行, 省掉串行
+//     6s; 封面本身 URL 形态无错 (绝对地址、ie2 host、无 Referer 也 200
+//     image/jpeg、无替代 host), VM 侧全通, 手机侧全灭未在 VM 复现。
 // 字幕: 接 sextb.js 定版字幕芯 (Layer A), 详情页地址为键登记片名、后台预热,
 //   play() 有命中才挂 subs。
 import req from '../../util/req.js';
@@ -33,7 +55,29 @@ const CLASSES = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'release', type_name: '新发布' },
   { type_id: 'upcoming', type_name: '即将上映' },
+  // 用户点名补的顶级题材 (2026-11-13, 各页 p1/p2 均 12 条、0 重叠, curl 串行实测)。
+  // 站内无 "无码流出" 标签, 用 JAV Uncensored 页承接 (全站 grep leak 0 命中)。
+  { type_id: 'g-uncensored', type_name: '无码流出' },
+  { type_id: 'g-bigtits', type_name: '巨乳' },
+  { type_id: 'g-hugebutt', type_name: '大屁股' },
+  { type_id: 'g-creampie', type_name: '中出' },
+  { type_id: 'g-married', type_name: '人妻' },
+  { type_id: 'g-mature', type_name: '熟女' },
+  { type_id: 'g-solowork', type_name: '单体作品' },
+  { type_id: 'g-amateur', type_name: '素人' },
 ];
+
+// 顶级题材 type_id -> 站内题材页 (与 GENRES 前 40 里的同一地址, 非平铺新增)
+const GENRE_TOP = {
+  'g-uncensored': 'genres/javuncensored/jav-uncensored',
+  'g-bigtits': 'genres/BJiygps/big-tits',
+  'g-hugebutt': 'genres/BmfzJNE/huge-butt',
+  'g-creampie': 'genres/GVWkCw/creampie',
+  'g-married': 'genres/BcEqYww/married-woman',
+  'g-mature': 'genres/DFiQTPU/mature-woman',
+  'g-solowork': 'genres/QxHGjE/solowork',
+  'g-amateur': 'genres/BHCJmMg/amateur',
+};
 
 // 题材前 40 (/genres 索引页人气序, 2026-11-13 实录; 全站 361 个, 只取前 40)
 const GENRES = [
@@ -105,8 +149,8 @@ const MAKERS = [
 
 // 两张筛选卡共用 key 'sub' (123AV 同款): 值前缀 genres/ 与 maker/ 区分维度
 const FILTERS = {};
-for (const tid of ['latest', 'release', 'upcoming']) {
-  FILTERS[tid] = [
+for (const c of CLASSES) {
+  FILTERS[c.type_id] = [
     { key: 'sub', name: '题材', value: GENRES },
     { key: 'sub', name: '制作商', value: MAKERS },
   ];
@@ -201,6 +245,10 @@ async function category(reqIn) {
   if (sub && (sub.startsWith('genres/') || sub.startsWith('maker/'))) {
     url = HOST + '/' + sub;
     if (page > 1) url += '?page=' + page;
+  } else if (GENRE_TOP[tid]) {
+    // 顶级题材: 直接走题材页, 翻页 ?page=N (p1/p2 各 12 条、0 重叠已验)
+    url = HOST + '/' + GENRE_TOP[tid];
+    if (page > 1) url += '?page=' + page;
   } else if (tid === 'release') {
     url = HOST + '/release';
     single = true;
@@ -260,6 +308,12 @@ function parseFormats(html, mv) {
     const segStart = heads[i].index + heads[i][0].length;
     const segEnd = (i + 1 < heads.length) ? heads[i + 1].index : Math.min(html.length, segStart + 4000);
     const seg = html.slice(segStart, segEnd);
+    // 组内规范 type 取自兄弟链接的 ?type= (站方实值, 如 FULLHD_UPDATED);
+    // '#' 按钮 (当前 part) 无 href 参数时用它, 不再用标题剥出来的臆测值
+    // (旧版 "FullHD (Fixed)" 剥出 FULLHDFIXED, 站方从未用过该值; 实测站方
+    // 忽略未知 type 回默认 part, 与 FULLHD_UPDATED 回同一 mp4, 但仍以实值为准)。
+    const typeInSeg = seg.match(/[?&]type=([A-Za-z0-9_-]+)/i);
+    const canonType = typeInSeg ? typeInSeg[1].toUpperCase() : type;
     const bre = /<a[^>]*class="[^"]*video-source-btn[^"]*"[^>]*href="([^"]*)"[^>]*>([^<]*)<\/a>/g;
     let bm;
     let hasBtn = false;
@@ -267,13 +321,13 @@ function parseFormats(html, mv) {
       hasBtn = true;
       const href = bm[1] || '';
       const part = t(bm[2]) || '1';
-      let ptype = type;
+      let ptype = canonType;
       let pnum = part;
       const qm = href.match(/[?&]type=([^&]+)&p=(\d+)/i);
       if (qm) { ptype = qm[1].toUpperCase(); pnum = qm[2]; }
       lines.push(fmt + '·P' + pnum + '$move:' + mv.id + ':' + mv.slug + ':' + ptype + ':' + pnum);
     }
-    if (!hasBtn) lines.push(fmt + '·P1$move:' + mv.id + ':' + mv.slug + ':' + type + ':1');
+    if (!hasBtn) lines.push(fmt + '·P1$move:' + mv.id + ':' + mv.slug + ':' + canonType + ':1');
   }
   return lines;
 }
@@ -325,7 +379,11 @@ async function play(reqIn) {
   const type = m[3];
   const part = m[4];
   const durl = HOST + '/movie/' + mid + '/' + slug;
-  // 按 part 地址现取 data-id (各 part token 不同), 再调 /watch 取直链
+  // 字幕搜索先启动、与下面两次站方请求并行 (旧版串行等 6s 预算, 站方单请求已
+  // 3-7s, play 全程在 harness 实测 24-66s); detail() 预热未完成时这里也已在途。
+  const subsP = subSearchAll(subNormKey(durl)).catch(() => []);
+  // 按 part 地址现取 data-id (各 part token 不同, 且每次加载都轮换), 再调 /watch
+  // 取直链。/watch 必须带 Referer 头 (任意值都行; 不带则 200 但正文仅 "re")。
   const partUrl = type ? durl + '?type=' + type + '&p=' + part : durl;
   const html = await getHtml(partUrl);
   if (!html) return { parse: 0, url: '' };
@@ -334,7 +392,6 @@ async function play(reqIn) {
   const watchTxt = await getHtml(HOST + '/watch?token=' + encodeURIComponent(dm[1]), { 'Referer': partUrl }, 15000);
   const url = t(watchTxt);
   if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '' };
-  const subsP = subSearchAll(subNormKey(durl)).catch(() => []);
   return subAttach({
     parse: 0,
     url,
