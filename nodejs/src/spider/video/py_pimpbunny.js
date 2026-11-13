@@ -129,6 +129,48 @@
 //     与直连同构；最坏总耗时 20 秒，与原来单腿 20 秒持平）。
 //     detail() 的 .net 取页刻意不动（已有档位双腿兜底，动它
 //     只加最坏耗时，不治列表的病）。】
+//   - 【v6 诊断 2026-11-13（R5 实测：21:54 用户报点播立即失败，
+//     "视频信息获取失败"）：v5 的点播三腿全系在 .com 一根线上——
+//     腿 1 重铸要取 .com 视频页、腿 2 回落详情时刻的 .com 令牌、
+//     腿 3 parse:1 嗅探 .com 视频页；.com 在 VM 下本轮又回 403 +
+//     1861 字节 Shield 页（直连取页 1.6 秒即回挑战页），三腿同
+//     时撞墙、且都死得快，与用户"立即解析不出地址"正对上。
+//     v4 的修法只在"怎么铸 .com 令牌"上换花样，没换"必须过
+//     .com"这个前提——前提本身就是断点。
+//     R5 复现核对（本轮实测，见 REPORT）：失败片
+//     Comatozze《Comatozze Enjoys Own Coworker's BWC》
+//     （https://pimpbunny.net/comatozze-enjoys-own-coworkers-bwc-onlyfans-video/）
+//     的 .net 详情页 200/69624 字节，<video id="wpst-video"> 只
+//     有一条 <source>（/stream/video.mp4?v=<b64>），页内无
+//     kt_player、无 get_file、无 bunnytoken、无 download 按钮——
+//     .net 页里根本没有令牌配置，所谓".net 现铸令牌"不存在；
+//     .com 视频页（jina 两次取回字节全同、rnd 同为 1794578245，
+//     缓存假象再确认）里的下载按钮是 data-dialog="upgrade"
+//     付费墙、/api/v1/direct/* 是 tsyndicate 广告、
+//     bunnytoken 出现 0 次——yesporn 的下载页腿与 JavRate 的
+//     /api/bunnytoken/generate 腿在本源都不存在，无法移植；
+//     /embed/<id> 与视频页同属 .com，同墙同死。
+//     v6 换主路：整条点播只走 .net（手机上列表/详情都通的
+//     唯一宿主），不再碰 .com、不再铸令牌——蜘蛛在手机端替
+//     播放器做 Safari 那次请求：GET /stream（Safari UA +
+//     Referer=详情页 + Range 0-1023），手动跟跳转（≤3 跳，
+//     逐跳收 Set-Cookie 并带往下一跳）：① 302 到 get_file
+//     就把最终地址 + 当次 cookie 交播放器（令牌由站方在跳
+//     转时为手机出口现铸，蜘蛛不碰令牌本身）；② 无跳转且
+//     回视频字节就把 /stream 本身交播放器（与 Safari 站内
+//     <video> 请求等价）；③ 403/Shield/超时才退回 parse:1
+//     嗅探 .net 详情页（App 内浏览器复现 Safari 站内播放）。
+//     与 v2 的区别：v2 是 HEAD + 不跟跳转（只读 Location），
+//     本轮是 GET + 手动跟跳转——GET 才是 Safari 的请求形态，
+//     且跳转后的最终地址由蜘蛛直接交播放器，播放器不再经
+//     历会丢头的跳转。先例：24JAV 的蜘蛛本地字节代理（蜘蛛
+//     在 App 内替播放器拉取并改写播单、播放器只拿成品地址，
+//     同仓 py_24jav.js /proxy/m3u8 路由）——同一思路，本源
+//     是 MP4 故不用 /proxy 路由，改取跳转终点直链。
+//     代价（实话）：.net 只给一条 /stream，v3 起的五档菜单
+//     随 .com 一起下线，详情只出一条"正片"（.net 实际供给
+//     的就是一条流，不编档位）；/stream 播的是哪一档、清
+//     晰度如何，VM 侧验不到，只差真机。】
 //   - 列表分页必须带 ?filter=latest：默认排序首页 30 条/页、翻页在边界
 //     处重复 1-2 条（anal p1/p2、home p1/p2/p3 实测）；带 filter=latest
 //     后一律 20 条/页，p1/p2 零重叠（anal、home、tag、search 实测）。
@@ -465,10 +507,9 @@ async function detail(reqIn) {
   if (!name) return { list: [] };
   // 播放源：<video id="wpst-video"> 块内全部 <source>；多档页的 4 条
   // label（1080p/720p/480p/360p）src 字节相同，去重后只剩 1 条
-  // 真实流（见文件头档位核查），故 .net 页本身只给一条 /stream；
-  // 真实档位菜单在 .com 视频页的 kt_player 配置里，v4 由
-  // fetchLadderDirect() 直连现铸（失败退回 fetchLadderJina()，见下）。
-  // 集串同时带详情页与直链，供 play() 先解析、后嗅探。
+  // 真实流（见文件头档位核查），故 .net 页本身只给一条 /stream。
+  // v6 不再取 .com 视频页的 kt_player 档位（R5 断点：.com 是墙），
+  // 集串只带详情页与 /stream，供 play() 蜘蛛侧解析、后嗅探。
   const vBlock = html.match(/<video[^>]*id="wpst-video"[^>]*>([\s\S]*?)<\/video>/)
     || html.match(/<video[^>]*>([\s\S]*?)<\/video>/);
   const srcs = [];
@@ -491,24 +532,13 @@ async function detail(reqIn) {
     || html.match(/property="og:image"\s+content="([^"]+)"/);
   const durMeta = html.match(/itemprop="duration"\s+content="([^"]+)"/);
   const desc = html.match(/<meta\s+itemprop="description"\s+content="([^"]+)"/);
-  // v4：手机端现铸档位。先直连取 .com 视频页（现铸档位 + 抓会话
-  // cookie），成功则出真实档位菜单（集串四段：
-  // pbplay:<.net 详情页>|<.com 视频页>|<某档 get_file 直链>|<cookie>，
-  // play() 点播时重铸，铸不到回落此令牌）；直连失败退回 jina 只取
-  // 档位名（集串 cookie 段为空，play() 不直接交 jina 令牌）；
-  // 两腿都失败则退回 v2 单"正片"集串（附 .com 视频页供 play()
-  // 嗅探用）。
-  let playUrl = '正片$pbplay:' + url + '|' + stream;
-  const comVideo = comVideoFromStream(stream);
-  if (comVideo) {
-    let got = await fetchLadderDirect(comVideo);
-    if (!got.ladder.length) got = await fetchLadderJina(comVideo);
-    if (got.ladder.length) {
-      playUrl = got.ladder.map((q) => q.label + '$pbplay:' + url + '|' + comVideo + '|' + q.url + '|' + (got.cookie || '')).join('#');
-    } else {
-      playUrl = '正片$pbplay:' + url + '|' + stream + '|' + comVideo;
-    }
-  }
+  // v6：只出一条"正片"，集串只带 .net 详情页与 /stream，不再碰
+  // .com、不再铸档位。v3 起的五档菜单全系在 .com 视频页的
+  // kt_player 配置上，.com 在手机上撞 Shield 即全死（R5 断点）；
+  // .net 详情页本身只给一条 /stream（本轮 Comatozze 实测），
+  // .net 实际供给的就是一条流——按实供出一条，不编档位。
+  // play() 点播时蜘蛛侧 GET /stream 跟跳转取终点（见 resolveStream）。
+  const playUrl = '正片$pbplay:' + url + '|' + stream;
   return {
     list: [{
       vod_id: url,
@@ -522,227 +552,136 @@ async function detail(reqIn) {
   };
 }
 
-// ---------- v4：手机端现铸档位（直连优先，jina 只取档位名） ----------
-// /stream URL 内 base64 解开即 .com 视频页地址（新旧两种形态通用）。
-function b64decode(s) {
-  try {
-    s = String(s || '').replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
-    while (s.length % 4) s += '=';
-    return Buffer.from(s, 'base64').toString('utf8');
-  } catch (e) { return ''; }
-}
+// ---------- v6：蜘蛛侧 GET /stream 跟跳转（只走 .net，不碰 .com） ----------
+// R5 换路：v3/v4/v5 的点播全系在 .com 视频页（铸令牌 / 嗅探页），
+// .com 一撞 Shield 就全死且死得快。本轮改由蜘蛛在手机端替播放器
+// 做 Safari 那次请求——GET /stream（Safari UA + Referer=详情页 +
+// Range 0-1023），手动跟跳转、逐跳收 cookie：
+//   ① 302 到 get_file → 回 { kind:'final', url: 最终地址, cookie }
+//      （令牌由站方在跳转时为手机出口现铸，蜘蛛不碰令牌本身）；
+//   ② 无跳转且回视频字节（206/200 + video/*）→ 回 { kind:'direct',
+//      url: /stream 本身 }（与 Safari 站内 <video> 请求等价）；
+//   ③ 403/Shield/超时/非视频 2xx → 回 null，play() 退回 parse:1
+//      嗅探 .net 详情页。
+// 与 v2 的区别：v2 是 HEAD + maxRedirects:0 只读 Location（不跟跳
+// 转）；本轮是 GET + 手动跟跳转——GET 才是 Safari 的请求形态，
+// 且最终地址由蜘蛛直接交播放器，播放器不再经历会丢头的跳转。
+// 边界：每跳 4 秒、最多 3 跳（最坏 12 秒，正常 1 跳 1-2 秒）；
+// Range 只取前 1KB 探路，maxContentLength 64KB 兜底（站方若无视
+// Range 直下整文件，axios 拒收即证明在出视频字节，按 direct 计，
+// 不把整部片读进内存）。不解 PoW、不伪造凭证、不拿用户 cookie。
 
-function comVideoFromStream(stream) {
-  try {
-    const u = new URL(stream);
-    let b64 = '';
-    if (u.pathname === '/stream/video.mp4') b64 = u.searchParams.get('v') || '';
-    else if (u.pathname.indexOf('/stream/') === 0) b64 = u.pathname.split('/').pop().replace(/\.mp4$/i, '');
-    const dec = b64decode(b64);
-    if (/^https:\/\/pimpbunny\.com\/videos\/[^/]+\/$/.test(dec)) return dec;
-  } catch (e) { /* 不是可解的 /stream 形态 */ }
-  return '';
-}
-
-// ---------- v4：手机端现铸档位（直连优先，jina 只取档位名） ----------
-
-// 取 .com 视频页：回 { html, cookie }。cookie 取法与同批 yesporn 的
-// getPage 同款（anysex/yesporn 的播放地址必须带详情页会话 cookie
-// 才能取到 200，无 cookie 一律 410/403；本站 .com 页每次回
-// Set-Cookie bunny_shield_id_210144，.net 页不设 cookie）。
-// 注意不用 isShield() 判页：真页正文里也含 'bunny-shield' 字样，
-// 判页只看解析出的档位（parseLadder 为空即失败），Shield 挑战页
-// 本身无 kt_player 配置，自然落空。
-async function getComPage(url, timeoutMs) {
-  try {
-    const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Referer': COM + '/', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' },
-      timeout: timeoutMs || 6000,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-    });
-    const data = r && r.data;
-    const html = typeof data === 'string' ? data : (data ? JSON.stringify(data) : '');
-    let cookies = [];
-    if (r && r.headers) {
-      const sc = r.headers['set-cookie'] || r.headers['Set-Cookie'];
-      if (Array.isArray(sc)) cookies = sc;
-      else if (typeof sc === 'string' && sc) cookies = [sc];
-      else if (typeof r.headers.getSetCookie === 'function') {
-        try { cookies = r.headers.getSetCookie(); } catch (e) { /* 忽略 */ }
-      }
+// 收集一跳的 Set-Cookie（取法与旧版 getComPage 同款：数组 / 字符串 /
+// getSetCookie() 三态），与之前各跳的 cookie 按名合并（后者覆盖）。
+function collectCookie(r, prev) {
+  let cookies = [];
+  if (r && r.headers) {
+    const sc = r.headers['set-cookie'] || r.headers['Set-Cookie'];
+    if (Array.isArray(sc)) cookies = sc;
+    else if (typeof sc === 'string' && sc) cookies = [sc];
+    else if (typeof r.headers.getSetCookie === 'function') {
+      try { cookies = r.headers.getSetCookie(); } catch (e) { /* 忽略 */ }
     }
-    const cookie = (cookies || []).map((c) => String(c).split(';')[0].trim()).filter(Boolean).join('; ');
-    return { html, cookie };
-  } catch (e) {
-    return { html: '', cookie: '' };
   }
+  const fresh = (cookies || []).map((c) => String(c).split(';')[0].trim()).filter(Boolean);
+  if (!fresh.length) return prev || '';
+  const map = new Map();
+  (prev ? String(prev).split('; ') : []).concat(fresh).forEach((kv) => {
+    const k = String(kv).split('=')[0];
+    if (k) map.set(k, kv);
+  });
+  return Array.from(map.values()).join('; ');
 }
 
-// 解析 kt_player 内联配置的档位菜单：
-//   video_url: '<360p 直链>'（+ video_url_text: '360p'）
-//   video_alt_url[N]: '<高档直链>'（+ video_alt_url[N]_text: '720p' 等）
-// 只收带 v-acctoken 的 pimpbunny.com/get_file/ 直链，按档位数字降序。
-// token 原样透传，不截不断（v-acctoken 解开是 ASCII 前缀 + 12 字节
-// 二进制尾，截掉尾部即废令牌）。
-function parseLadder(html) {
-  if (!html || html.indexOf('video_url:') < 0 || html.indexOf('get_file/') < 0) return [];
-  const texts = {};
-  const tre = /(video_url|video_alt_url\d*)_text\s*:\s*'([^']+)'/g;
-  let tm;
-  while ((tm = tre.exec(html)) !== null) texts[tm[1]] = tm[2];
-  const out = [];
-  const seen = new Set();
-  const ure = /(video_url|video_alt_url\d*)\s*:\s*'([^']+)'/g;
-  let um;
-  while ((um = ure.exec(html)) !== null) {
-    const furl = um[2];
-    if (!/^https:\/\/pimpbunny\.com\/get_file\/[^']*v-acctoken=[A-Za-z0-9%_-]+/.test(furl)) continue;
-    if (seen.has(furl)) continue;
-    seen.add(furl);
-    const label = texts[um[1]] || '';
-    const num = parseInt((label.match(/(\d+)/) || [])[1] || '0', 10) || 0;
-    out.push({ label: label || (num ? num + 'p' : '正片'), num, url: furl });
-  }
-  out.sort((a, b) => b.num - a.num);
-  return out;
-}
-
-// 直连取 .com 视频页现铸档位（手机端出口 + 当次会话 cookie，令牌
-// 与 cookie 同次渲染才配对）。失败返回空档位，调用方退回 jina。
-async function fetchLadderDirect(comVideo) {
-  const pg = await getComPage(comVideo, 6000);
-  const ladder = parseLadder(pg.html);
-  if (!ladder.length) return { ladder: [], cookie: '' };
-  return { ladder, cookie: pg.cookie };
-}
-
-// jina 取 .com 视频页（只取档位名/集名，令牌是 jina 缓存页铸的旧
-// 令牌——有效期数十秒，到点播时已过期，绝不直接交给播放器；
-// play() 会现铸，铸不到则走 parse:1 嗅探 .com 页）。
-async function fetchLadderJina(comVideo) {
-  try {
-    const r = await req.get('https://r.jina.ai/' + comVideo, {
-      headers: { 'User-Agent': UA, 'x-respond-with': 'html', 'Accept': 'text/html,*/*' },
-      timeout: 8000,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-    });
-    const data = r && r.data;
-    const html = typeof data === 'string' ? data : '';
-    return { ladder: parseLadder(html), cookie: '' };
-  } catch (e) {
-    return { ladder: [], cookie: '' };
-  }
-}
-
-function fileTail(url) {
-  try {
-    const u = new URL(String(url || ''));
-    const base = u.pathname.split('/').filter(Boolean).pop() || '';
-    return base;
-  } catch (e) { return ''; }
-}
-
-// 点播时重铸（yesporn 同款）：点播瞬间重取 .com 页，用点播时的出
-// 口 IP + 同会话 cookie 现铸同档新令牌。先按集名（档位，如 1080p）
-// 找，再按文件名找（详情时刻的直链文件名与重铸后相同：同视频同档
-// 文件路径不变，只换 token 尾部），再按档位数字找。找不到或取页
-// 失败返回 null，调用方回落详情时刻的令牌/嗅探线。单次 6 秒超时，
-// 不重试。
-async function remintLadder(comVideo, label, fileUrl) {
-  try {
-    const pg = await getComPage(comVideo, 6000);
-    const ladder = parseLadder(pg.html);
-    if (!ladder.length) return null;
-    const tail = fileTail(fileUrl);
-    const num = parseInt((String(label || '').match(/(\d+)/) || [])[1] || '0', 10) || 0;
-    const hit = (label && ladder.find((q) => q.label === label))
-      || (tail && ladder.find((q) => fileTail(q.url) === tail))
-      || (num && ladder.find((q) => q.num === num));
-    if (!hit) return null;
-    return { url: hit.url, cookie: pg.cookie, label: hit.label };
-  } catch (e) {
+async function resolveStream(stream, referer) {
+  let url = stream;
+  let cookie = '';
+  for (let hop = 0; hop < 3; hop++) {
+    let r;
+    try {
+      const headers = {
+        'User-Agent': UA,
+        'Referer': referer || SITE + '/',
+        'Accept': 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+        'Range': 'bytes=0-1023',
+        'Sec-Fetch-Dest': 'video',
+        'Sec-Fetch-Mode': 'no-cors',
+        'Sec-Fetch-Site': 'same-origin',
+      };
+      if (cookie) headers.Cookie = cookie;
+      r = await req.get(url, {
+        headers,
+        timeout: 4000,
+        maxRedirects: 0,
+        responseType: 'arraybuffer',
+        maxContentLength: 65536,
+        validateStatus: () => true,
+      });
+    } catch (e) {
+      // 站方无视 Range、直接下发整文件时 axios 因 maxContentLength
+      // 拒收：这本身证明该跳在出视频字节（不是 403/Shield），按
+      // 直出计——返回当前跳地址（可能是跟跳后的 get_file，也可能
+      // 就是 /stream 本身）。
+      if (/maxContentLength/i.test(String((e && e.message) || ''))) {
+        return { kind: 'direct', url, cookie };
+      }
+      return null;
+    }
+    if (!r) return null;
+    cookie = collectCookie(r, cookie);
+    const status = r.status || 0;
+    const loc = r.headers && (r.headers.location || r.headers.Location);
+    if (status >= 300 && status < 400 && loc) {
+      try {
+        url = new URL(String(loc), url).href;
+      } catch (e) { return null; }
+      if (!/^https?:\/\//i.test(url)) return null;
+      continue;
+    }
+    if (status >= 200 && status < 300) {
+      const ct = String((r.headers && (r.headers['content-type'] || r.headers['Content-Type'])) || '');
+      if (!/video\/|octet-stream/i.test(ct)) return null;
+      // 跟跳到了最终文件 → 交最终地址；没跳过、本身出字节 → 交 /stream。
+      return { kind: url !== stream ? 'final' : 'direct', url, cookie };
+    }
     return null;
   }
+  return null;
 }
 
-// /stream 是代理：站内播放时它应 302 到 .com get_file 真实文件。
-// 用 HEAD（不拉 body）+ maxRedirects:0 只读跳转目标；拿到最终地址
-// 就交给播放器直连（等价于 Safari 跳转后的那次请求，不再经过会
-// 丢头的跳转）。任何失败（挑战页/超时/非 3xx/无 Location）都返回
-// ''，由 play() 退回 parse:1 嗅探线。本地已验：axios 1.6.7
-// maxRedirects:0 + validateStatus 恒真时 302 响应可正常返回，
-// headers.location 完整。
-async function resolveFinal(stream, referer) {
-  try {
-    const r = await req.head(stream, {
-      headers: { 'User-Agent': UA, 'Referer': referer || SITE + '/' },
-      timeout: 6000,
-      maxRedirects: 0,
-      validateStatus: () => true,
-    });
-    const loc = r && r.headers && (r.headers.location || r.headers.Location);
-    if (r && r.status >= 300 && r.status < 400 && loc) {
-      const u = new URL(String(loc), stream).href;
-      if (/^https?:\/\//i.test(u)) return u;
-    }
-  } catch (e) { /* 解析失败即退回嗅探线 */ }
-  return '';
-}
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (!id) return { parse: 0, url: '' };
   const dollar = id.indexOf('$');
-  const label = dollar >= 0 ? id.slice(0, dollar).trim() : '';
   if (dollar >= 0) id = id.slice(dollar + 1).trim();
   // 集串形态：
-  //   档位（v4）：pbplay:<详情页>|<.com 视频页>|<某档 get_file 直链>|<cookie>
-  //   档位（v3 遗留）：pbplay:<详情页>|<.com 视频页>|<某档 get_file 直链>
-  //     （无 cookie 段，按 jina 令牌处理：重铸，铸不到走嗅探）
-  //   单"正片"（v2）：pbplay:<详情页>|</stream> 或
-  //     pbplay:<详情页>|</stream>|<.com 视频页>
+  //   v6 新集串：pbplay:<.net 详情页>|</stream>
+  //   v2 旧集串：pbplay:<.net 详情页>|</stream>|<.com 视频页>
+  //     （第三段是死掉的 .com 地址，直接忽略）
+  //   v3/v4/v5 旧档位集串：pbplay:<.net 详情页>|<.com 视频页>|
+  //     <某档 get_file 直链>|<cookie>（无 /stream，无法解析，
+  //     只能嗅探详情页；用户每次重导前删旧包，此形态基本不出现）
   if (id.indexOf('pbplay:') === 0) {
     const rest = id.slice('pbplay:'.length);
     const parts = rest.split('|');
-    // v4/v3 档位集串：parts[2] 是 get_file 直链。
-    if (parts.length >= 3 && /^https:\/\/pimpbunny\.com\/get_file\//.test(parts[2])) {
-      const detailUrl = parts[0] || '';
-      const comVideo = parts[1] || '';
-      const fileUrl = parts[2];
-      const cookie = parts[3] || '';
-      // 腿 1：点播时重铸（yesporn 同款）——重取 .com 页按集名现铸
-      // 同档新令牌 + 新 cookie，6 秒超时。
-      if (comVideo) {
-        const fresh = await remintLadder(comVideo, label, fileUrl);
-        if (fresh) {
-          const header = { 'User-Agent': UA, 'Referer': comVideo };
-          if (fresh.cookie) header.Cookie = fresh.cookie;
-          return { parse: 0, url: fresh.url, header };
-        }
+    const detailUrl = parts[0] || '';
+    const stream = (parts[1] && /\/stream\//i.test(parts[1])) ? parts[1] : '';
+    if (stream) {
+      // 腿 1（v6 主路）：蜘蛛侧 GET /stream 跟跳转取终点。302 到
+      // get_file → 交最终地址 + 当次 cookie；无跳转且回视频字节
+      // → 交 /stream 本身。两路都不再碰 .com、不铸令牌。
+      const hit = await resolveStream(stream, detailUrl);
+      if (hit) {
+        const header = { 'User-Agent': UA, 'Referer': detailUrl || SITE + '/' };
+        if (hit.cookie) header.Cookie = hit.cookie;
+        return { parse: 0, url: hit.url, header };
       }
-      // 腿 2：重铸失败，回落详情时刻铸好的令牌 + cookie（仅当集串
-      // 带 cookie，即直连现铸；jina 集串无 cookie，不走这条）。
-      if (fileUrl && cookie) {
-        return {
-          parse: 0,
-          url: fileUrl,
-          header: { 'User-Agent': UA, 'Referer': comVideo || COM + '/', 'Cookie': cookie },
-        };
-      }
-      // 腿 3：无可用令牌（jina 旧令牌已过期，不直接交）→ 把 .com
-      // 视频页交给播放器嗅探，由 App 内浏览器环境复现 Safari 站内
-      // 播放（manko Upload18 同款 parse:1 做法；不解 PoW、不伪造
-      // 凭证）。v2 嗅 .net 详情页已真机证死，不再嗅 .net。
-      if (comVideo) {
-        return {
-          parse: 1,
-          url: comVideo,
-          header: { 'User-Agent': UA, 'Referer': SITE + '/' },
-        };
-      }
+      // 腿 2：蜘蛛侧解析失败（403/Shield/超时）→ 嗅探 .net 详情
+      // 页，由 App 内浏览器复现 Safari 站内播放。v2 嗅 .net 曾
+      // 在 HEAD 之后失败，但当时从未试过 GET 解析 + 嗅探的组合，
+      // 且嗅探是最后的兜底、不是主路；.com 嗅探已死，不再回 .com。
       if (detailUrl) {
         return {
           parse: 1,
@@ -752,30 +691,7 @@ async function play(reqIn) {
       }
       return { parse: 0, url: '' };
     }
-    const detailUrl = parts[0] || '';
-    const stream = parts[1] || '';
-    const comVideo = parts[2] || '';
-    // v2 单"正片"：腿 1 解析出最终文件地址，直接交给播放器
-    // （Safari UA + Referer=详情页，与 Safari 跳转后的请求等价）。
-    if (stream) {
-      const final = await resolveFinal(stream, detailUrl);
-      if (final) {
-        return {
-          parse: 0,
-          url: final,
-          header: { 'User-Agent': UA, 'Referer': detailUrl },
-        };
-      }
-    }
-    // 腿 2：解析不到（挑战页/超时）→ 嗅探 .com 视频页（v4 改：不
-    // 再嗅 .net 详情页），无 .com 地址才嗅 .net 详情页。
-    if (comVideo) {
-      return {
-        parse: 1,
-        url: comVideo,
-        header: { 'User-Agent': UA, 'Referer': SITE + '/' },
-      };
-    }
+    // 无 /stream 的旧档位集串：只能嗅探详情页。
     if (detailUrl) {
       return {
         parse: 1,
@@ -785,7 +701,7 @@ async function play(reqIn) {
     }
     return { parse: 0, url: '' };
   }
-  // 裸 get_file 直链（v3 档位 URL 被直接点播时）→ 直接交播放器。
+  // 裸 get_file 直链（旧档位 URL 被直接点播时）→ 直接交播放器。
   if (/^https:\/\/pimpbunny\.com\/get_file\//i.test(id)) {
     return {
       parse: 0,
@@ -793,8 +709,15 @@ async function play(reqIn) {
       header: { 'User-Agent': UA, 'Referer': COM + '/' },
     };
   }
-  // 旧缓存集串：裸 /stream 直链 → 老行为原样直出。
+  // 裸 /stream 直链 → 同样走蜘蛛侧解析；解析失败则原样直出（不比
+  // 旧行为更差，播放器自己再试一次 Safari 路径）。
   if (/^https?:\/\//i.test(id) && /\/stream\//i.test(id)) {
+    const hit = await resolveStream(id, SITE + '/');
+    if (hit) {
+      const header = { 'User-Agent': UA, 'Referer': SITE + '/' };
+      if (hit.cookie) header.Cookie = hit.cookie;
+      return { parse: 0, url: hit.url, header };
+    }
     return {
       parse: 0,
       url: id,
@@ -811,6 +734,7 @@ async function play(reqIn) {
   }
   return { parse: 0, url: '' };
 }
+
 
 async function search(reqIn) {
   const body = reqIn?.body || {};
