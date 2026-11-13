@@ -34,6 +34,27 @@
 //    详情走 /j/detail 取名/图/简介（失败回落 /f/ 原样取页）；
 //    播放链（dex、/api/play/、embed）与字幕芯一字未动。
 //    Worker 未部署 v2 或上游被拦时列表回空、不出假条目。
+//  - v5（2026-11-13）：v4 的两条 Worker 主腿在手机上全死——实测坐实是“谁去取页”：
+//    已部署 Worker v2 的 /j/list、/f/ 在 CF 边缘撞挑战（502 challenge / 403 Just a moment），
+//    且结果按调用方网络路径决定（curl 18/18 通、node 0/14 被拦、UA 无关）；
+//    站方为 WordPress + CF APO，/wp-json 需登录、/feed 回首页、/sitemap 被拦、
+//    /api/play/ GET 回 405（API 墙与 HTML 墙不同，可通）。
+//    破局点：jina（自有出口）回完整 HTML——列表含 data-lazy-src 封面，
+//    详情含 data-ts-live/data-ts-id（与上游逐字一致），embed 页含 data-config；
+//    且实测坐实视频直链绑 embed 取页方 IP（jina 取与 Worker 取的 data-config
+//    解出不同 ip/token），故 embed 必须由 Worker 上游直取、直链必须由 Worker 代理。
+//    视频宿主不止 streamtape：DASS-027 实测四条 embed 分别是 pianopic HLS、
+//    streamhls HLS、cloudatacdn 1080p mp4，且三者皆 IP 绑定（换 Referer 仍 403）。
+//    新架构：Worker v3（javxxx-fetch-worker-v3.js，用户部署）：
+//      /j/list、/j/detail：上游直取 → jina HTML（Markdown 第二回落）；
+//      /resolve：Worker 内全链解析（详情→token→/api/play/→embed 上游→直链），
+//        HLS（.m3u8/type=hls）回本站 /h 改写代理地址，单文件回本站 /v 代理地址
+//        （仅白名单宿主：streamtape、pianopic、streamhls、cloudatacdn；白名单外回裸地址）；
+//      /v：单文件字节代理（Range 透传）；/h：HLS 播放列表改写代理（变体回 /h，
+//        分片/密钥回 /s）；/s：分片/密钥字节代理；/diag：全链诊断。
+//    蜘蛛 v5 改动仅三处：getJson 超时 20s→30s（Worker 内含上游+jina 两段）；
+//    新增 getResolve（Worker /resolve 优先）；play() 先试 /resolve、失败回落 v4 本地链。
+//    其余（分类/详情/搜索、dex、字幕芯）一字未动；Worker 未部署 v3 时自动走本地链。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -225,7 +246,7 @@ function viaJsonDetail(url) { return FETCH_WORKER + '/j/detail/' + b64url(url); 
 
 async function getJson(url) {
   try {
-    var r = await withTimeout(req.get(url, { headers: headers(), timeout: 20000 }), 20000, null);
+    var r = await withTimeout(req.get(url, { headers: headers(), timeout: 30000 }), 30000, null);
     if (!r || r.status !== 200) return null;
     var data = r.data;
     var obj = null;
@@ -264,6 +285,24 @@ async function getJsonDetail(url) {
   var obj = await getJson(viaJsonDetail(url));
   if (!obj) return null;
   return { name: String(obj.name || ''), pic: String(obj.pic || ''), desc: String(obj.desc || ''), live: String(obj.live || ''), tid: String(obj.tid || '') };
+}
+
+// Worker v3 /resolve：服务端全链解析，回 {ok:true, url: Worker /v 代理地址} 或 null。
+// v3 未部署（404/非 JSON）或上游 embed 被拦时返回 null，调用方回落 v4 本地链。
+function viaResolve(detailUrl) { return FETCH_WORKER + '/resolve?u=' + encodeURIComponent(detailUrl); }
+async function getResolve(detailUrl) {
+  try {
+    var r = await withTimeout(req.get(viaResolve(detailUrl), { headers: headers(), timeout: 45000 }), 45000, null);
+    if (!r || r.status !== 200) return null;
+    var data = r.data;
+    var obj = null;
+    if (typeof data === 'string') {
+      try { obj = JSON.parse(data); } catch (e) { return null; }
+    } else if (data && typeof data === 'object') obj = data;
+    else return null;
+    if (!obj || obj.ok !== true || !obj.url) return null;
+    return { url: String(obj.url), expires: String(obj.expires || '') };
+  } catch (e) { return null; }
 }
 
 // 详情/播放/embed 用：只走 HTML 腿（Worker /f/ + 直连 + fetch）。
@@ -470,9 +509,14 @@ async function category(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var tid = String(body.tid || body.id || 'home');
   var page = Math.max(1, parseInt(body.page, 10) || 1);
+  // v5：首页无翻页——站内首页无 pagination 链接，/page/N/ 实测回第一页内容（两路验证：
+  //   Worker /f/ 与 jina 均回同一 28 条），翻页会无限重复。首页固定 28 条单页。
+  if (tid === 'home' && page > 1) {
+    return { page: page, pagecount: page, limit: 20, total: 28, list: [] };
+  }
   var url;
   if (tid === 'home') {
-    url = page > 1 ? HOST + '/page/' + page + '/' : HOST + '/';
+    url = HOST + '/';
   } else {
     var v = VPATH[tid] || '';
     // 第 1 页用站方规范 vXX 地址；翻页用站内实际生成的 /category/<slug>/page/N/（会 301 到 vXX 版）
@@ -481,7 +525,9 @@ async function category(reqIn) {
       : HOST + '/' + v + '/category/' + tid + '/';
   }
   var list = await getJsonList(url);
-  return { page: page, pagecount: list.length >= 20 ? page + 1 : page, limit: 20, total: 999, list: list };
+  var pc = list.length >= 20 ? page + 1 : page;
+  if (tid === 'home') pc = 1;
+  return { page: page, pagecount: pc, limit: 20, total: 999, list: list };
 }
 async function detail(reqIn) {
   var body = (reqIn && reqIn.body) || {};
@@ -530,6 +576,13 @@ async function play(reqIn) {
   if (/\.(m3u8|mp4)(\?|$)/i.test(id) || /streamtape\.(com|net)\/get_video/i.test(id)) {
     return subAttach({ parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
   }
+  // v5：先走 Worker v3 /resolve（服务端全链 + /v 字节代理）；失败回落 v4 本地链。
+  try {
+    var rv = await getResolve(id);
+    if (rv && rv.url) {
+      return subAttach({ parse: 0, url: rv.url, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
+    }
+  } catch (e) {}
   try {
     var r = await resolvePlay(id);
     if (r && r.url) {
