@@ -54,21 +54,31 @@
 //     10 分钟缓存, 见 JAVMOVE_WORKER), token 失效时先走 Worker 再直连。
 //     Worker 只做解析 (取页 + /watch), 不代理 mp4 字节 (直链本身通,
 //     1.8GB 走免费 Worker 既无必要也扛不住)。
-//   2026-11-13 第三轮真机反馈 (R3, 用户重导第二轮包仍转圈, VM 侧坐实):
-//   直链本身在 curl/Range 下通, 但源站 mp4 host (*.cfd) 对「无 Range」
-//   与「Range: bytes=A-」(无尾端) 只回前 3 MiB (206, Content-Range
-//   bytes 0-3145728, 干净 EOF), 而每部片 moov 都在 3.4-4.2MB (文件头);
-//   播放器 FFmpeg/ijkplayer 首请求即 Range: bytes=0-, 永远拿不全 moov,
-//   ffprobe/ffmpeg 直连复现 "error reading header / End of file" (0 重试)。
-//   只有带明确尾端的 Range (bytes=A-B, 单次上限 12 MiB+1) 才按数回传。
-//   故 v2 "回直链即播" 的前提不成立: 直链只对显式 Range 的播放器可用。
-//   修法 (v3, 最小改动): play() 解析链一个字不动, 只把最终直链包进
-//   Worker /stream (javmove-fetch v2): 显式 Range 原样透传, 无尾端/
-//   无 Range 回首个 12,582,913 字节 chunk 的 206 (FFmpeg 实测会续接
-//   下一段 Range, 60 秒解码已验); Worker 不缓存视频字节、只做流转。
-//   流量账与部署门见同目录 REPORT.md §六-§七: 必须先部署 Worker v2
-//   再推蜘蛛 v3 (v1 Worker 没有 /stream 路由); Worker 未部署时
-//   JAVMOVE_WORKER 为空即回直链 (旧行为, 手机侧仍转圈, 仅作退路)。
+//   2026-11-13 第四轮真机反馈 (R4, 用户重导第三轮包后: 起播一切正常、
+//   所有线路都能播, 但拖进度条就卡住不动; VM 侧坐实, 详见
+//   diag-1113-r4-javmove/REPORT.md):
+//   断点不在 Range 形态 (起播与 seek 的全部 Range 形态经 /stream 都回
+//   正确字节, ffmpeg -ss 900/3000 直连 Worker 也通), 而在播放器
+//   (FFmpeg/ijkplayer) 每个请求都带 `Connection: close`:
+//   Cloudflare 边缘对 HTTP/1.1 + `Connection: close` 的大响应会随机
+//   提前掐断 (VM 侧干净路径实测: 12.58MB 响应只回 7.14MB,
+//   1MB 响应只回 0.97MB, 直连源站同样截断; 不带该头则每次足额;
+//   带 `Connection: keep-alive` 则足额; 头里同时出现 close 即截断)。
+//   起播只读 moov (3.5MB) 时未必撞上线, 拖进度条后新请求随机
+//   死在几百 KB 处、凑不够续播数据, 画面即冻住; 连续播放同样会
+//   在约 33 秒处被掐断 (ffmpeg 4/4 次复现, 本地代理 150 秒全通)。
+//   修法 (v4, 最小改动, 解析链与 /stream 一个字不动): playFinish()
+//   的 header 加 `'Connection': 'keep-alive'` —— FFmpeg 收到自定义
+//   Connection 头会用它替代默认的 close (本地 hdrlog 实测: 只发
+//   keep-alive 一行, 不重复), 边缘即足额回传; ffmpeg 经线上 Worker
+//   v2 带此头连续解码 150 秒全通、-ss 900/3000 全通。
+//   注意: 此头是否生效取决于 App 是否把 play 结果的 header 原样
+//   交给播放器 (CatVod 惯例是原样交; 真机是最终验证)。
+//   Worker v3 (同目录 javmove-fetch-worker-v3.js, 用户部署, 不进仓库)
+//   为配套加固 (非本次断点所必需): 流取超时 20s→120s (慢网排空
+//   12MB chunk 会撞 20s 中断)、chunk 12.58MB→8MB、显式 Range 钳制
+//   到 chunk、响应补 keep-alive; 蜘蛛 v4 不依赖 Worker v3 (v2 即可),
+//   但 v3 部署后抗慢网更稳, 部署门见 REPORT.md §七。
 // 字幕: 接 sextb.js 定版字幕芯 (Layer A), 详情页地址为键登记片名、后台预热,
 //   play() 只挂缓存命中 (无命中不现搜, 播放优先)。
 import req from '../../util/req.js';
@@ -490,7 +500,13 @@ function playFinish(url, durl) {
   const res = {
     parse: 0,
     url: streamUrl(url),
-    header: { 'User-Agent': UA, 'Referer': HOST + '/' },
+    // R4: 必须带 Connection: keep-alive (见文件头 R4 注释)。
+    // FFmpeg/ijkplayer 默认每请求发 `Connection: close`, Cloudflare
+    // 边缘对 HTTP/1.1 + close 的大响应随机提前掐断 (起播约 33 秒处断,
+    // seek 新请求常死在几百 KB 处致拖进度条冻住); 自定义 Connection
+    // 头会替代 FFmpeg 的默认值 (只发 keep-alive 一行), 边缘即足额
+    // 回传, ffmpeg 经线上 Worker v2 带此头 150 秒连续解码已验全通。
+    header: { 'User-Agent': UA, 'Referer': HOST + '/', 'Connection': 'keep-alive' },
   };
   try {
     const hit = subResultCache.get(durl);

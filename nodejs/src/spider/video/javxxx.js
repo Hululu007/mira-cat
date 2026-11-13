@@ -69,6 +69,24 @@
 //       mp4 保持原样（直连腿赢时绑手机 IP，仍有机会播）。
 //    列表/详情/搜索/字幕芯一字未动。Worker 侧另有 v5（/s Range 剥头、fetchHtml
 //    重试、probeHls 走真实改写地址），见 javxxx-fetch-worker-v5.js，蜘蛛不依赖它。
+//  - v8（2026-11-13）：修第四轮真机反馈“点播转圈 7–8 秒后视频加载失败 + 详情只有‘播放’一档”。
+//    断点（见 diag-1113-r4-javxxx/REPORT.md，VM 实测坐实）：
+//    ① 串行烧时间：v7 的 play() 先跑 getResolve 3 次顺序重试（手机路径上每次约 2.5s 速败，
+//       三次 ≈ 7.5s——正好是用户看到的转圈时长），耗尽才走本地链；本地链纵有直连腿能活，
+//       也没时间再跑完，全程结束才回 parse:1。修法：/resolve 与本地链并行竞速
+//       （本地腿延迟 5s 起跑——/resolve 首发通常 3s 内命中，本地腿晚起可少烧上游、
+//       避免并行加倍触发上游限流），先赢者出线，总预算 25s。
+//    ② 本地链只认第一条 embed：旧 resolvePlay 拿 streamtape mp4 即回，不找 HLS；
+//       而 mp4 绑取 embed 方 IP、HLS 才是经 /h、/s 可播的路。修法：本地链扫全部 embed，
+//       优先 HLS（命中即回），无 HLS 才回 mp4；mp4 只有直连腿取的才绑手机 IP，
+//       故 mp4 兜底时再补一次纯直连并行重取，拿到就优先用。
+//    ③ 档位从不存在 detail() 里：detail 只回一条“播放$vid”，档位藏在 HLS master 的变体表里，
+//       App 的线路选择器看不见。修法：detail() 调 getMasterEntry 取变体表（/resolve 单次 +
+//       本地链兜底，详情页只等 12s，失败回单条），有几档出几行“1080p$vid|q=1080”
+//       （yesporn/javmove 同款‘|’后缀集名）；play() 按 q 选变体，选不到回 master；
+//       master 与变体表缓存 10 分钟供 play() 复用（token 约 12h 有效）。
+//    其余（列表/搜索/dex/字幕芯）一字未动；不依赖任何未部署的 Worker（v5 即够；
+//    另有可选 v6 见 javxxx-fetch-worker-v6.js——只给 embed 取页加重试，蜘蛛不依赖它）。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -421,7 +439,7 @@ function parseResolveObj(data) {
   } else if (data && typeof data === 'object') obj = data;
   else return null;
   if (!obj || obj.ok !== true || !obj.url) return null;
-  return { url: String(obj.url), expires: String(obj.expires || '') };
+  return { url: String(obj.url), kind: String(obj.kind || ''), expires: String(obj.expires || '') };
 }
 async function getResolveOnce(detailUrl) {
   var target = viaResolve(detailUrl);
@@ -472,6 +490,128 @@ function wrapHlsViaWorker(rawUrl) {
   try { host = new URL(u).hostname.toLowerCase(); } catch (e) { return u; }
   if (host !== 'pianopic.com' && host !== 'streamhls.click' && host !== 'cloudatacdn.com' && !host.endsWith('.cloudatacdn.com')) return u;
   return FETCH_WORKER + '/h?u=' + b64url(u);
+}
+
+
+// ---------- v8：master 变体表（档位） ----------
+// master 缓存：detail() 解析出的变体表供 play() 复用（token 约 12h 有效，缓存 10 分钟）。
+const MASTER_TTL = 10 * 60 * 1000;
+const masterCache = new Map();
+function masterCacheGet(vid) {
+  var e = masterCache.get(vid);
+  if (!e) return null;
+  if (Date.now() - e.ts > MASTER_TTL) { masterCache.delete(vid); return null; }
+  return e;
+}
+function masterCacheSet(vid, entry) {
+  if (!vid || !entry) return;
+  entry.ts = Date.now();
+  masterCache.set(vid, entry);
+  if (masterCache.size > 50) masterCache.delete(masterCache.keys().next().value);
+}
+
+// 解析 master 文本里的变体表：[{h:1080, bw, url}]（按 h 从高到低去重）。
+// 变体地址：/h 改写地址原样保留；裸 master 里的相对地址按 base 解析、再过 wrapHlsViaWorker。
+function parseHlsVariants(text, base) {
+  var out = [];
+  var seen = new Set();
+  var s = String(text || '');
+  if (!/#EXTM3U/.test(s)) return out;
+  var re = /#EXT-X-STREAM-INF:([^\n]*)\n([^\n]+)/g;
+  var m;
+  while ((m = re.exec(s))) {
+    var inf = m[1] || '';
+    var url = String(m[2] || '').trim();
+    if (!url || url.charAt(0) === '#') continue;
+    var rm = inf.match(/RESOLUTION=\d+x(\d+)/i);
+    var h = rm ? parseInt(rm[1], 10) : 0;
+    if (!h) continue;
+    if (seen.has(h)) continue;
+    seen.add(h);
+    var bm = inf.match(/BANDWIDTH=(\d+)/i);
+    var bw = bm ? parseInt(bm[1], 10) : 0;
+    if (!/^https?:\/\//i.test(url) && base && !/\/h\?u=/.test(base)) {
+      try { url = new URL(url, base).href; } catch (e) {}
+    }
+    out.push({ h: h, bw: bw, url: wrapHlsViaWorker(url) });
+  }
+  out.sort(function (a, b) { return (b.h - a.h) || (b.bw - a.bw); });
+  return out;
+}
+
+// 取 master 文本（/h 地址或裸 m3u8）：10s 封顶；非 #EXTM3U 回 ''。
+async function fetchMasterText(masterUrl) {
+  try {
+    var r = await withTimeout(req.get(masterUrl, { headers: { 'User-Agent': UA, 'Referer': HOST + '/', 'Accept': 'application/vnd.apple.mpegurl,application/x-mpegURL,*/*' }, timeout: 10000 }), 10000, null);
+    if (!r || r.status !== 200) return '';
+    var t = (r && r.data != null) ? String(r.data) : '';
+    if (!/#EXTM3U/.test(t)) return '';
+    return t;
+  } catch (e) { return ''; }
+}
+
+// 从缓存条目里按 q 选变体地址：精确命中；否则不高于 q 的最高档；否则最低档；无 q 回 master。
+function pickVariantFromEntry(entry, q) {
+  if (!entry || !entry.masterHUrl) return '';
+  var vs = entry.variants || [];
+  if (!q || !vs.length) return entry.masterHUrl;
+  var exact = null, below = null, lowest = vs[vs.length - 1];
+  for (var i = 0; i < vs.length; i++) {
+    if (vs[i].h === q) { exact = vs[i]; break; }
+    if (vs[i].h < q && !below) below = vs[i];
+  }
+  var pick = exact || below || lowest;
+  return (pick && pick.url) || entry.masterHUrl;
+}
+
+// 取 master 文本、解析变体、按 q 选档并缓存；选档失败回 master 地址本身。
+async function pickVariantUrl(vid, masterHUrl, q) {
+  if (!q) return masterHUrl;
+  var cached = masterCacheGet(vid);
+  if (cached && cached.masterHUrl === masterHUrl && cached.variants && cached.variants.length) {
+    return pickVariantFromEntry(cached, q);
+  }
+  var txt = await fetchMasterText(masterHUrl);
+  var vs = parseHlsVariants(txt, masterHUrl);
+  if (vs.length) {
+    var entry = { masterHUrl: masterHUrl, variants: vs };
+    masterCacheSet(vid, entry);
+    return pickVariantFromEntry(entry, q);
+  }
+  return masterHUrl;
+}
+
+// detail() 用：取某片的 master 与变体表。先 /resolve 单次（不重试，详情页不等），
+// 再本地链 HLS 扫描；调用方用 withTimeout 封顶（12s），失败回 null（回单条“播放”）。
+async function getMasterEntry(vid) {
+  var cached = masterCacheGet(vid);
+  if (cached) return cached;
+  try {
+    var rv = await getResolveOnce(vid);
+    // 注意：/resolve 回的已是 Worker /h 地址（b64 编码，字面不含 .m3u8），不能只用 /\.m3u8/ 判断 HLS；
+    // v8 首版这里漏了 /h?u=，导致详情永远回单条“播放”（R4 harness 实测坐实）。
+    if (rv && rv.url && (/\.m3u8(\?|#|$)/i.test(rv.url) || /\/h\?u=/.test(rv.url))) {
+      var masterH = wrapHlsViaWorker(rv.url);
+      var txt = await fetchMasterText(masterH);
+      var vs = parseHlsVariants(txt, masterH);
+      var entry = { masterHUrl: masterH, variants: vs };
+      masterCacheSet(vid, entry);
+      return entry;
+    }
+    if (rv && rv.url) return null; // /resolve 回了 mp4：无档位
+  } catch (e) {}
+  try {
+    var r = await resolvePlayLocal(vid);
+    if (r && r.kind === 'hls' && r.url) {
+      var masterH2 = wrapHlsViaWorker(r.url);
+      var txt2 = await fetchMasterText(masterH2);
+      var vs2 = parseHlsVariants(txt2, masterH2);
+      var entry2 = { masterHUrl: masterH2, variants: vs2 };
+      masterCacheSet(vid, entry2);
+      return entry2;
+    }
+  } catch (e) {}
+  return null;
 }
 
 // 详情/播放/embed 用：只走 HTML 腿（Worker /f/ + 直连 + fetch）。
@@ -604,47 +744,104 @@ function embedPathQuery(embedUrl) {
   } catch (e) { return ''; }
 }
 
-// 解一个 embed 页，返回 streamtape mp4 地址（失败返回 ''）
-async function resolveEmbed(embedUrl, referer) {
+// 从 embed 页 HTML 解出视频文件：返回 {file, type}（type 取 config sources 的 type，
+// 'hls' | 'mp4' | ''）；失败回 null。v8：从旧 resolveEmbed 抽出纯解码，供两路复用。
+function decodeEmbedInfo(html, embedUrl) {
   try {
-    var full = absUrl(embedUrl);
-    var html = await getHtmlOnly(full, referer);
-    if (!html) return '';
-    var cm = html.match(/data-config="([^"]+)"/);
-    if (!cm) return '';
-    var pq = embedPathQuery(full);
-    if (!pq) return '';
+    var cm = String(html || '').match(/data-config="([^"]+)"/);
+    if (!cm) return null;
+    var pq = embedPathQuery(embedUrl);
+    if (!pq) return null;
     var seed = b64enc(pq).slice(6, 22);
     var cfgJson = dex(seed, cm[1], '_0x59a0e4');
-    if (!cfgJson) return '';
+    if (!cfgJson) return null;
     var cfg;
-    try { cfg = JSON.parse(cfgJson); } catch (e) { return ''; }
-    if (!cfg || !cfg.src) return '';
+    try { cfg = JSON.parse(cfgJson); } catch (e) { return null; }
+    if (!cfg || !cfg.src) return null;
     var srcJson = b64decBytes(cfg.src).toString('latin1');
     var sources;
-    try { sources = JSON.parse(srcJson); } catch (e) { return ''; }
-    if (!Array.isArray(sources)) return '';
+    try { sources = JSON.parse(srcJson); } catch (e) { return null; }
+    if (!Array.isArray(sources)) return null;
     for (var i = 0; i < sources.length; i++) {
       var f = sources[i] && (sources[i].file || sources[i].src || '');
       // 注意：streamtape 直链是 get_video?id=...&stream=1，URL 里没有 .mp4 后缀，
       // 不能用 /\.mp4/ 过滤；config 的 sources 只含真实视频文件，直接认 http(s) 地址即可。
-      if (f && /^https?:\/\//i.test(f)) return f;
+      if (f && /^https?:\/\//i.test(f)) return { file: f, type: String(sources[i].type || '') };
     }
-    return '';
-  } catch (e) { return ''; }
+    return null;
+  } catch (e) { return null; }
 }
 
-// 详情页 → 最终播放地址（现取现播；主 embed 不行则按 reserve 顺序重试）
-async function resolvePlay(detailUrl) {
-  var html = await getHtmlOnly(detailUrl);
-  if (!html) return '';
-  var live = (html.match(/data-ts-live="([^"]+)"/) || [])[1] || '';
-  var tid = (html.match(/data-ts-id="([^"]+)"/) || [])[1] || '';
-  if (!live || !tid) return '';
+// 纯直连取页（不走 Worker /f/）：8s 封顶。mp4 兜底专用——直连腿取到的 mp4 才绑手机 IP。
+async function getHtmlDirectOnly(url, referer) {
+  var hdrs = headers(referer);
+  var jobs = [];
+  jobs.push((async function () {
+    try {
+      var r = await withTimeout(req.get(url, { headers: hdrs, timeout: 8000 }), 8000, null);
+      if (!r || r.status !== 200) return null;
+      var b = (r && r.data != null) ? String(r.data) : '';
+      if (!b || isChallengePage(b)) return null;
+      return b;
+    } catch (e) { return null; }
+  })());
+  if (typeof fetch === 'function') {
+    jobs.push((async function () {
+      try {
+        var ctrl = null;
+        try { if (typeof AbortController === 'function') ctrl = new AbortController(); } catch (e) {}
+        var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, 8000);
+        try {
+          var r2 = await fetch(url, { headers: hdrs, signal: ctrl ? ctrl.signal : undefined });
+          if (!r2 || r2.status !== 200) return null;
+          var b2 = await withTimeout(r2.text(), 8000, '');
+          if (!b2 || isChallengePage(b2)) return null;
+          return b2;
+        } finally { clearTimeout(timer); }
+      } catch (e) { return null; }
+    })());
+  }
+  var won = await firstSuccess(jobs, 8000);
+  return won || '';
+}
+
+// 解一个 embed 页，返回 {file, type}（失败回 null）。
+// directOnly=true 时只走直连腿（mp4 兜底用）；否则走 getHtmlOnly（Worker /f/ + 直连 + fetch 竞速）。
+async function resolveEmbedInfo(embedUrl, referer, directOnly) {
+  try {
+    var full = absUrl(embedUrl);
+    var html = directOnly ? await getHtmlDirectOnly(full, referer) : await getHtmlOnly(full, referer);
+    if (!html) return null;
+    return decodeEmbedInfo(html, full);
+  } catch (e) { return null; }
+}
+
+// ---------- v8：token 缓存（detail → play 直通） ----------
+// detail() 已取过 data-ts-live/data-ts-id（/j/detail 直接回，HTML 回落里也有），
+// play() 的本地链复用它可省一次详情取页（坏 colo 下一次取页 6~10s，是本地链最大的单项耗时）。
+// token 有效期按小时计，缓存 10 分钟；缓存 token 失效时（api 无数据）删缓存、重取详情再试一次。
+const TOKEN_TTL = 10 * 60 * 1000;
+const tokenCache = new Map();
+function tokenCacheGet(vid) {
+  var e = tokenCache.get(vid);
+  if (!e) return null;
+  if (Date.now() - e.ts > TOKEN_TTL) { tokenCache.delete(vid); return null; }
+  return e;
+}
+function tokenCacheSet(vid, live, tid) {
+  if (!vid || !live || !tid) return;
+  tokenCache.set(vid, { live: live, tid: tid, ts: Date.now() });
+  if (tokenCache.size > 50) tokenCache.delete(tokenCache.keys().next().value);
+}
+
+// 详情页 → embed 列表（主 + reserve，dex 解出）：与旧 resolvePlay 前半段同款，抽出供本地链复用。
+// 用给定的 live/tid 调 /api/play/ 并解 embed 列表。
+// 回 embeds 数组（可能为空）；回 null 表示 token/接口失败（调用方决定是否重取）。
+async function decodeEmbedsWithToken(detailUrl, live, tid) {
   var token = dex(tid, live, '_0x48107a');
-  if (!token) return '';
+  if (!token) return null;
   var resp = await postForm(HOST + '/api/play/', { sources: token, ep: '1', ver: '2' }, detailUrl);
-  if (!resp || resp.status !== true || !resp.data) return '';
+  if (!resp || resp.status !== true || !resp.data) return null;
   var embeds = [];
   var main = dex(tid, resp.data, 'undefined');
   if (main) embeds.push(main);
@@ -661,11 +858,78 @@ async function resolvePlay(detailUrl) {
       }
     }
   } catch (e) {}
-  for (var j = 0; j < embeds.length; j++) {
-    var file = await resolveEmbed(embeds[j], detailUrl);
-    if (file) return { url: file, referer: absUrl(embeds[j]) };
+  return embeds;
+}
+
+// 详情页 → embed 列表（主 + reserve，dex 解出）：先用 detail() 缓存的 token（省一次取页），
+// 缓存 token 失效时删缓存、重取详情页再试一次；新 token 也进缓存供下次复用。
+async function decodeEmbeds(detailUrl) {
+  var cached = tokenCacheGet(detailUrl);
+  if (cached) {
+    var e1 = await decodeEmbedsWithToken(detailUrl, cached.live, cached.tid);
+    if (e1 && e1.length) return e1;
+    tokenCache.delete(detailUrl);
   }
-  return '';
+  var html = await getHtmlOnly(detailUrl);
+  if (!html) return [];
+  var live = (html.match(/data-ts-live="([^"]+)"/) || [])[1] || '';
+  var tid = (html.match(/data-ts-id="([^"]+)"/) || [])[1] || '';
+  if (!live || !tid) return [];
+  tokenCacheSet(detailUrl, live, tid);
+  var e2 = await decodeEmbedsWithToken(detailUrl, live, tid);
+  return e2 || [];
+}
+
+// 并行 embed 扫描（v8）：全部 embed 一次并行 resolveEmbedInfo，首个 HLS 赢；
+// 无 HLS 时返回首个 mp4（呼叫方再决定是否用纯直连重取）；15s 封顶。
+async function scanEmbedsHlsFirst(embeds, detailUrl, directOnly) {
+  return new Promise(function (resolve) {
+    var total = embeds.length;
+    if (!total) return resolve(null);
+    var done = 0, mp4First = null, settled = false;
+    var timer = setTimeout(function () {
+      if (!settled) { settled = true; resolve(mp4First); }
+    }, 15000);
+    function onSettled(info) {
+      if (settled) return;
+      done++;
+      if (info && info.kind === 'hls') {
+        settled = true; clearTimeout(timer); resolve(info);
+      } else if (info && info.kind === 'mp4' && !mp4First) {
+        mp4First = info;
+      }
+      if (done >= total) { settled = true; clearTimeout(timer); resolve(mp4First); }
+    }
+    embeds.forEach(function (e) {
+      resolveEmbedInfo(e, detailUrl, directOnly).then(function (info) {
+        onSettled(info);
+      }).catch(function () { onSettled(null); });
+    });
+  });
+}
+
+// 本地链（v8）：详情页 → 最终播放地址（现取现播）。
+// 并行扫全部 embed，HLS 优先命中即回；无 HLS 才回 mp4；mp4 优先用纯直连腿重取的那条
+// （直连取到的 mp4 绑手机 IP，播放器直取才能播；Worker 腿取到的绑 Worker 出口 IP，手机上 403）。
+// 返回 {url, kind:'hls'|'mp4', referer} 或 ''。
+async function resolvePlayLocal(detailUrl) {
+  var embeds = await decodeEmbeds(detailUrl);
+  if (!embeds.length) return '';
+  var found = await scanEmbedsHlsFirst(embeds, detailUrl, false);
+  if (found && found.kind === 'hls') return found;
+  // 无 HLS：纯直连并行重取一遍 embed（只找 mp4），先拿到的赢，8s 封顶。
+  var dJobs = embeds.map(function (e) {
+    return (async function () {
+      var inf = await resolveEmbedInfo(e, detailUrl, true);
+      if (inf && inf.file && inf.type !== 'hls' && !/\.m3u8(\?|#|$)/i.test(inf.file)) {
+        return { url: inf.file, kind: 'mp4', referer: absUrl(e) };
+      }
+      return null;
+    })();
+  });
+  var directMp4 = await firstSuccess(dJobs, 8000);
+  if (directMp4) return directMp4;
+  return (found && found.kind === 'mp4') ? found : '';
 }
 
 async function init(reqIn) { return {}; }
@@ -701,14 +965,21 @@ async function detail(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var vid = String(body.id || '').trim();
   if (!vid) return { list: [] };
+  // v8：变体发现与详情 JSON 并行起跑（两路独立），省串行等待；12s 封顶在后面等它。
+  var entryP = getMasterEntry(vid);
+  var entryDeadline = Date.now() + 12000; // 12s 从起跑算起，不因详情 JSON 慢而顺延
   var jd = await getJsonDetail(vid);
   var name = '';
   var pic = '';
   var desc = '';
+  var live = '';
+  var tid = '';
   if (jd) {
     name = jd.name;
     pic = jd.pic;
     desc = jd.desc;
+    live = jd.live || '';
+    tid = jd.tid || '';
   } else {
     var html = await getHtmlOnly(vid);
     var tm = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i)
@@ -718,11 +989,22 @@ async function detail(reqIn) {
     if (pm) pic = pm[1];
     var dm = html.match(/<meta[^>]+property="og:description"[^>]+content="([^"]+)"/i);
     if (dm) desc = cleanText(dm[1]);
+    live = (html.match(/data-ts-live="([^"]+)"/) || [])[1] || '';
+    tid = (html.match(/data-ts-id="([^"]+)"/) || [])[1] || '';
   }
+  if (live && tid) tokenCacheSet(vid, live, tid);
   // 只存详情页地址；play() 里现取现播（token 约 19.5 小时过期且绑 IP，不能提前解好）
   // 字幕：token-key 登记——detail 只存详情页地址 vid，play 按 vid 查名（javsaga 同款 subRegister/subAttach 模式）；
   // 直链分支（id 已是 streamtape/m3u8 地址）查不到缓存是正常的，与 javtiful 一致。
   if (name) { subCacheName(vid, name); subWarm(vid); }
+  // v8：档位行。有几档出几行（master 变体表实测值，不编造）；取不到变体回单条“播放”。
+  var playUrl = '播放$' + vid;
+  try {
+    var entry = await withTimeout(entryP, Math.max(1000, entryDeadline - Date.now()), null);
+    if (entry && entry.variants && entry.variants.length) {
+      playUrl = entry.variants.map(function (v) { return v.h + 'p$' + vid + '|q=' + v.h; }).join('#');
+    }
+  } catch (e) {}
   return {
     list: [{
       vod_id: vid,
@@ -730,7 +1012,7 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: desc,
       vod_play_from: NAME,
-      vod_play_url: '播放$' + vid,
+      vod_play_url: playUrl,
     }],
   };
 }
@@ -738,31 +1020,65 @@ async function play(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var id = String(body.id || '').trim();
   if (id.indexOf('$') !== -1) id = id.split('$').pop().trim();
-  // 字幕：按 vid（detail 地址）早启动搜索，与 resolvePlay 并行跑；直链分支查不到缓存时 subs 为空，不挂 subs 键
+  // v8：剥 |q=<height> 档位后缀（detail 的档位行带上来的）；剥完才是干净 vid
+  var q = 0;
+  var mQ = id.match(/\|q=(\d{3,4})$/);
+  if (mQ) { q = parseInt(mQ[1], 10); id = id.slice(0, mQ.index); }
+  // 字幕：按 vid（detail 地址）早启动搜索，与解析并行跑；直链分支查不到缓存时 subs 为空，不挂 subs 键
   var subsP = subSearchAll(subNormKey(id)).catch(() => []);
   // 已是直链（m3u8/mp4，或 streamtape 的 get_video 直链，URL 里无 .mp4 后缀）则直接播；
-  // v7：裸 .m3u8（pianopic/streamhls）包一层 Worker /h 再播，分片走 /s 剥 PNG 头。
+  // v8：裸 .m3u8（pianopic/streamhls）包一层 Worker /h 再播，分片走 /s 剥 PNG 头；有 q 按变体选档。
   if (/\.(m3u8|mp4)(\?|$)/i.test(id) || /streamtape\.(com|net)\/get_video/i.test(id)) {
-    var directUrl = /\.m3u8(\?|#|$)/i.test(id) ? wrapHlsViaWorker(id) : id;
+    var directUrl = id;
+    if (/\.m3u8(\?|#|$)/i.test(id)) {
+      var wrapped = wrapHlsViaWorker(id);
+      directUrl = q > 0 ? await pickVariantUrl(id, wrapped, q) : wrapped;
+    }
     return subAttach({ parse: 0, url: directUrl, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
   }
-  // v5：先走 Worker v3 /resolve（服务端全链 + /v 字节代理）；失败回落 v4 本地链。
-  // v7：/resolve 改 3 次重试（req/fetch 双腿竞速）；本地链拿到的 HLS 裸地址包 /h 再播。
-  try {
-    var rv = await getResolve(id);
-    if (rv && rv.url) {
-      return subAttach({ parse: 0, url: rv.url, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
+  // v8：缓存命中（detail 已解析过变体）直接出档，不再现算
+  var cached = masterCacheGet(id);
+  if (cached && cached.masterHUrl) {
+    var curl2 = pickVariantFromEntry(cached, q);
+    if (curl2) {
+      return subAttach({ parse: 0, url: curl2, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
     }
-  } catch (e) {}
-  try {
-    var r = await resolvePlay(id);
-    if (r && r.url) {
-      var fbUrl = /\.m3u8(\?|#|$)/i.test(r.url) ? wrapHlsViaWorker(r.url) : r.url;
-      return subAttach({ parse: 0, url: fbUrl, header: { 'User-Agent': UA, 'Referer': r.referer || (HOST + '/') } }, subsP);
+  }
+  // v8：Worker /resolve（3 次重试）与本地链（HLS 优先、mp4 兜底）并行竞速，
+  // 本地腿延迟 5s 起跑（/resolve 首发命中时少烧上游）；先赢者出线，总预算 25s。
+  // v7 的串行是断点①：先烧完 3 次重试（≈7.5s）才走本地链，App 等不及就报加载失败。
+  var resolveJob = (async function () {
+    try {
+      var rv = await getResolve(id);
+      if (rv && rv.url) {
+        var kind = rv.kind === 'mp4' ? 'mp4' : (rv.kind === 'hls' ? 'hls' : (/\.m3u8(\?|#|$)/i.test(rv.url) ? 'hls' : 'mp4'));
+        return { url: rv.url, kind: kind, referer: HOST + '/', via: 'resolve' };
+      }
+    } catch (e) {}
+    return null;
+  })();
+  var localJob = sleep(5000).then(function () {
+    return (async function () {
+      try {
+        var r = await resolvePlayLocal(id);
+        if (r && r.url) return { url: r.url, kind: r.kind, referer: r.referer || (HOST + '/'), via: 'local' };
+      } catch (e) {}
+      return null;
+    })();
+  });
+  var won = await firstSuccess([resolveJob, localJob], 25000);
+  if (won && won.url) {
+    var finalUrl = won.url;
+    var referer = won.referer || (HOST + '/');
+    if (won.kind === 'hls' || /\.m3u8(\?|#|$)/i.test(won.url)) {
+      var masterH = wrapHlsViaWorker(won.url);
+      finalUrl = q > 0 ? await pickVariantUrl(id, masterH, q) : masterH;
     }
-  } catch (e) {}
+    return subAttach({ parse: 0, url: finalUrl, header: { 'User-Agent': UA, 'Referer': referer } }, subsP);
+  }
   return subAttach({ parse: 1, url: id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } }, subsP);
 }
+
 async function search(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var wd = String(body.wd || '').trim();

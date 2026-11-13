@@ -110,6 +110,25 @@
 //     条被 Shield 拦的路）。③ 直连 .com 页在 VM 下时通时断
 //     （连续快取 10 次后 Shield 限流 403，过后恢复），故每条腿
 //     都有失败回落，不把单腿当必通。】
+//   - 【v5 诊断 2026-11-13（R4 实测：20:21 用户报四栏全"暂无数据"，
+//     不是 v4 回归）：① v3→v4 diff：getText/parseList/listUrl/
+//     category/home/search 一字未动，只改了 detail/play 与档位
+//     helper，列表路径在代码上不可能因 v4 变空；② harness 定向
+//     对照：v3 与 v4 的 home/最新 p1p2/分类/标签/模特/搜索/详情
+//     点播全通、errors 均为 0，内容完全一致；③ 站方现态：.net
+//     首页/分类/标签/模特页 VM 下全 200、无 Shield，每页 20 条
+//     article、解析正则全中；④ 线上基线：蜘蛛 blob 108a875d 即
+//     v4、router 已注册、dist md5 256ecca4 与构建提交 3655c923
+//     的 dist 字节一致。结论：20:21 的全空是当时那一刻 .net
+//     直连在手机出口上取不到页（Shield/限流/代理抖动之类的瞬
+//     态），不是代码回归；但 v4 之前列表腿是单腿直连（getText
+//     20 秒，空了就空），没有任何回落，一次瞬态就全栏皆空。
+//     v5 修法：列表腿改直连 + jina 双腿（getListHtml，直连
+//     10 秒、空了换 jina 10 秒取同一页原 HTML、仍空才认空；
+//     jina 腿 2026-11-13 实测 /anal/ 页 200/64062 字节/20 条，
+//     与直连同构；最坏总耗时 20 秒，与原来单腿 20 秒持平）。
+//     detail() 的 .net 取页刻意不动（已有档位双腿兜底，动它
+//     只加最坏耗时，不治列表的病）。】
 //   - 列表分页必须带 ?filter=latest：默认排序首页 30 条/页、翻页在边界
 //     处重复 1-2 条（anal p1/p2、home p1/p2/p3 实测）；带 filter=latest
 //     后一律 20 条/页，p1/p2 零重叠（anal、home、tag、search 实测）。
@@ -293,6 +312,32 @@ async function getText(url, timeoutMs) {
   }
 }
 
+// v5：列表取页（category/search 共用）：直连 .net 10 秒，空了换
+// jina 取同一页（x-respond-with: html 回原 HTML，jina 10 秒），
+// 仍空才认空。R4 之前列表是单腿直连，.net 在手机出口上一次瞬态
+// 取不到页（Shield/限流/代理抖动）就四栏全空；jina 换出口可绕
+// 过出口侧的拦。最坏总耗时 20 秒，与原来单腿 20 秒持平，不叠加
+// 重试。jina 免费腿有 429 可能、且会缓存页（列表缓存几分钟可接
+// 受）；jina 也空时返回 ''，调用方原样出空列表，不编造内容。
+async function getListHtml(url) {
+  const direct = await getText(url, 10000);
+  if (direct) return direct;
+  try {
+    const r = await req.get('https://r.jina.ai/' + url, {
+      headers: { 'User-Agent': UA, 'x-respond-with': 'html', 'Accept': 'text/html,*/*' },
+      timeout: 10000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+    });
+    const data = r && r.data;
+    const html = typeof data === 'string' ? data : '';
+    if (!html || isShield(html)) return '';
+    return html;
+  } catch (e) {
+    return '';
+  }
+}
+
 // 列表卡片：<article class="thumb-block ...">...</article>
 //   <a href="<详情 URL>" title="<标题>">
 //   <img src="<封面>"> ... <span class="duration">MM:SS</span>
@@ -403,7 +448,7 @@ async function category(reqIn) {
   else if (id === 'tags') base = SITE + '/tag/' + (sub || TAG_CARDS[0].v) + '/';
   else if (id === 'actors') base = SITE + '/actor/' + (sub || ACTOR_CARDS[0].v) + '/';
   else return { page, pagecount: page, limit: 0, total: 0, list: [] };
-  const html = await getText(listUrl(base, page));
+  const html = await getListHtml(listUrl(base, page));
   return listResult(html, page);
 }
 
@@ -774,7 +819,7 @@ async function search(reqIn) {
   if (!wd) return { page, pagecount: page, limit: 0, total: 0, list: [] };
   const q = encodeURIComponent(wd);
   const url = page <= 1 ? SITE + '/?s=' + q : SITE + '/page/' + page + '/?s=' + q;
-  const html = await getText(url);
+  const html = await getListHtml(url);
   // 无命中时站方仍会渲染 20 条推荐视频（与主循环同形），须以计数为准：
   // <span class="search-video-number">0 video found</span> 即空结果。
   if (html && /search-video-number">\s*0\s+video/i.test(html)) {
