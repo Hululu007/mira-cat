@@ -109,6 +109,16 @@
 //    jina 共用承诺无 token 时再现取一次；其余一字未动。
 //    分段铸造本身、8 秒预算、/resolve 单次第二路、mp4 直连兜底、字幕行为一字未动；
 //    无新 Worker、不部署任何东西（R4 的 v6 草稿只加 embed 重试，修不了 token 源与 apiPlay 403，不部署）。
+//  - v13（2026-11-14 第九轮）：修第八轮真机反馈“仍无法播放”。根因（JavRate 先例 + 代码内证）：
+//    token 绑取页方 IP——live/tid 是详情页按取页方 IP 签发的（jina 取与 Worker 取解出不同 ip/token，
+//    见 v5 注释；蜘蛛内亦注“token 约 19.5 小时过期且绑 IP”），手机 /api/play/ 直发用的 token
+//    必须是手机自己取详情页拿到的（direct 腿）。旧 getTokenAll 三腿竞速“先拿到者赢”专挑错的：
+//    Worker/jina 腿更快（1.5-3s），直连腿更慢，竞速恒让 Worker/jina token 赢，再拿去直发即异 IP。
+//    VM 实测佐证（非决定性：VM 出口本身也被墙）：jina 铸的 token 直发 POST 回 CF 403 Just a
+//    moment；经 jina 转发 POST 目标回 405——jina 不转发 POST，只 GET，此路已死。
+//    修法（只改蜘蛛，不部署）：getTokenAll 改为 direct 优先——先试直连（短预算），拿到即赢；
+//    直连失败再并行 Worker + jina 回落（异 IP token 直发或成或败，/resolve 路并行兜底）。
+//    token 缓存记 via 备查。分段路与 /resolve 两路并行竞速，先赢者出线。
 //  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
 //    新路：直连详情页取 token。getBaseAll 的 HTML 回落腿（getHtmlOnly：Worker /f/ +
 //    直连 + fetch 竞速）本来就能取到详情页 HTML、parseDetailHtml 本来就能从中抽
@@ -574,18 +584,21 @@ async function getJsonDetailAny(vid) {
   } catch (e) { return null; }
 }
 
-// token 并行三腿（v11）：Worker /j/detail（2.5s 封顶）+ 蜘蛛 jina 详情页（共用调用方
-// 传入的 jinaDetailP，不重复发 jina；未传入时现取一次）+ 直连详情页（v11 新增，
-// 唯一从未试过的源）。先拿到 live/tid 者赢；皆败回空。
-// 预算未动：封顶 = 调用方 deadline 剩余。
+// token（v13）：direct 优先，Worker/jina 只作回落。
+// direct token 是唯一能保证手机 /api/play/ 直发通过的（live/tid 绑取页方 IP）；
+// 旧版三腿竞速“先拿到者赢”恒让更快的 Worker/jina token 赢，再拿去直发即异 IP。
+// 先试直连（短预算，挑战页速败不拖时间）；直连失败再并行 Worker + jina（v12 同款）。
+// jinaDetailP 参数保留（调用方签名不变），回落腿复用它，不重复发 jina。
 async function getTokenAll(vid, deadlineMs, jinaDetailP) {
+  var capD = deadlineMs ? Math.max(1500, Math.min(5000, deadlineMs - Date.now())) : 5000;
+  try {
+    var dt = await withTimeout(getDirectToken(vid, deadlineMs), capD, null);
+    if (dt && dt.live && dt.tid) return { live: dt.live, tid: dt.tid, via: 'direct' };
+  } catch (e) {}
+  if (deadlineMs && Date.now() >= deadlineMs - 1500) return { live: '', tid: '', via: '' };
   var jobs = [];
   jobs.push((async function () {
     try {
-      // v12：2.5s 封顶是手机端杀手——Worker /j/detail 实测 1.5-3s，手机上常超
-      // 2.5s 即被掐死（R8 坐实：对新片 /j/detail 与 /resolve 均活，死的是旧
-      // slug；SVCAO-032 长 slug 已改短，站方对旧 slug 回 404/挑战）。
-      // 放宽到 8s；首试无 token 且时间有余时再试一次（偶发挑战/超时）。
       var capW = deadlineMs ? Math.max(1500, Math.min(8000, deadlineMs - Date.now())) : 8000;
       var jd = await withTimeout(getJsonDetail(vid), capW, null);
       if (jd && jd.live && jd.tid) return { live: jd.live, tid: jd.tid, via: 'worker' };
@@ -600,18 +613,10 @@ async function getTokenAll(vid, deadlineMs, jinaDetailP) {
     try {
       var jt = jinaDetailP ? await jinaDetailP : await getJinaDetail(vid, deadlineMs);
       if (jt && jt.live && jt.tid) return { live: jt.live, tid: jt.tid, via: 'jina' };
-      // 共用承诺无 token（旧缓存/429/超时）时再现取一次，仍在 deadline 内才发。
       if (jinaDetailP && deadlineMs && Date.now() < deadlineMs - 2000) {
         var jt2 = await getJinaDetail(vid, deadlineMs);
         if (jt2 && jt2.live && jt2.tid) return { live: jt2.live, tid: jt2.tid, via: 'jina-retry' };
       }
-    } catch (e) {}
-    return null;
-  })());
-  jobs.push((async function () {
-    try {
-      var dt = await getDirectToken(vid, deadlineMs);
-      if (dt && dt.live && dt.tid) return { live: dt.live, tid: dt.tid, via: 'direct' };
     } catch (e) {}
     return null;
   })());
@@ -1011,9 +1016,9 @@ function tokenCacheGet(vid) {
   if (Date.now() - e.ts > TOKEN_TTL) { tokenCache.delete(vid); return null; }
   return e;
 }
-function tokenCacheSet(vid, live, tid) {
+function tokenCacheSet(vid, live, tid, via) {
   if (!vid || !live || !tid) return;
-  tokenCache.set(vid, { live: live, tid: tid, ts: Date.now() });
+  tokenCache.set(vid, { live: live, tid: tid, via: via || '', ts: Date.now() });
   if (tokenCache.size > 50) tokenCache.delete(tokenCache.keys().next().value);
 }
 
@@ -1247,7 +1252,7 @@ async function detail(reqIn) {
   var tk = await tokenP;
   var live = tk.live;
   var tid = tk.tid;
-  if (live && tid) tokenCacheSet(vid, live, tid);
+  if (live && tid) tokenCacheSet(vid, live, tid, tk.via);
   var base = await withTimeout(baseP, Math.max(500, detailDeadline - Date.now()), { name: '', pic: '', desc: '' });
   var name = base.name;
   var pic = base.pic;
@@ -1313,11 +1318,9 @@ async function play(reqIn) {
       return attachCached({ parse: 0, url: curl2, header: { 'User-Agent': UA, 'Referer': HOST + '/' } });
     }
   }
-  // token：缓存优先（detail 已取过时 0 秒）；无缓存则并行双腿取 token（见 getTokenAll：
-  // Worker /j/detail + 蜘蛛 jina 详情页，先拿到 live/tid 者赢）。v9 只走 /j/detail 单腿，
-  // Worker 取详情页死则分段路直接判死——R6 探针坐实该腿 10/10 死，手机上两路同死即本轮症状。
-  // HTML 详情页回落仍不要（坏相位下 3–6s，会把分段路饿死在 8 秒 deadline 之外）。
-  // token 拿不到时分段路直接判死，只剩 /resolve 路竞速。
+  // token：缓存优先（detail 已取过时 0 秒）；无缓存则取 token（见 getTokenAll：
+  // v13 起 direct 优先，Worker/jina 只作回落）。token 拿不到时分段路直接判死，
+  // 只剩 /resolve 路竞速。
   var live0 = '';
   var tid0 = '';
   var tc0 = tokenCacheGet(id);
@@ -1326,7 +1329,7 @@ async function play(reqIn) {
     if (live0 && tid0) return { live: live0, tid: tid0 };
     var tk0 = await getTokenAll(id, playDeadline);
     if (tk0 && tk0.live && tk0.tid) {
-      tokenCacheSet(id, tk0.live, tk0.tid);
+      tokenCacheSet(id, tk0.live, tk0.tid, tk0.via);
       return { live: tk0.live, tid: tk0.tid };
     }
     return { live: '', tid: '' };
