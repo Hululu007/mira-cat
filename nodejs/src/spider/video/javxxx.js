@@ -103,6 +103,15 @@
 //    与下面的第二次 getMasterEntrySplit 调用重复——每开一次详情页向上游发两套铸造请求。
 //    分段铸造本身、8 秒预算、/resolve 单次第二路、mp4 直连兜底、字幕行为一字未动；
 //    无新 Worker、不部署任何东西（R4 的 v6 草稿只加 embed 重试，修不了 token 源与 apiPlay 403，不部署）。
+//  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
+//    新路：直连详情页取 token。getBaseAll 的 HTML 回落腿（getHtmlOnly：Worker /f/ +
+//    直连 + fetch 竞速）本来就能取到详情页 HTML、parseDetailHtml 本来就能从中抽
+//    出 data-ts-live/data-ts-id，但它只回 {name, pic, desc}，把 live/tid 扔了；
+//    getTokenAll 也从来没接过这条腿。v11 把直连详情页（req.get + fetch 双腿并行，
+//    6 秒封顶，不走 Worker、不走 jina）加为 token 第三腿，与 Worker/jina 并行竞速，
+//    先拿到 live/tid 者赢。detail() 预算 8 秒→12 秒（直连腿本身 6 秒封顶，
+//    档位发现仍需 apiPlay POST + embed 扫描的时间；play() 仍 8 秒，
+//    主路是 detail() 已缓存的 token，冷播才走三腿竞速）。
 import req from '../../util/req.js';
 
 const KEY = 'py_javxxx';
@@ -466,7 +475,7 @@ function parseDetailHtml(html) {
 async function getJinaDetail(vid, deadlineMs) {
   var jinaUrl = 'https://r.jina.ai/' + vid;
   var hdrs = { 'User-Agent': UA, 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8', 'x-respond-with': 'html' };
-  var cap = deadlineMs ? Math.max(1500, Math.min(6000, deadlineMs - Date.now())) : 6000;
+  var cap = deadlineMs ? Math.max(1500, Math.min(9000, deadlineMs - Date.now())) : 6000;
   var jobs = [];
   jobs.push((async function () {
     try {
@@ -501,6 +510,48 @@ async function getJinaDetail(vid, deadlineMs) {
   return won || null;
 }
 
+// v11：直连详情页取 token（第三腿）。手机直连 javxxx.me 详情页是唯一从未试过的
+// token 源：Worker /j/detail 死于 CF 出口 403，jina 腿在手机上没赢过，而详情页
+// 本身的 data-ts-live/data-ts-id 就在静态 HTML 里（与 Worker/jina 腿共用同一解析）。
+// req.get + fetch 双腿并行、6 秒封顶，不走 Worker、不走 jina；挑战页/空页回 null。
+// 与 getJinaDetail 同款结构，只换直连 URL、去掉 x-respond-with。
+async function getDirectToken(vid, deadlineMs) {
+  var hdrs = headers();
+  var cap = deadlineMs ? Math.max(1500, Math.min(9000, deadlineMs - Date.now())) : 6000;
+  var jobs = [];
+  jobs.push((async function () {
+    try {
+      var r = await withTimeout(req.get(vid, { headers: hdrs, timeout: cap }), cap, null);
+      if (!r || r.status !== 200) return null;
+      var b = (r && r.data != null) ? String(r.data) : '';
+      if (!b || isChallengePage(b)) return null;
+      var p = parseDetailHtml(b);
+      if (!p.live || !p.tid) return null;
+      return { live: p.live, tid: p.tid, via: 'direct' };
+    } catch (e) { return null; }
+  })());
+  if (typeof fetch === 'function') {
+    jobs.push((async function () {
+      try {
+        var ctrl = null;
+        try { if (typeof AbortController === 'function') ctrl = new AbortController(); } catch (e) {}
+        var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, cap);
+        try {
+          var r2 = await fetch(vid, { headers: hdrs, signal: ctrl ? ctrl.signal : undefined });
+          if (!r2 || r2.status !== 200) return null;
+          var b2 = await withTimeout(r2.text(), cap, '');
+          if (!b2 || isChallengePage(b2)) return null;
+          var p2 = parseDetailHtml(b2);
+          if (!p2.live || !p2.tid) return null;
+          return { live: p2.live, tid: p2.tid, via: 'direct' };
+        } finally { clearTimeout(timer); }
+      } catch (e) { return null; }
+    })());
+  }
+  var won = await firstSuccess(jobs, cap);
+  return won || null;
+}
+
 // /j/detail 原样取回（ok:false 的 notoken 也带 name/pic/desc，基础信息腿自判 live/tid）。
 async function getJsonDetailAny(vid) {
   try {
@@ -517,8 +568,9 @@ async function getJsonDetailAny(vid) {
   } catch (e) { return null; }
 }
 
-// token 并行双腿：Worker /j/detail（2.5s 封顶）+ 蜘蛛 jina 详情页（共用调用方传入的
-// jinaDetailP，不重复发 jina；未传入时现取一次）。先拿到 live/tid 者赢；皆败回空。
+// token 并行三腿（v11）：Worker /j/detail（2.5s 封顶）+ 蜘蛛 jina 详情页（共用调用方
+// 传入的 jinaDetailP，不重复发 jina；未传入时现取一次）+ 直连详情页（v11 新增，
+// 唯一从未试过的源）。先拿到 live/tid 者赢；皆败回空。
 // 预算未动：封顶 = 调用方 deadline 剩余。
 async function getTokenAll(vid, deadlineMs, jinaDetailP) {
   var jobs = [];
@@ -533,6 +585,13 @@ async function getTokenAll(vid, deadlineMs, jinaDetailP) {
     try {
       var jt = jinaDetailP ? await jinaDetailP : await getJinaDetail(vid, deadlineMs);
       if (jt && jt.live && jt.tid) return { live: jt.live, tid: jt.tid, via: 'jina' };
+    } catch (e) {}
+    return null;
+  })());
+  jobs.push((async function () {
+    try {
+      var dt = await getDirectToken(vid, deadlineMs);
+      if (dt && dt.live && dt.tid) return { live: dt.live, tid: dt.tid, via: 'direct' };
     } catch (e) {}
     return null;
   })());
@@ -763,7 +822,7 @@ async function postApiPlayDirect(url, form, referer, deadlineMs) {
   var qs = new URLSearchParams(form).toString();
   var hdrs = { ...headers(referer), 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': 'XMLHttpRequest' };
   var cap = 6000;
-  if (deadlineMs) cap = Math.max(1000, Math.min(6000, deadlineMs - Date.now()));
+  if (deadlineMs) cap = Math.max(1000, Math.min(9000, deadlineMs - Date.now()));
   var jobs = [];
   jobs.push((async function () {
     try {
@@ -1150,13 +1209,13 @@ async function detail(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var vid = String(body.id || '').trim();
   if (!vid) return { list: [] };
-  // v10：档位发现仍只等 8 秒（从 detail 起跑算起），超时/失败回单条“播放”。
-  // 预算一字未动（8 秒）；换的是 token 的来源——见 getTokenAll。
+  // v11：档位发现等 12 秒（从 detail 起跑算起），超时/失败回单条“播放”。
+  // v10 的 8 秒不够直连腿（本身 6 秒封顶）+ 档位发现走完；12 秒仍有界。
   // 另修 v9 的 bug：detail() 里 entryP（tokenP.then(getMasterEntrySplit)）定义后从未被 await，
   // 却仍在后台跑完一整条分段链（又一次 apiPlay POST + 4 路并行 /f/ 扫描），与下面
   // withTimeout 里的第二次 getMasterEntrySplit 调用重复——每次打开详情页都向上游发两套铸造请求。
   // v10 只跑一次：entryP 定义后由下面唯一一次 withTimeout 结算。
-  var detailDeadline = Date.now() + 8000;
+  var detailDeadline = Date.now() + 12000;
   // jina 详情页只取一次：tokenP 与 baseP 共用同一份承诺，不重复发 jina（jina 也会 429）。
   var jinaDetailP = getJinaDetail(vid, detailDeadline);
   var tokenP = getTokenAll(vid, detailDeadline, jinaDetailP);

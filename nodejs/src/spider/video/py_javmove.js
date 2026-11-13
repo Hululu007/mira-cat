@@ -1,8 +1,10 @@
 // JavMove (https://javmove.com) -> CatPawOpen spider
 // 探查 (2026-11-13, VM curl iPhone UA 全链实测):
 //   顶级: 最新 (首页 / , 24 条/页, 翻页 /?page=N, p8 仍有 12 条新内容, 页数不止
-//     导航栏显示的 7 页, 故用 999 形态)、新发布 (/release 单页 10 条, 无翻页)、
-//     即将上映 (/upcoming 单页 13 条, 无翻页)。
+//     导航栏显示的 7 页, 故用 999 形态)。新发布与即将上映在 v4 里被当成单页
+//     (pagecount=1、p2 直接回空), 但 2026-11-14 实测站方是真翻页:
+//     /release p1 12 条、p2 9 条 (共 2 页), /upcoming 每页 12 条、至少 8 页。
+//     v5: 两分类都按 ?page=N 真翻页, pagecount 取站内 ?page= 链接最大值。
 //   2026-11-13 用户反馈顶级分类太少: 站内导航只有 / /release /upcoming /genres
 //     /makers, 无更多站方顶级栏; /genres 索引实录 361 个题材, 其中无 "无码流出"
 //     标签 (grep leak 全站 0 命中), 最接近的是 JAV Uncensored
@@ -316,7 +318,6 @@ async function category(reqIn) {
   // R2: 两张卡分 key (genre/maker); 旧 'sub' 仅作兼容 (旧版 App 已存筛选态)
   const sub = t(extend.genre || extend.maker || extend.sub || '');
   let url;
-  let single = false;
   if (sub && (sub.startsWith('genres/') || sub.startsWith('maker/'))) {
     url = HOST + '/' + sub;
     if (page > 1) url += '?page=' + page;
@@ -325,21 +326,22 @@ async function category(reqIn) {
     url = HOST + '/' + GENRE_TOP[tid];
     if (page > 1) url += '?page=' + page;
   } else if (tid === 'release') {
+    // v5: /release 真翻页 (p1 12 条, p2 9 条, 共 2 页), 不再单页
     url = HOST + '/release';
-    single = true;
+    if (page > 1) url += '?page=' + page;
   } else if (tid === 'upcoming') {
+    // v5: /upcoming 真翻页 (每页 12 条, 至少 8 页), 不再单页
     url = HOST + '/upcoming';
-    single = true;
+    if (page > 1) url += '?page=' + page;
   } else {
     url = page <= 1 ? HOST + '/' : HOST + '/?page=' + page;
   }
-  if (single && page > 1) return { page, pagecount: 1, limit: 20, total: 20, list: [] };
   const html = await getHtml(url, null, 25000);
   const list = parseList(html);
-  const pc = single ? 1 : Math.max(parsePagecount(html), page);
+  const pc = Math.max(parsePagecount(html), page);
   return {
     page,
-    pagecount: single ? 1 : pc,
+    pagecount: pc,
     limit: list.length || 24,
     total: list.length,
     list,
@@ -443,7 +445,12 @@ async function detail(reqIn) {
   const token = dm0 ? dm0[1] : '';
 
   let lines = parseFormats(html, mv, token);
-  if (!lines.length) lines = ['正片$move:' + mv.id + ':' + mv.slug + '::1' + (token ? ':' + token : '')];
+  // v5: 无格式区且无 data-id token 时不给播放线路。即将上映的片在站方详情页里
+  // 根本没有片源 (2026-11-14 抽 4 部: 0 格式区、0 data-id、0 mp4/m3u8/预告;
+  // MIMK-294 发行日 2026-11-15, 还没上映)。旧版兜底给一条无 token 的"正片",
+  // play() 三腿全败回空 url, 手机端无限转圈。无线路即详情页无播放按钮,
+  // 上映后站方放出片源即自动有线路, 不用再改蜘蛛。
+  if (!lines.length && token) lines = ['正片$move:' + mv.id + ':' + mv.slug + '::1:' + token];
 
   const vod = {
     vod_id: durl,
@@ -452,7 +459,7 @@ async function detail(reqIn) {
     vod_play_from: NAME,
     vod_play_url: lines.join('#'),
   };
-  if (name) subRegister(durl, vod);
+  if (name && lines.length) subRegister(durl, vod);
   return { list: [vod] };
 }
 

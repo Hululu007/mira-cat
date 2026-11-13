@@ -177,6 +177,19 @@ import req from '../../util/req.js';
 
 const KEY = 'py_pimpbunny';
 const NAME = 'PimpBunny';
+// v8 (2026-11-14, 第七轮)：
+//   ① 封面改回 .net + 一律取 -640x360 缩略变体。v7 改写 .com 是错的：
+//      用户真机全部封面空白；VM HEAD 核查：同一文件 .net 200、.com 403
+//      (Shield 只拦原图)；且原图 224–529KB、-640x360 变体 29–51KB
+//      (10/10 抽样全有)，App 加载小图更稳。详情 poster 本就是
+//      -640x360 变体，不重复加后缀。
+//   ② resolveChain：responseType 由 arraybuffer 改 text（只读头和
+//      状态，不读 body；App 内 axios 的 arraybuffer 支持未坐实，
+//       text 是最稳的形态），每跳超时 4s→8s（手机端取页比 VM 慢）。
+//   ③ remint/fetchLadderDirect/remintBest 超时 6s→8s。
+//   ④ Worker 腿：腿 2（新鲜令牌）已在 v7，新增腿 3.5（详情时刻令牌
+//      跟链失败时也走 Worker /stream）；STREAM_WORKER 部署并 /diag
+//      验绿后才填，未部署时两腿自动跳过。
 const SITE = 'https://pimpbunny.net';
 const COM = 'https://pimpbunny.com';
 // pimpbunny-stream Worker（v7 腿 2 备选，未部署前留空；部署后填入地址）：
@@ -186,7 +199,7 @@ const COM = 'https://pimpbunny.com';
 //   留空时 play() 腿 2 自动跳过，不影响主路。注意：Worker 腿未验证
 //   过（CF 出口无 cookie 代取曾 403，带 cookie 转发是否过墙待部署
 //   后 /diag 核查），只是备选，不是主路。
-const STREAM_WORKER = '';
+const STREAM_WORKER = 'https://pimpbunny-stream.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1';
 const PAGE_SIZE = 20;
 
@@ -321,20 +334,18 @@ function fixUrl(u) {
   return SITE + '/' + u;
 }
 
-// v7 封面 host 改写：列表与详情封面一律走 .com（同路径同文件）。
-// R6 实测：封面全是 pimpbunny.net/wp-content/uploads/2026/06/…，
-// 同文件在 .com host 上亦 200（probe/cover_host.json，三文件
-// netRef 206 / comRef 200）；而 .net 视频全死、.com 视频全活
-// （Safari 全站死 vs .com 浏览器能播）。蜘蛛侧数据本身无缺封面
-// 的口子（441 条抽样 0 缺，60 个封面 Range 取回全 206 image/jpeg，
-// 详情 poster 与列表封面同一文件），用户说的"有的出不了"在 VM 侧
-// 无复现；改写是现有证据下最有支撑的一步——若个别标题仍无封面，
-// 需报具体片名再查。只改封面 host，不动详情页/播放地址。
+// v8 封面：走 .net host + -640x360 缩略变体（v7 的 .com 改写已证伪，
+// 见文件头 v8 ①：.com 原图 VM 侧即 403，用户真机全部空白）。
+// 原图 224–529KB，-640x360 变体 29–51KB（10/10 抽样全有），
+// App 侧加载更快、更稳；已是 -640x360 的不重复加后缀；非 uploads
+// 图片原样返回，不编造。
 function coverUrl(u) {
-  const fixed = fixUrl(u);
-  if (fixed.indexOf('https://pimpbunny.net/') === 0) {
-    return 'https://pimpbunny.com/' + fixed.slice('https://pimpbunny.net/'.length);
+  let fixed = fixUrl(u);
+  if (fixed.indexOf('https://pimpbunny.com/') === 0) {
+    fixed = 'https://pimpbunny.net/' + fixed.slice('https://pimpbunny.com/'.length);
   }
+  const m = fixed.match(/^(https:\/\/pimpbunny\.net\/wp-content\/uploads\/.*)(\.(?:jpe?g|png|webp))$/i);
+  if (m && m[1].indexOf('-640x360') < 0) return m[1] + '-640x360' + m[2];
   return fixed;
 }
 
@@ -516,7 +527,7 @@ async function detail(reqIn) {
   // v7 poster 兜底：<video> poster 优先，缺了退 og:image（R6 实测
   // 12 部详情页 poster 与列表封面同一文件，两者皆为同文件不同裁
   // 切：poster 为 -640x360 变体，og:image 为原图；两者都缺才留空，
-  // 不编造）。封面 host 同列表一律改写为 .com（见 coverUrl）。
+  // 不编造）。封面 host 与变体处理同列表（见 coverUrl：.net + -640x360）。
   const posterM = html.match(/<video[^>]*poster="([^"]+)"/)
     || html.match(/property="og:image"\s+content="([^"]+)"/);
   const poster = posterM ? posterM[1] : '';
@@ -642,7 +653,7 @@ function parseLadder(html) {
 // 直连取 .com 视频页现铸档位（手机端出口 + 当次会话 cookie，令牌
 // 与 cookie 同次渲染才配对）。失败返回空档位，调用方退回 jina。
 async function fetchLadderDirect(comVideo) {
-  const pg = await getComPage(comVideo, 6000);
+  const pg = await getComPage(comVideo, 8000);
   const ladder = parseLadder(pg.html);
   if (!ladder.length) return { ladder: [], cookie: '' };
   return { ladder, cookie: pg.cookie };
@@ -683,7 +694,7 @@ function fileTail(url) {
 // 不重试。
 async function remintLadder(comVideo, label, fileUrl) {
   try {
-    const pg = await getComPage(comVideo, 6000);
+    const pg = await getComPage(comVideo, 8000);
     const ladder = parseLadder(pg.html);
     if (!ladder.length) return null;
     const tail = fileTail(fileUrl);
@@ -760,9 +771,13 @@ async function resolveChain(startUrl, referer, cookie) {
       if (ck) headers.Cookie = ck;
       r = await req.get(url, {
         headers,
-        timeout: 4000,
+        timeout: 8000,
         maxRedirects: 0,
-        responseType: 'arraybuffer',
+        // v8: 只读头和状态，不读 body——text 是 App 内最稳的形态
+        // （arraybuffer 在 App 侧 axios 的支持未坐实；1KB 探路体
+        // 即使是二进制，当文本读也不影响判断）。
+        responseType: 'text',
+        transformResponse: [(d) => d],
         maxContentLength: 65536,
         validateStatus: () => true,
       });
@@ -802,7 +817,7 @@ async function resolveChain(startUrl, referer, cookie) {
 // （ladder 按档位数字降序，首位即最高档）+ 当次 cookie。
 async function remintBest(comVideo) {
   try {
-    const pg = await getComPage(comVideo, 6000);
+    const pg = await getComPage(comVideo, 8000);
     const ladder = parseLadder(pg.html);
     if (!ladder.length) return null;
     return { url: ladder[0].url, cookie: pg.cookie, label: ladder[0].label };
@@ -875,6 +890,16 @@ async function play(reqIn) {
           return {
             parse: 0,
             url: chained.url,
+            header: { 'User-Agent': UA, 'Referer': comVideo || COM + '/' },
+          };
+        }
+        // 腿 3.5（v8 新增）：蜘蛛侧跟链失败，把详情时刻的令牌 +
+        // cookie 交 Worker 代跟链、代流（与腿 2 同款，只是用详情
+        // 时刻的凭证）。STREAM_WORKER 未部署（空）时跳过。
+        if (STREAM_WORKER) {
+          return {
+            parse: 0,
+            url: STREAM_WORKER + '/stream?u=' + encodeURIComponent(fileUrl) + '&c=' + encodeURIComponent(cookie),
             header: { 'User-Agent': UA, 'Referer': comVideo || COM + '/' },
           };
         }
