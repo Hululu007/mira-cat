@@ -33,9 +33,17 @@ import req from '../../util/req.js';
 // 搜索：/?s=<关键词>（站方 SearchAction 结构，实测 ADN-814 / MIRD 均回帖子）
 // 翻页：归档 /page/<N>/（首页 /page/<N>/、分类与 genre 同理）
 // 字幕：与模板同一套 Layer A（迅雷 > 迅雷看看 > SubtitleCat），仅番号条目接芯；单码率 1080p，不编假档位。
+// 2026-11-14 无码修复：无码首页 24 条实测 19 条 upload18、5 条 mee；无码详情页多为 upload18 播放器
+//   （无 mee iframe），旧版只认 mee 故 19 条全无线路。新增 upload18 路：详情页取
+//   https://upload18.com/play/index/<slug>，播放时现取 window.PLAYER_CONFIG.m3u8（helvid.com 直链，
+//   取法照 javmobile 已验过的 resolveUpload18，手机 UA 取页，token 约 30 分钟，播放时现取不缓存）。
+//   分辨率说明（实测，不编档位）：mee master 只有 1080p 一档；helvid 播单是单档媒体清单（无 STREAM-INF，
+//   alternate720 为空）。两路都只有一档，无法做分辨率选择；各给一条“正片/1080p”线。
 const HOST = 'https://www4.24-jav.com';
 const KEY = 'py_24jav';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+const UA_MOB = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko) Version/18.2 Mobile/15E148 Safari/604.1';
+const U18_REFERER = 'https://upload18.com/';
 
 function unescapeHtml(s) {
   return String(s || '')
@@ -141,6 +149,47 @@ function extractMeeMd5(html) {
 
 function masterUrl(mee) {
   return 'https://' + (mee && mee.host ? mee.host : 'mee18player.com') + '/hlsr2/' + mee.token + '/master';
+}
+
+// 无码路：详情页 upload18 iframe（无 mee iframe 时走这路）。
+function extractUpload18(html) {
+  const m = String(html || '').match(/https?:\/\/(?:www\.)?upload18\.com\/play\/index\/([^"'\s<>]+)/i);
+  if (!m) return '';
+  return 'https://upload18.com/play/index/' + m[1].replace(/\/$/, '');
+}
+
+async function getTextWithUa(url, ua, referer) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await req.get(url, {
+        headers: { 'User-Agent': ua, 'Referer': referer },
+        timeout: 15000,
+      });
+      if (r.status === 200 && typeof r.data === 'string' && r.data) return r.data;
+    } catch (e) { /* retry */ }
+  }
+  return '';
+}
+
+// upload18 播放页 -> window.PLAYER_CONFIG.m3u8（helvid.com 直链，单档媒体清单）。
+// 必须用手机 UA 取页（helvid 按 UA 签发 token，d=apple）；token 约 30 分钟，播放时现取。
+async function resolveUpload18(embedUrl) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const html = await getTextWithUa(embedUrl, UA_MOB, HOST + '/');
+    if (!html || html.indexOf('window.PLAYER_CONFIG') < 0) continue;
+    // 直取 m3u8 字段（不依赖 JSON 键顺序；PLAYER_CONFIG 内嵌对象时 JSON.parse 会截断）。
+    // 注意：页内 JSON 把 & 写成 \u0026、/ 写成 \/，直接取串必须先解码，否则查询串全并进 e= 致 404。
+    let url = '';
+    const direct = html.match(/"m3u8"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+    if (direct) url = direct[1].replace(/\\u0026/gi, '&').replace(/\\\//g, '/');
+    if (!url) {
+      const cfgM = html.match(/window\.PLAYER_CONFIG\s*=\s*(\{[\s\S]*?\});/);
+      if (cfgM) { try { url = String(JSON.parse(cfgM[1]).m3u8 || '').replace(/\\\//g, '/'); } catch (e) { /* ignore */ } }
+    }
+    if (/^https?:\/\/[^/]*helvid\.com\/m\//.test(url)) return url;
+    if (/^https?:\/\//.test(url) && url.indexOf('.m3u8') >= 0) return url;
+  }
+  return '';
 }
 
 // 解析 master 播单的 STREAM-INF 档位（RESOLUTION + 下一行 variant URL）；失败返回空数组。
@@ -729,6 +778,11 @@ async function detail(reqIn) {
   }
   const mee = extractMeeMd5(html);
   let playUrl = '';
+  if (!mee) {
+    // 无码路：upload18 播放器。只记 embed 地址，播放时 play() 现取 m3u8（token 约 30 分钟）。
+    const embed = extractUpload18(html);
+    if (embed) playUrl = '正片$' + durl + '@@u18:' + embed;
+  }
   if (mee) {
     // 读 master 播单只为取档位名作标签；播放地址一律给 master 走本地代理（代理内再拆 variant + 音频轨，
     // 1080p 音视频分离的片子才有声音；分片 PNG 头由代理剥掉，播放器才能建 VOD 时间轴、从头播、可拖动）。
@@ -767,6 +821,20 @@ async function play(reqIn) {
       if (mee) target = masterUrl(mee);
     }
     if (!target) return { parse: 1, url: durl || HOST + '/' };
+  }
+  // 无码 upload18 路：现取 m3u8（token 约 30 分钟，绝不复用详情时的旧地址）；失败回网页兜底，绝不回空 url。
+  if (target.indexOf('u18:') === 0) {
+    const m3u8 = await resolveUpload18(target.slice(4));
+    if (m3u8) {
+      const uTitle = subNameCache.get(durl) || '';
+      const uCode = subExtractCode(uTitle) || subExtractCode(durl);
+      const uSubsP = uCode ? subSearchAll(durl).catch(() => []) : Promise.resolve([]);
+      const uResult = { parse: 0, url: m3u8, header: { 'User-Agent': UA_MOB, 'Referer': U18_REFERER } };
+      const uSubs = await uSubsP;
+      if (uSubs && uSubs.length) uResult.subs = uSubs;
+      return uResult;
+    }
+    return { parse: 1, url: durl || HOST + '/' };
   }
   // 旧缓存的详情可能仍带 mee 直链：统一包一层本地代理再出（已是代理地址的不重复包）。
   if (target.indexOf('/proxy/') < 0 && /mee(18)?player\.com/i.test(target)) {
