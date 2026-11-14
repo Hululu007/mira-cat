@@ -208,8 +208,33 @@ async function fetchOnce(url) {
 // 200、274KB、112 条，解析也通），断在手机侧直连取页。getHtml 加 jina 兜底
 // 通道（r.jina.ai 取 /luckily/ 实测 200、112 条，无验证墙），直连失败时走 jina。
 // 主站取不到 (超时/空回/域名失效) 时换备用域重试; 与 seniu 的 ALT_HOSTS 同款写法
+// 先回非空者赢（直连挂起时不等它拖满超时，jina 快即可先赢）。
+function raceNonEmpty(promises) {
+  return new Promise((resolve) => {
+    let done = 0, settled = false;
+    const total = promises.length;
+    if (!total) return resolve('');
+    promises.forEach((p) => {
+      Promise.resolve(p).then((v) => {
+        if (settled) return;
+        if (v) { settled = true; resolve(v); return; }
+        done++;
+        if (done >= total) { settled = true; resolve(''); }
+      }).catch(() => {
+        done++;
+        if (!settled && done >= total) { settled = true; resolve(''); }
+      });
+    });
+  });
+}
+
 async function getHtml(url) {
-  let html = await fetchOnce(url);
+  // v3（2026-11-14）：v2 的 jina 兜底排最后，直连挂起拖满 20s 超时、App 等
+  // 不到 jina 就先空了。改直连 + jina 并行竞速，先回者赢；备用域仍作后备。
+  let html = await raceNonEmpty([
+    (async () => { try { return await fetchOnce(url); } catch (e) { return ''; } })(),
+    (async () => { try { return await fetchOnce('https://r.jina.ai/' + url); } catch (e) { return ''; } })(),
+  ]);
   if (html) return html;
   for (const alt of ALT_HOSTS) {
     const altUrl = url.replace(HOST, alt);
@@ -217,12 +242,6 @@ async function getHtml(url) {
     html = await fetchOnce(altUrl);
     if (html) return html;
   }
-  // jina 兜底（2026-11-14）：直连与备用域都空手时走 r.jina.ai（取 /luckily/
-  // 实测 200、112 条，无验证墙）。jina 返回完整 HTML，parseList 直接可用。
-  try {
-    html = await fetchOnce('https://r.jina.ai/' + url);
-    if (html) return html;
-  } catch (e) { /* fall through */ }
   return '';
 }
 

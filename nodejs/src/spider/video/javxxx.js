@@ -150,6 +150,12 @@
 //    （另已坐实：live/tid 是每片稳定的——jina 两次取、Worker 取均同一 live
 //    串，tid 596077 不变；token 不绑 IP、不快过期。故断点不在 token 本身，
 //    而在手机侧取 token 或调 /resolve2 的某一步。）
+//  - v18（2026-11-14 第十四轮，v17 诊断 tk:jina r2:fail r:fail sp:fail wk:ok）：
+//    Worker 通（wk:ok）但两条 Worker 腿断、分段直连也断。手机 Safari 能直接开
+//    站（IP 能过墙），App 的 axios 被墙——与 javsaga 同因。直连改发 iPhone
+//    Safari 全套浏览器头（UA + Accept + Sec-Fetch，照 javsaga v2）；另修诊断
+//    bug：entryP2 的 wrapper 会把 getMasterEntrySplit 设的细粒度 sp
+//    （post-fail/embed-fail）覆盖成笼统 fail。
 //  - v17（2026-11-14 第十三轮，v16 诊断 tk:jina r2:fail r:fail sp:fail）：
 //    token 通（jina），三条 Worker 腿全断。手机侧断点未坐实（Worker 不可达？
 //    抑或 POST/取 embed 亦断）。两处改动：
@@ -173,7 +179,7 @@ import req from '../../util/req.js';
 const KEY = 'py_javxxx';
 const NAME = 'JavXXX';
 const HOST = 'https://www.javxxx.me';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 // 分类：站内导航原样。vXX 前缀是站方规范地址（/category/<slug>/ 会 301 到它）。
 // home=最新；其余 9 个为视频分类。/pornstars/ 与 /studios/ 为人物/厂商索引，结构不同，暂不做。
@@ -200,9 +206,14 @@ function headers(referer) {
   return {
     'User-Agent': UA,
     'Referer': referer || (HOST + '/'),
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
   };
 }
 
@@ -1599,7 +1610,7 @@ async function detail(reqIn) {
     })();
   });
   // 诊断：记录 entryP（分段路）与 resolveEntryP（/resolve）的结果。
-  var entryP2 = entryP.then(function (e) { diag.sp = e ? 'ok' : 'fail'; return e; });
+  var entryP2 = entryP.then(function (e) { if (!diag.sp) diag.sp = e ? 'ok' : 'fail'; return e; });
   var resolveEntryP2 = resolveEntryP.then(function (e) { diag.r = e ? 'ok' : 'fail'; return e; });
   var tk = await tokenP;
   var live = tk.live;
