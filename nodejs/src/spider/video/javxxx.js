@@ -150,6 +150,11 @@
 //    （另已坐实：live/tid 是每片稳定的——jina 两次取、Worker 取均同一 live
 //    串，tid 596077 不变；token 不绑 IP、不快过期。故断点不在 token 本身，
 //    而在手机侧取 token 或调 /resolve2 的某一步。）
+//  - v19（2026-11-14 第十五轮，v18 仍无档位）：
+//    Worker 腿实测是通的（VM 连测 /resolve2 三次全 ok:true，/diag 全链
+//    200），手机 wk:ok 也证明连得上 Worker——断在时间上：token（jina）
+//    在手机上拿得慢，留给 /resolve2 的时间不够 12 秒预算。detail 预算
+//    12 秒 → 20 秒，给 Worker 腿留足时间；Safari 头与 sp 诊断修正保留。
 //  - v18（2026-11-14 第十四轮，v17 诊断 tk:jina r2:fail r:fail sp:fail wk:ok）：
 //    Worker 通（wk:ok）但两条 Worker 腿断、分段直连也断。手机 Safari 能直接开
 //    站（IP 能过墙），App 的 axios 被墙——与 javsaga 同因。直连改发 iPhone
@@ -1566,7 +1571,7 @@ async function detail(reqIn) {
   // 却仍在后台跑完一整条分段链（又一次 apiPlay POST + 4 路并行 /f/ 扫描），与下面
   // withTimeout 里的第二次 getMasterEntrySplit 调用重复——每次打开详情页都向上游发两套铸造请求。
   // v10 只跑一次：entryP 定义后由下面唯一一次 withTimeout 结算。
-  var detailDeadline = Date.now() + 12000;
+  var detailDeadline = Date.now() + 20000;
   // jina 详情页只取一次：tokenP 与 baseP 共用同一份承诺，不重复发 jina（jina 也会 429）。
   var jinaDetailP = getJinaDetail(vid, detailDeadline);
   var tokenP = getTokenAll(vid, detailDeadline, jinaDetailP);

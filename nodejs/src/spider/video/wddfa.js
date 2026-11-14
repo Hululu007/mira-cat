@@ -13,6 +13,8 @@ const HOST = 'https://wddfa.18jtoday10m20.buzz';
 // 主域是 .buzz 镜像 (站方提示"收藏几个网址防止失效", 域名会轮换); 主域取不到时自动换备用域
 const ALT_HOSTS = ['https://18j.today'];
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+// 自家抓取中转（site-fetch Worker v5，需用户部署；未部署前回 400，自动回落）。
+const FETCH_WORKER = 'https://site-fetch.li768435813.workers.dev';
 
 // 分类: 顶级 3 个 (国产/日本/AI短剧) + 子分类去重后 153 个 (同名只留最小 id, 共 156 个)
 // 236 个原始分类里 43 个名字重复, 已按名字去重
@@ -229,11 +231,14 @@ function raceNonEmpty(promises) {
 }
 
 async function getHtml(url) {
-  // v3（2026-11-14）：v2 的 jina 兜底排最后，直连挂起拖满 20s 超时、App 等
-  // 不到 jina 就先空了。改直连 + jina 并行竞速，先回者赢；备用域仍作后备。
+  // v4（2026-11-14）：v3 的直连 + jina 并行在手机上仍空。加自家 Worker 腿
+  // （site-fetch v5，白名单已加 wddfa 两域；手机连 workers.dev 是通的，
+  // wk:ok 已证；wddfa 不上 CF 墙，Worker 出口能正常抓）。三路并行竞速，
+  // 先回者赢；Worker 未部署前回 400，自动回落，不影响另两路。
   let html = await raceNonEmpty([
     (async () => { try { return await fetchOnce(url); } catch (e) { return ''; } })(),
     (async () => { try { return await fetchOnce('https://r.jina.ai/' + url); } catch (e) { return ''; } })(),
+    (async () => { try { return await fetchOnce(FETCH_WORKER + '/?u=' + encodeURIComponent(url)); } catch (e) { return ''; } })(),
   ]);
   if (html) return html;
   for (const alt of ALT_HOSTS) {
