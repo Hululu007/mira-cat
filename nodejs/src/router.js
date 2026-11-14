@@ -112,12 +112,14 @@ import manko from './spider/video/py_manko.js';
 import porno4k from './spider/video/py_4kporno.js';
 import pimpbunny from './spider/video/py_pimpbunny.js';
 import yesporn from './spider/video/py_yesporn.js';
+import lxtv5 from './spider/video/py_5lxtv.js';
 
 const spiders = [
     missav_xptv,
     av123,
     chigua51,
     porno4k,
+    lxtv5,
     mmtv,
     rip17,
     av18,
