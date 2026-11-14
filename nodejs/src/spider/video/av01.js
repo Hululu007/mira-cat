@@ -54,10 +54,6 @@ const HOT_TAGS = [
 const CLASSES = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'hottest', type_name: '热门' },
-  // LTX超清解码（2026-11-14，用户点名加在热门后）：站内真标签
-  // LTXモザイク破壊（id 3585301，中文名 LTX超清解码），13 部，番号带 -ltx
-  // 后缀（decensor_family ltx，去码版），走现成的 tag: 列表路。
-  { type_id: 'tag:3585301', type_name: 'LTX超清解码' },
 ].concat(NEW_TAGS).concat(HOT_TAGS);
 
 function t(v) {
@@ -350,7 +346,13 @@ async function home() {
   for (const x of tags) {
     if (!fixedIds[x.type_id]) rest.push(x);
   }
-  const cls = [{ type_id: 'latest', type_name: '最新' }, { type_id: 'hottest', type_name: '热门' }]
+  // LTX超清解码（2026-11-14，用户点名加在热门后）：站内真标签
+  // LTXモザイク破壊（id 3585301，中文名 LTX超清解码），13 部，番号带 -ltx
+  // 后缀（decensor_family ltx，去码版），走现成的 tag: 列表路。
+  // 注意：CLASSES 常量是死代码（home() 不用它），分类必须加在这里。
+  const LTX = { type_id: 'tag:3585301', type_name: 'LTX超清解码' };
+  fixedIds[LTX.type_id] = 1;
+  const cls = [{ type_id: 'latest', type_name: '最新' }, { type_id: 'hottest', type_name: '热门' }, LTX]
     .concat(NEW_TAGS).concat(rest);
   return { class: cls, filters: {} };
 }

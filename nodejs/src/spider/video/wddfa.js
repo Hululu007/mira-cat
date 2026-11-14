@@ -192,14 +192,16 @@ function headers() {
 }
 
 async function fetchOnce(url) {
+  // v5（2026-11-14）：单腿 20s + 20s = 最长 40s，App 等不到就先空了。
+  // 改 8s 快败，让并行竞速尽快落定。
   try {
-    const { data } = await req.get(url, { headers: headers(), timeout: 20000 });
+    const { data } = await req.get(url, { headers: headers(), timeout: 8000 });
     const html = String(data || '');
     if (html) return html;
   } catch (e) { /* fall through to fetch */ }
   try {
     if (typeof fetch === 'function') {
-      const r = await fetch(url, { headers: headers(), signal: AbortSignal.timeout(20000) });
+      const r = await fetch(url, { headers: headers(), signal: AbortSignal.timeout(8000) });
       if (r.ok) return await r.text();
     }
   } catch (e) { /* ignore */ }
@@ -231,23 +233,23 @@ function raceNonEmpty(promises) {
 }
 
 async function getHtml(url) {
-  // v4（2026-11-14）：v3 的直连 + jina 并行在手机上仍空。加自家 Worker 腿
-  // （site-fetch v5，白名单已加 wddfa 两域；手机连 workers.dev 是通的，
-  // wk:ok 已证；wddfa 不上 CF 墙，Worker 出口能正常抓）。三路并行竞速，
-  // 先回者赢；Worker 未部署前回 400，自动回落，不影响另两路。
-  let html = await raceNonEmpty([
-    (async () => { try { return await fetchOnce(url); } catch (e) { return ''; } })(),
-    (async () => { try { return await fetchOnce('https://r.jina.ai/' + url); } catch (e) { return ''; } })(),
-    (async () => { try { return await fetchOnce(FETCH_WORKER + '/?u=' + encodeURIComponent(url)); } catch (e) { return ''; } })(),
-  ]);
-  if (html) return html;
+  // v5（2026-11-14）：v4 仍空。两点改动：① 单腿改 8s 快败（见 fetchOnce），
+  // ② 备用域 18j.today 不再排队等（主域在手机网络上可能被拦，备用域走另
+  // 一条路），与主域一起并行竞速：主域直连/jina/Worker + 备用域直连/jina/
+  // Worker 六路，先回者赢。Worker 腿对 wddfa 目前回 502（CF 出口抓不到），
+  // 但它回得快，不拖竞速。
+  const jobs = [];
+  const add = (u) => {
+    jobs.push((async () => { try { return await fetchOnce(u); } catch (e) { return ''; } })());
+    jobs.push((async () => { try { return await fetchOnce('https://r.jina.ai/' + u); } catch (e) { return ''; } })());
+    jobs.push((async () => { try { return await fetchOnce(FETCH_WORKER + '/?u=' + encodeURIComponent(u)); } catch (e) { return ''; } })());
+  };
+  add(url);
   for (const alt of ALT_HOSTS) {
     const altUrl = url.replace(HOST, alt);
-    if (altUrl === url) continue;
-    html = await fetchOnce(altUrl);
-    if (html) return html;
+    if (altUrl !== url) add(altUrl);
   }
-  return '';
+  return await raceNonEmpty(jobs);
 }
 
 function t(v) {
