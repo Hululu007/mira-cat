@@ -3,7 +3,8 @@
 // 分类：19 个频道（顶级）+ 标签筛选卡片（前 40 热门标签）。
 // 列表：/latest 与各频道 ?page=N（频道 20 条/页，最新 30 条/页）；
 //   标签页 /tags/<tag>?page=N。封面 https://5lxtv.com/content-cover/<CODE>。
-// 播放：详情页取 slug/t/n -> /api/play/<slug>?t=<t>&n=<n>&hls=1
+// 播放：详情页取 slug/t/n -> /api/play/<slug>?t=<t>&n=<n>&hls=1，再走本地 /proxy/m3u8 改写
+//   （分片 .jpg + image/jpeg 建不起可拖动时间轴，代理出 .ts 后缀 + video/mp2t 修复从头播/快进）
 //   回单档 VOD m3u8（AES-128，密钥走 /api/hlskey，分片为 .jpg 伪装的加密 TS）。
 //   实测 CEAD-776 单档 720p（1280x720 h264），站内无多档位可供选择，
 //   故只出单行「720p」，不编造档位。play() 现取详情页拿新鲜 t/n。
@@ -227,6 +228,134 @@ function extractPlayParams(html) {
   return { slug, t: tt, n: nn };
 }
 
+// ---------- 本地清单代理（修“不能从头播、无法快进后退”） ----------
+// 病因：站方分片是 .jpg 后缀、回 Content-Type: image/jpeg，播放器建不起可拖动时间轴
+// （MissAV SQTE-727 同款病因，修法同款：本地清单改写 + 分片走代理出 .ts 后缀）。
+// 代理拉清单改写分片行走 /proxy/<b64>/<b64>.ts，KEY 行走 /proxy/m3u8?u=&r=；
+// 分片原样转发（AES-128 密文不动，由播放器拿 KEY 解），回 Content-Type: video/mp2t，支持 Range。
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+async function fetchBytes(url, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': referer || (HOST + '/'), 'Accept': '*/*' },
+      timeout: 20000,
+      responseType: 'arraybuffer',
+      validateStatus: () => true,
+    });
+    if (!r || r.status !== 200 || !r.data) return null;
+    return Buffer.isBuffer(r.data) ? r.data : Buffer.from(r.data);
+  } catch (e) {
+    try {
+      if (typeof fetch === 'function') {
+        const r = await fetch(url, { headers: { 'User-Agent': UA, 'Referer': referer || (HOST + '/') } });
+        if (!r || !r.ok) return null;
+        return Buffer.from(await r.arrayBuffer());
+      }
+    } catch (e2) {}
+    return null;
+  }
+}
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+function rewriteLxtvM3u8(raw, playlistUrl, selfBase, referer) {
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try {
+            const abs = new URL(uri, playlistUrl).toString();
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}"`;
+          } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    try {
+      const abs = new URL(s, playlistUrl).toString();
+      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}.ts`;
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
+}
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  try {
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+  try {
+    const buf = await fetchBytes(target, referer);
+    if (!buf || !buf.length) { reply.redirect(target); return; }
+    const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+    if (head.trimStart().startsWith('#EXTM3U')) {
+      reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(rewriteLxtvM3u8(buf.toString('utf8'), target, selfBase, referer));
+      return;
+    }
+    // 分片：AES-128 密文原样转发，不解密、不剥头；回 video/mp2t + Range，播放器凭 KEY 解。
+    const range = request?.headers && request.headers.range;
+    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      const start = Math.min(parseInt(m[1], 10) || 0, buf.length);
+      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
+      if (start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', 'bytes ' + start + '-' + end + '/' + buf.length);
+        reply.send(buf.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(buf);
+  } catch (e) {
+    try { reply.redirect(target); } catch (e2) { /* 已发送则忽略 */ }
+  }
+}
+
 async function detail(reqIn) {
   const body = (reqIn && reqIn.body) || {};
   const id = t(body.id || '');
@@ -263,9 +392,11 @@ async function play(reqIn) {
   const p = extractPlayParams(html);
   if (!p) return { parse: 1, url: durl };
   const playUrl = HOST + '/api/play/' + encodeURIComponent(p.slug) + '?t=' + p.t + '&n=' + encodeURIComponent(p.n) + '&hls=1';
+  // 清单走本地代理改写（分片出 .ts 后缀 + video/mp2t，否则播放器建不起可拖动时间轴）。
+  const proxied = proxyUrl(reqIn, '/proxy/m3u8', playUrl, durl) || playUrl;
   const res = {
     parse: 0,
-    url: playUrl,
+    url: proxied,
     header: {
       'User-Agent': UA,
       'Referer': durl,
@@ -746,6 +877,8 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
+      fastify.get('/proxy/*', m3u8Proxy);
     },
   };
 }
