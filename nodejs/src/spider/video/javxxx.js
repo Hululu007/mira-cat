@@ -150,6 +150,15 @@
 //    （另已坐实：live/tid 是每片稳定的——jina 两次取、Worker 取均同一 live
 //    串，tid 596077 不变；token 不绑 IP、不快过期。故断点不在 token 本身，
 //    而在手机侧取 token 或调 /resolve2 的某一步。）
+//  - v17（2026-11-14 第十三轮，v16 诊断 tk:jina r2:fail r:fail sp:fail）：
+//    token 通（jina），三条 Worker 腿全断。手机侧断点未坐实（Worker 不可达？
+//    抑或 POST/取 embed 亦断）。两处改动：
+//    ① 分段路脱 Worker：embed 页改直连取（streamhls，非 javxxx.me，不吃 CF
+//    墙；resolveEmbedInfo directOnly 已有），master 改走蜘蛛本地 /proxy/m3u8
+//    （24jav 同款：清单改写 + 分片剥 PNG 头；streamhls 分片实测 PNG 包裹，
+//    首字节 89 50 4e 47，直链必死，代理必不可少）。分段路至此全程不碰 Worker。
+//    ② 诊断升级：sp 分 post-fail/embed-fail/ok；新增 wk（手机能否直连 Worker
+//    根地址，2 秒探针）。
 //  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
 //    新路：直连详情页取 token。getBaseAll 的 HTML 回落腿（getHtmlOnly：Worker /f/ +
 //    直连 + fetch 竞速）本来就能取到详情页 HTML、parseDetailHtml 本来就能从中抽
@@ -918,22 +927,40 @@ function pickVariantFromEntry(entry, q) {
 //   → 命中 HLS 后经 /h 取 master 文本（白名单宿主）或裸取（maxstream 等非白名单宿主，
 //     裸 master 可直取且分片自带 AES-128 密钥，见 R5 probe_max）。
 // 任一步失败/超时回 null（调用方回单条“播放”）。不调 /resolve（死腿不等它）。
-async function getMasterEntrySplit(vid, live, tid, deadlineMs) {
+async function getMasterEntrySplit(vid, live, tid, deadlineMs, reqIn, diag) {
   var cached = masterCacheGet(vid);
   if (cached) return cached;
   try {
     var remain = function () { return Math.max(0, deadlineMs - Date.now()); };
     if (remain() < 1500) return null;
     var embeds = await decodeEmbedsSplit(vid, live, tid, deadlineMs);
-    if (!embeds || !embeds.length || remain() < 1500) return null;
-    var found = await scanEmbedsWorkerOnly(embeds, vid, deadlineMs);
-    if (!found || found.kind !== 'hls' || !found.url) return null;
-    var masterH = found.url;
-    var entry = await entryFromMasterUrl(masterH, deadlineMs);
-    if (!entry || !entry.variants || !entry.variants.length || remain() < 500) return null;
+    if (!embeds || !embeds.length) { if (diag) diag.sp = 'post-fail'; return null; }
+    if (remain() < 1500) return null;
+    // v17：Worker 扫 + 直连扫并行竞速（直连扫不碰 Worker）。
+    var cap = Math.max(1000, remain());
+    var found = await firstSuccess([
+      scanEmbedsWorkerOnly(embeds, vid, deadlineMs),
+      scanEmbedsDirect(embeds, vid, deadlineMs),
+    ], cap);
+    if (!found || found.kind !== 'hls' || !found.url) { if (diag) diag.sp = 'embed-fail'; return null; }
+    var entry = null;
+    if (found.direct) {
+      // 直连 master：包本地代理（清单改写 + 分片剥 PNG 头），变体地址即代理地址。
+      var purl = proxyUrl(reqIn, '/proxy/m3u8', found.url, found.referer || vid);
+      if (!purl) { if (diag) diag.sp = 'embed-fail'; return null; }
+      var ev = await entryFromMasterUrl(found.url, deadlineMs);
+      var h = (ev && ev.variants && ev.variants.length && ev.variants[0].h)
+        || (masterHostOf(found.url) === 'streamhls.click' ? 720 : 0);
+      if (!h) { if (diag) diag.sp = 'embed-fail'; return null; }
+      entry = { masterHUrl: purl, variants: [{ h: h, url: purl }] };
+    } else {
+      entry = await entryFromMasterUrl(found.url, deadlineMs);
+    }
+    if (!entry || !entry.variants || !entry.variants.length || remain() < 500) { if (diag) diag.sp = 'embed-fail'; return null; }
     masterCacheSet(vid, entry);
+    if (diag) diag.sp = 'ok';
     return entry;
-  } catch (e) { return null; }
+  } catch (e) { if (diag) diag.sp = 'err'; return null; }
 }
 
 // 详情/播放/embed 用：只走 HTML 腿（Worker /f/ + 直连 + fetch）。
@@ -1287,17 +1314,61 @@ async function scanEmbedsWorkerOnly(embeds, detailUrl, deadlineMs) {
   });
 }
 
+// v17：直连扫 embed（不碰 Worker）——embed 页直连取（streamhls，非 javxxx.me，
+// 不吃 CF 墙；resolveEmbedInfo directOnly 已有）。回 {url: 直链 master, kind, referer, direct:true}。
+async function scanEmbedsDirect(embeds, detailUrl, deadlineMs) {
+  var total = embeds.length;
+  if (!total) return null;
+  var cap = Math.max(1000, deadlineMs - Date.now());
+  return new Promise(function (resolve) {
+    var done = 0, anyHls = null, mp4First = null, settled = false;
+    var timer = setTimeout(function () {
+      if (!settled) { settled = true; resolve(anyHls || mp4First); }
+    }, cap);
+    function finish(v) { if (!settled) { settled = true; clearTimeout(timer); resolve(v); } }
+    function onSettled(info) {
+      if (settled) return;
+      done++;
+      if (info && info.kind === 'hls') {
+        if (!anyHls) anyHls = info;
+        finish(info); return;
+      } else if (info && info.kind === 'mp4' && !mp4First) {
+        mp4First = info;
+      }
+      if (done >= total) finish(anyHls || mp4First);
+    }
+    embeds.forEach(function (e) {
+      resolveEmbedInfo(e, detailUrl, true).then(function (inf) {
+        if (!inf || !inf.file) return onSettled(null);
+        var isHls = inf.type === 'hls' || /\.m3u8(\?|#|$)/i.test(inf.file);
+        onSettled(isHls
+          ? { url: inf.file, kind: 'hls', referer: absUrl(e), raw: inf.file, direct: true }
+          : { url: inf.file, kind: 'mp4', referer: absUrl(e), direct: true });
+      }).catch(function () { onSettled(null); });
+    });
+  });
+}
+
 // 分段路（v9 主路）：详情页 → 最终播放地址（现取现播）。
 // token（调用方传入或缓存）→ /api/play/ 直发 → Worker /f/ 并行扫 embed（HLS 优先）
 // → 白名单 HLS 包 /h（分片走 /s 剥 PNG 头），非白名单 HLS 裸回（maxstream 同款）。
 // 返回 {url, kind:'hls'|'mp4', referer} 或 ''。mp4 不在这里出（Worker 腿的 mp4 绑 Worker IP）。
-async function resolvePlaySplit(detailUrl, live, tid, deadlineMs) {
+async function resolvePlaySplit(detailUrl, live, tid, deadlineMs, reqIn) {
   var embeds = await decodeEmbedsSplit(detailUrl, live, tid, deadlineMs);
   if (!embeds || !embeds.length) return '';
   if (Date.now() >= deadlineMs - 1000) return '';
-  var found = await scanEmbedsWorkerOnly(embeds, detailUrl, deadlineMs);
-  if (found && found.kind === 'hls') return found;
-  return '';
+  var cap = Math.max(1000, deadlineMs - Date.now());
+  var found = await firstSuccess([
+    scanEmbedsWorkerOnly(embeds, detailUrl, deadlineMs),
+    scanEmbedsDirect(embeds, detailUrl, deadlineMs),
+  ], cap);
+  if (!found || found.kind !== 'hls') return '';
+  if (found.direct) {
+    var purl = proxyUrl(reqIn, '/proxy/m3u8', found.url, found.referer || detailUrl);
+    if (!purl) return '';
+    return { url: purl, kind: 'hls', referer: found.referer || detailUrl };
+  }
+  return found;
 }
 
 // mp4 兜底（v9）：纯直连并行重取 embed（只找 mp4），先拿到的赢；直连取到的 mp4 才绑手机 IP。
@@ -1347,6 +1418,133 @@ async function category(reqIn) {
   var pc = list.length >= 20 ? page + 1 : page;
   return { page: page, pagecount: pc, limit: 20, total: 999, list: list };
 }
+
+// ---------------- v17：蜘蛛本地 /proxy/m3u8（24jav 同款，剥 PNG 头） ----------------
+// streamhls 分片是 PNG 包裹的 TS（首字节 89 50 4e 47），播放器直触建不起时间轴；
+// 代理只做两件事：清单改写（子清单/音频轨/分片行全部指回代理）、分片字节透传时剥头。
+// 地址形态（24jav/Ero 同款，手机实测）：master/variant 行走查询串
+//   {dynamic}/spider/py_javxxx/3/proxy/m3u8?u={b64 目标}&r={b64 referer}；
+// 分片行走路径段形式并在末尾加 .ts 后缀（过 ffmpeg 分片后缀白名单）。
+// b64url / b64urlDecode 复用文件已有定义（第 238 / 789 行）。
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    var server = reqIn && reqIn.server;
+    var dynamic = (server && server.address && server.address() && server.address().dynamic) || 'js2p://_WEB_';
+    var prefix = (server && server.prefix) || ('/spider/' + KEY + '/3');
+    return dynamic + prefix + path + '?u=' + b64url(targetUrl) + '&r=' + b64url(referer || '');
+  } catch (e) { return ''; }
+}
+async function fetchBytes(url, referer) {
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      var r = await req.get(url, {
+        headers: { 'User-Agent': UA, 'Referer': referer || HOST + '/' },
+        timeout: 30000,
+        responseType: 'arraybuffer',
+        validateStatus: function () { return true; },
+      });
+      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+    } catch (e) { /* 重试，落空走 302 降级 */ }
+  }
+  return null;
+}
+function stripPngPrefix(buf) {
+  if (!buf || !buf.length) return buf;
+  if (buf[0] === 0x47) return buf;
+  for (var off = 0; off + 376 < buf.length; off++) {
+    if (buf[off] === 0x47 && buf[off + 188] === 0x47 && buf[off + 376] === 0x47) {
+      return buf.subarray(off);
+    }
+  }
+  return buf;
+}
+function rewriteJavxxxM3u8(raw, playlistUrl, selfBase, referer) {
+  var isMaster = String(raw).indexOf('#EXT-X-STREAM-INF') !== -1;
+  var lines = String(raw).split(/\r?\n/);
+  var out = lines.map(function (line) {
+    var s = line.trim();
+    if (!s) return line;
+    if (s.charAt(0) === '#') {
+      if (s.indexOf('URI="') !== -1) {
+        return line.replace(/URI="([^"]+)"/g, function (all, uri) {
+          try {
+            var abs = new URL(uri, playlistUrl).toString();
+            return 'URI="' + selfBase + '/proxy/m3u8?u=' + b64url(abs) + '&r=' + b64url(referer || '') + '"';
+          } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    try {
+      var abs = new URL(s, playlistUrl).toString();
+      if (isMaster) return selfBase + '/proxy/m3u8?u=' + b64url(abs) + '&r=' + b64url(referer || '');
+      return selfBase + '/proxy/' + b64url(abs) + '/' + b64url(referer || '-') + '.ts';
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
+}
+async function m3u8Proxy(request, reply) {
+  var q = (request && request.query) || {};
+  var uEnc = q.u || '';
+  var rEnc = q.r || '';
+  if (!uEnc) {
+    var wild = request && request.params && request.params['*'];
+    var segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      var rawPath = String((request && request.raw && request.raw.url) || (request && request.url) || '').split('?')[0];
+      var pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
+  var target = '';
+  var referer = HOST + '/';
+  try {
+    target = b64urlDecode(uEnc);
+    if (rEnc && rEnc !== '-') referer = b64urlDecode(rEnc) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  var host = request.headers && request.headers.host;
+  var selfBase = host
+    ? 'http://' + host + '/spider/' + KEY + '/3'
+    : ('/spider/' + KEY + '/3');
+  try {
+    var buf = await fetchBytes(target, referer);
+    if (!buf || !buf.length) { reply.redirect(target); return; }
+    var head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+    if (head.trimStart().indexOf('#EXTM3U') === 0) {
+      reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(rewriteJavxxxM3u8(buf.toString('utf8'), target, selfBase, referer));
+      return;
+    }
+    var ts = stripPngPrefix(buf);
+    var range = request && request.headers && request.headers.range;
+    var m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      var start = Math.min(parseInt(m[1], 10) || 0, ts.length);
+      var end = m[2] ? Math.min(parseInt(m[2], 10), ts.length - 1) : ts.length - 1;
+      if (start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', 'bytes ' + start + '-' + end + '/' + ts.length);
+        reply.send(ts.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(ts);
+  } catch (e) {
+    reply.code(502).send('proxy failed');
+  }
+}
+
 async function detail(reqIn) {
   var body = (reqIn && reqIn.body) || {};
   var vid = String(body.id || '').trim();
@@ -1364,7 +1562,7 @@ async function detail(reqIn) {
   var baseP = getBaseAll(vid, detailDeadline, jinaDetailP);
   // 档位发现与基础取数并行起跑（共用 tokenP，不等基础取数先结算）。
   var entryP = tokenP.then(function (tk) {
-    return getMasterEntrySplit(vid, tk.live, tk.tid, detailDeadline);
+    return getMasterEntrySplit(vid, tk.live, tk.tid, detailDeadline, reqIn, diag);
   }).catch(function () { return null; });
   // v14：/resolve 也参与档位发现（全 Worker 链，与分段路并行竞速，先出变体者赢）。
   // 分段路在手机上常因 token/直发被墙而空手，/resolve 在好 colo 上 2-7s 即出 master；
@@ -1379,7 +1577,14 @@ async function detail(reqIn) {
   })();
   // v16：resolve2EntryP 改成 tokenP.then 链式创建（与 entryP、resolveEntryP 同时起跑，
   // token 一到即发 /resolve2，不再等 `await tokenP` 之后才创建）。
-  var diag = { tk: '', r2: '', r: '', sp: '' };
+  var diag = { tk: '', r2: '', r: '', sp: '', wk: '' };
+  // v17：Worker 可达性探针（手机能否直连 Worker 根地址，2.5 秒封顶，与其它腿并行）。
+  var wkP = (async function () {
+    try {
+      var wr = await withTimeout(req.get(FETCH_WORKER + '/', { headers: headers(), timeout: 2500 }), 2500, null);
+      return (wr && wr.status === 200) ? 'ok' : 'no';
+    } catch (e) { return 'no'; }
+  })();
   var resolve2EntryP = tokenP.then(function (tk2) {
     return (async function () {
       try {
@@ -1402,6 +1607,7 @@ async function detail(reqIn) {
   diag.tk = (tk.via || '-') ;
   if (live && tid) tokenCacheSet(vid, live, tid, tk.via);
   var base = await withTimeout(baseP, Math.max(500, detailDeadline - Date.now()), { name: '', pic: '', desc: '' });
+  diag.wk = await wkP;
   var name = base.name;
   var pic = base.pic;
   var desc = base.desc;
@@ -1425,7 +1631,7 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: desc,
       vod_play_from: NAME,
-      vod_remarks: 'tk:' + (diag.tk || '-') + ' r2:' + (diag.r2 || '-') + ' r:' + (diag.r || '-') + ' sp:' + (diag.sp || '-'),
+      vod_remarks: 'tk:' + (diag.tk || '-') + ' r2:' + (diag.r2 || '-') + ' r:' + (diag.r || '-') + ' sp:' + (diag.sp || '-') + ' wk:' + (diag.wk || '-'),
       vod_play_url: playUrl,
     }],
   };
@@ -1488,7 +1694,7 @@ async function play(reqIn) {
     return (async function () {
       try {
         if (!tk.live || !tk.tid) return null;
-        var r = await resolvePlaySplit(id, tk.live, tk.tid, playDeadline);
+        var r = await resolvePlaySplit(id, tk.live, tk.tid, playDeadline, reqIn);
         if (r && r.url) return { url: r.url, kind: r.kind, referer: r.referer || (HOST + '/'), via: 'split' };
       } catch (e) {}
       return null;
@@ -1933,6 +2139,8 @@ export default function createSpider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
+      fastify.get('/proxy/*', m3u8Proxy);
     },
   };
 }

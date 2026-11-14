@@ -204,6 +204,9 @@ async function fetchOnce(url) {
   return '';
 }
 
+// 2026-11-14 v2：列表空（用户报分类出、内容无）。站方本身正常（/luckily/ 实测
+// 200、274KB、112 条，解析也通），断在手机侧直连取页。getHtml 加 jina 兜底
+// 通道（r.jina.ai 取 /luckily/ 实测 200、112 条，无验证墙），直连失败时走 jina。
 // 主站取不到 (超时/空回/域名失效) 时换备用域重试; 与 seniu 的 ALT_HOSTS 同款写法
 async function getHtml(url) {
   let html = await fetchOnce(url);
@@ -214,6 +217,12 @@ async function getHtml(url) {
     html = await fetchOnce(altUrl);
     if (html) return html;
   }
+  // jina 兜底（2026-11-14）：直连与备用域都空手时走 r.jina.ai（取 /luckily/
+  // 实测 200、112 条，无验证墙）。jina 返回完整 HTML，parseList 直接可用。
+  try {
+    html = await fetchOnce('https://r.jina.ai/' + url);
+    if (html) return html;
+  } catch (e) { /* fall through */ }
   return '';
 }
 

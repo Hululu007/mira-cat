@@ -13,7 +13,11 @@ const HOST = 'https://nfu.rftsln9.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // API 服务器列表（从站点 JS 逆向得到）
+// 2026-11-14 v2：列表空（用户报加载不出内容）。原 4 个 API_HOST 全死
+// （aa3/hlo/iv4 超时、zje 403），入口域 utv2.cc 的 API 实测 200、code 200。
+// 把 utv2.cc 放第一位（apiCall 按顺序取首个 code 200 者），原 4 个保留作后备。
 const API_HOSTS = [
+  'https://utv2.cc',
   'https://aa3.aa36jn.com:52000',
   'https://zje.zje0cx.com:52000',
   'https://hlo.hlos8o.com:52000',
