@@ -129,6 +129,18 @@
 //    b) detail() 的档位发现并行两路——分段路与 /resolve（取 /h master 现解析变体），
 //    先出变体者赢并缓存，play() 即可 0 秒出线；detail() 有 12s，比 play() 的 8s 更能
 //    等到 /resolve 结算。
+//  - v15（2026-11-14 第十一轮，用户令“多参考 javrate”）：照 JavRate v5/v7 的修法重做。
+//    JavRate 当年同毛病（详情只剩一集“正片”、无 1080p/720p/自适应）是这么修好的：
+//    ① 详情页凭 bare 地址直接出三集档位行，不取 master 现解析（v5：play() 不再取
+//    master，变体地址按实测形态直接构造）；② HTML 腿死时凭番号调 /api/hot 取 bare
+//    （v7，绕开已死的详情 HTML 腿）。javxxx 照搬：
+//    a) 详情档位行不再取 master 文本现解析——拿到 master 地址即出档位行
+//    （streamhls 单档 720p 已实测两部片皆单变体 1280x720，变体地址即 master 本身，
+//    播放器取 master 自适应；其余宿主仍取 master 文本解析作回落）；
+//    b) 新增 Worker /resolve2（javxxx-fetch v6，需用户部署）：手机把 jina 详情页
+//    取到的 live/tid 交给 Worker，Worker 只做 /api/play/ POST + embed 取页，不再
+//    自己取详情 HTML（JavRate Worker v2 模式：/api/ 墙比 HTML 墙弱；/resolve 的
+//    HTML 取页是坏 colo 抽奖）。分段路、/resolve、/resolve2 三路并行竞速。
 //  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
 //    新路：直连详情页取 token。getBaseAll 的 HTML 回落腿（getHtmlOnly：Worker /f/ +
 //    直连 + fetch 竞速）本来就能取到详情页 HTML、parseDetailHtml 本来就能从中抽
@@ -727,6 +739,83 @@ async function getResolve(detailUrl) {
   try { return await getResolveOnce(detailUrl); } catch (e) { return null; }
 }
 
+// ---------- v15：/resolve2（手机供 token）与“master 地址即出档位” ----------
+// /resolve2：GET FETCH_WORKER + '/resolve2?u=<详情页>&live=<live>&tid=<tid>'。
+// 手机把 jina 详情页取到的 live/tid 交给 Worker，Worker 只做 /api/play/ POST +
+// embed 取页，不取详情 HTML（JavRate Worker v2 模式）。未部署 v6 时 404 速败。
+function viaResolve2(live, tid, detailUrl) {
+  return FETCH_WORKER + '/resolve2?u=' + encodeURIComponent(detailUrl)
+    + '&live=' + encodeURIComponent(live) + '&tid=' + encodeURIComponent(tid);
+}
+async function getResolve2(live, tid, detailUrl, deadlineMs) {
+  var target = viaResolve2(live, tid, detailUrl);
+  var cap = deadlineMs ? Math.max(1000, deadlineMs - Date.now()) : 8000;
+  var jobs = [];
+  jobs.push((async function () {
+    try {
+      var r = await withTimeout(req.get(target, { headers: headers(), timeout: cap }), cap, null);
+      if (!r || r.status !== 200) return null;
+      return parseResolveObj(r.data);
+    } catch (e) { return null; }
+  })());
+  if (typeof fetch === 'function') {
+    jobs.push((async function () {
+      try {
+        var ctrl = null;
+        try { if (typeof AbortController === 'function') ctrl = new AbortController(); } catch (e) {}
+        var timer = setTimeout(function () { try { if (ctrl) ctrl.abort(); } catch (e) {} }, cap);
+        try {
+          var r2 = await fetch(target, { headers: headers(), signal: ctrl ? ctrl.signal : undefined });
+          if (!r2 || r2.status !== 200) return null;
+          var t2 = await withTimeout(r2.text(), cap, '');
+          return parseResolveObj(t2);
+        } finally { clearTimeout(timer); }
+      } catch (e) { return null; }
+    })());
+  }
+  var won = await firstSuccess(jobs, cap);
+  return won || null;
+}
+// base64url 解码（Cat 运行时有 Buffer）。/h 地址的 u 参数是 b64url 编码的真 master 地址。
+function b64urlDecode(str) {
+  try {
+    var b = String(str || '').replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) b += '=';
+    return Buffer.from(b, 'base64').toString('utf8');
+  } catch (e) { return ''; }
+}
+// master 地址的真实宿主：/h 地址解 u 参数，其余取自身 host。
+function masterHostOf(masterHUrl) {
+  var u = String(masterHUrl || '');
+  try {
+    if (/\/h\?u=/.test(u)) {
+      var m = u.match(/[?&]u=([^&]+)/);
+      if (m) {
+        var real = b64urlDecode(decodeURIComponent(m[1]));
+        if (real) return new URL(real).hostname.toLowerCase();
+      }
+    }
+    return new URL(u).hostname.toLowerCase();
+  } catch (e) { return ''; }
+}
+// v15（JavRate v5 模式）：拿到 master 地址即出档位行，不取 master 文本现解析。
+// streamhls 单档 720p 已实测（DASS-027、SAME-155 皆单变体 1280x720），变体地址即
+// master 本身（播放器取 master 自适应）；其余宿主仍取 master 文本解析作回落。
+async function entryFromMasterUrl(masterHUrl, deadlineMs) {
+  if (!masterHUrl) return null;
+  var host = masterHostOf(masterHUrl);
+  if (host === 'streamhls.click') {
+    return { masterHUrl: masterHUrl, variants: [{ h: 720, url: masterHUrl }] };
+  }
+  try {
+    var txt = await fetchMasterText(masterHUrl, Math.min(5000, Math.max(1000, deadlineMs ? deadlineMs - Date.now() : 5000)));
+    if (!txt) return null;
+    var vs = parseHlsVariants(txt, masterHUrl);
+    if (!vs.length) return null;
+    return { masterHUrl: masterHUrl, variants: vs };
+  } catch (e) { return null; }
+}
+
 // 本地链 / 直链分支拿到的 HLS 裸地址包一层 Worker /h（只认 Worker /h 白名单里的
 // HLS 宿主 pianopic/streamhls/cloudatacdn——/h 的 isVideoHost 三家都认；其余宿主
 // /h 会 400，不如裸奔，故只包这三家；已是 /h 地址的不重复包）。
@@ -831,10 +920,8 @@ async function getMasterEntrySplit(vid, live, tid, deadlineMs) {
     var found = await scanEmbedsWorkerOnly(embeds, vid, deadlineMs);
     if (!found || found.kind !== 'hls' || !found.url) return null;
     var masterH = found.url;
-    var txt = await fetchMasterText(masterH, Math.min(5000, remain()));
-    if (!txt || remain() < 500) return null;
-    var vs = parseHlsVariants(txt, masterH);
-    var entry = { masterHUrl: masterH, variants: vs };
+    var entry = await entryFromMasterUrl(masterH, deadlineMs);
+    if (!entry || !entry.variants || !entry.variants.length || remain() < 500) return null;
     masterCacheSet(vid, entry);
     return entry;
   } catch (e) { return null; }
@@ -1278,17 +1365,23 @@ async function detail(reqIn) {
       var rv = await withTimeout(getResolve(vid), Math.max(1000, detailDeadline - Date.now()), null);
       if (!rv || !rv.url) return null;
       if (rv.kind !== 'hls' && !/\.m3u8(\?|#|$)/i.test(rv.url)) return null;
-      var txt = await fetchMasterText(rv.url, Math.min(5000, Math.max(1000, detailDeadline - Date.now())));
-      if (!txt) return null;
-      var vs = parseHlsVariants(txt, rv.url);
-      if (!vs.length) return null;
-      return { masterHUrl: rv.url, variants: vs };
+      return await entryFromMasterUrl(rv.url, detailDeadline);
     } catch (e) { return null; }
   })();
   var tk = await tokenP;
   var live = tk.live;
   var tid = tk.tid;
   if (live && tid) tokenCacheSet(vid, live, tid, tk.via);
+  // v15：/resolve2 路（手机供 token，Worker 只 POST + 取 embed）。token 未拿到则此路为空。
+  var resolve2EntryP = (async function () {
+    try {
+      if (!live || !tid) return null;
+      var rv2 = await withTimeout(getResolve2(live, tid, vid, detailDeadline), Math.max(1000, detailDeadline - Date.now()), null);
+      if (!rv2 || !rv2.url) return null;
+      if (rv2.kind !== 'hls' && !/\.m3u8(\?|#|$)/i.test(rv2.url)) return null;
+      return await entryFromMasterUrl(rv2.url, detailDeadline);
+    } catch (e) { return null; }
+  })();
   var base = await withTimeout(baseP, Math.max(500, detailDeadline - Date.now()), { name: '', pic: '', desc: '' });
   var name = base.name;
   var pic = base.pic;
@@ -1300,7 +1393,7 @@ async function detail(reqIn) {
   // v10：档位行。有几档出几行（master 变体表实测值，不编造）；取不到变体回单条“播放”。
   var playUrl = '播放$' + vid;
   try {
-    var entry = await firstSuccess([entryP, resolveEntryP], Math.max(1000, detailDeadline - Date.now()));
+    var entry = await firstSuccess([entryP, resolveEntryP, resolve2EntryP], Math.max(1000, detailDeadline - Date.now()));
     if (entry && entry.variants && entry.variants.length) {
       masterCacheSet(vid, entry);
       playUrl = entry.variants.map(function (v) { return v.h + 'p$' + vid + '|q=' + v.h; }).join('#');
@@ -1391,7 +1484,20 @@ async function play(reqIn) {
     } catch (e) {}
     return null;
   })();
-  var won = await firstSuccess([splitJob, resolveJob], Math.max(1000, playDeadline - Date.now()));
+  var resolve2Job = tokenP.then(function (tk) {
+    return (async function () {
+      try {
+        if (!tk.live || !tk.tid) return null;
+        var rv2 = await withTimeout(getResolve2(tk.live, tk.tid, id, playDeadline), Math.max(1000, playDeadline - Date.now()), null);
+        if (rv2 && rv2.url) {
+          var kind2 = rv2.kind === 'mp4' ? 'mp4' : (rv2.kind === 'hls' ? 'hls' : (/\.m3u8(\?|#|$)/i.test(rv2.url) ? 'hls' : 'mp4'));
+          return { url: rv2.url, kind: kind2, referer: HOST + '/', via: 'resolve2' };
+        }
+      } catch (e) {}
+      return null;
+    })();
+  });
+  var won = await firstSuccess([splitJob, resolveJob, resolve2Job], Math.max(1000, playDeadline - Date.now()));
   if (won && won.url) {
     var finalUrl = won.url;
     var referer = won.referer || (HOST + '/');
