@@ -119,6 +119,16 @@
 //    修法（只改蜘蛛，不部署）：getTokenAll 改为 direct 优先——先试直连（短预算），拿到即赢；
 //    直连失败再并行 Worker + jina 回落（异 IP token 直发或成或败，/resolve 路并行兜底）。
 //    token 缓存记 via 备查。分段路与 /resolve 两路并行竞速，先赢者出线。
+//  - v14（2026-11-14 第十轮）：修第九轮真机反馈“仍无档位、只有‘播放’、无法播放”。新定性
+//    （/diag 现测）：Worker 链本身是活的——/j/detail ok:true 有 live/tid，/resolve ok:true
+//    回 /h master（streamhls 720p 变体，VM 侧 /h 取 master 200 真播单）；死的是手机端。
+//    两点：① v13 的 direct 先试（5s 串行）会拖慢回落——直连腿若半天不回，12s 预算先吃
+//    一半；② 档位发现只走分段路（detail），/resolve 只在 play()（8s）里跑，手机上链路
+//    慢时 8s 常等不到它，详情页便永远不出档位。修法（只改蜘蛛，不部署）：
+//    a) getTokenAll 改三腿并行 + direct 1.5s 宽限（并行不拖时间，宽限保 direct 优先）；
+//    b) detail() 的档位发现并行两路——分段路与 /resolve（取 /h master 现解析变体），
+//    先出变体者赢并缓存，play() 即可 0 秒出线；detail() 有 12s，比 play() 的 8s 更能
+//    等到 /resolve 结算。
 //  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
 //    新路：直连详情页取 token。getBaseAll 的 HTML 回落腿（getHtmlOnly：Worker /f/ +
 //    直连 + fetch 竞速）本来就能取到详情页 HTML、parseDetailHtml 本来就能从中抽
@@ -584,45 +594,56 @@ async function getJsonDetailAny(vid) {
   } catch (e) { return null; }
 }
 
-// token（v13）：direct 优先，Worker/jina 只作回落。
-// direct token 是唯一能保证手机 /api/play/ 直发通过的（live/tid 绑取页方 IP）；
-// 旧版三腿竞速“先拿到者赢”恒让更快的 Worker/jina token 赢，再拿去直发即异 IP。
-// 先试直连（短预算，挑战页速败不拖时间）；直连失败再并行 Worker + jina（v12 同款）。
-// jinaDetailP 参数保留（调用方签名不变），回落腿复用它，不重复发 jina。
+// token（v14）：三腿并行竞速，direct 优先（1.5s 宽限）。
+// v13 的 direct 先试（5s 串行）会拖慢回落：直连腿若半天不回，12s 预算先吃一半。
+// 并行 + 宽限两全：direct 若先到直接赢；Worker/jina 若先到，等 1.5s 看 direct 来不来，
+// 来则用 direct，不来则用先到的；宽限内无 token 则继续等到 deadline（v12 同款回落）。
 async function getTokenAll(vid, deadlineMs, jinaDetailP) {
-  var capD = deadlineMs ? Math.max(1500, Math.min(5000, deadlineMs - Date.now())) : 5000;
-  try {
-    var dt = await withTimeout(getDirectToken(vid, deadlineMs), capD, null);
-    if (dt && dt.live && dt.tid) return { live: dt.live, tid: dt.tid, via: 'direct' };
-  } catch (e) {}
-  if (deadlineMs && Date.now() >= deadlineMs - 1500) return { live: '', tid: '', via: '' };
-  var jobs = [];
-  jobs.push((async function () {
+  var directP = (async function () {
     try {
-      var capW = deadlineMs ? Math.max(1500, Math.min(8000, deadlineMs - Date.now())) : 8000;
-      var jd = await withTimeout(getJsonDetail(vid), capW, null);
-      if (jd && jd.live && jd.tid) return { live: jd.live, tid: jd.tid, via: 'worker' };
-      if (deadlineMs && Date.now() < deadlineMs - 2000) {
-        var jd2 = await withTimeout(getJsonDetail(vid), Math.max(1500, Math.min(8000, deadlineMs - Date.now())), null);
-        if (jd2 && jd2.live && jd2.tid) return { live: jd2.live, tid: jd2.tid, via: 'worker-retry' };
-      }
+      var dt = await getDirectToken(vid, deadlineMs);
+      if (dt && dt.live && dt.tid) return { live: dt.live, tid: dt.tid, via: 'direct' };
     } catch (e) {}
     return null;
-  })());
-  jobs.push((async function () {
-    try {
-      var jt = jinaDetailP ? await jinaDetailP : await getJinaDetail(vid, deadlineMs);
-      if (jt && jt.live && jt.tid) return { live: jt.live, tid: jt.tid, via: 'jina' };
-      if (jinaDetailP && deadlineMs && Date.now() < deadlineMs - 2000) {
-        var jt2 = await getJinaDetail(vid, deadlineMs);
-        if (jt2 && jt2.live && jt2.tid) return { live: jt2.live, tid: jt2.tid, via: 'jina-retry' };
-      }
-    } catch (e) {}
-    return null;
-  })());
-  var cap = deadlineMs ? Math.max(1000, deadlineMs - Date.now()) : 6000;
-  var won = await firstSuccess(jobs, cap);
-  return won || { live: '', tid: '', via: '' };
+  })();
+  var otherP = (async function () {
+    var jobs = [];
+    jobs.push((async function () {
+      try {
+        var capW = deadlineMs ? Math.max(1500, Math.min(8000, deadlineMs - Date.now())) : 8000;
+        var jd = await withTimeout(getJsonDetail(vid), capW, null);
+        if (jd && jd.live && jd.tid) return { live: jd.live, tid: jd.tid, via: 'worker' };
+        if (deadlineMs && Date.now() < deadlineMs - 2000) {
+          var jd2 = await withTimeout(getJsonDetail(vid), Math.max(1500, Math.min(8000, deadlineMs - Date.now())), null);
+          if (jd2 && jd2.live && jd2.tid) return { live: jd2.live, tid: jd2.tid, via: 'worker-retry' };
+        }
+      } catch (e) {}
+      return null;
+    })());
+    jobs.push((async function () {
+      try {
+        var jt = jinaDetailP ? await jinaDetailP : await getJinaDetail(vid, deadlineMs);
+        if (jt && jt.live && jt.tid) return { live: jt.live, tid: jt.tid, via: 'jina' };
+        if (jinaDetailP && deadlineMs && Date.now() < deadlineMs - 2000) {
+          var jt2 = await getJinaDetail(vid, deadlineMs);
+          if (jt2 && jt2.live && jt2.tid) return { live: jt2.live, tid: jt2.tid, via: 'jina-retry' };
+        }
+      } catch (e) {}
+      return null;
+    })());
+    var cap = deadlineMs ? Math.max(1000, deadlineMs - Date.now()) : 6000;
+    return await firstSuccess(jobs, cap);
+  })();
+  var capAll = deadlineMs ? Math.max(1000, deadlineMs - Date.now()) : 6000;
+  var first = await firstSuccess([directP, otherP], capAll);
+  if (!first) return { live: '', tid: '', via: '' };
+  if (first.via === 'direct') return first;
+  var grace = deadlineMs ? Math.max(0, Math.min(1500, deadlineMs - Date.now())) : 1500;
+  if (grace > 0) {
+    var d = await withTimeout(directP, grace, null);
+    if (d && d.live && d.tid) return d;
+  }
+  return first;
 }
 
 // 基础信息（名/图/简介）并行三腿：Worker /j/detail（notoken 也带名图）、蜘蛛 jina 详情页
@@ -1249,6 +1270,21 @@ async function detail(reqIn) {
   var entryP = tokenP.then(function (tk) {
     return getMasterEntrySplit(vid, tk.live, tk.tid, detailDeadline);
   }).catch(function () { return null; });
+  // v14：/resolve 也参与档位发现（全 Worker 链，与分段路并行竞速，先出变体者赢）。
+  // 分段路在手机上常因 token/直发被墙而空手，/resolve 在好 colo 上 2-7s 即出 master；
+  // play() 只有 8s 常等不到它，detail() 有 12s，把它挪到详情页发现并缓存，play() 即可 0 秒出线。
+  var resolveEntryP = (async function () {
+    try {
+      var rv = await withTimeout(getResolve(vid), Math.max(1000, detailDeadline - Date.now()), null);
+      if (!rv || !rv.url) return null;
+      if (rv.kind !== 'hls' && !/\.m3u8(\?|#|$)/i.test(rv.url)) return null;
+      var txt = await fetchMasterText(rv.url, Math.min(5000, Math.max(1000, detailDeadline - Date.now())));
+      if (!txt) return null;
+      var vs = parseHlsVariants(txt, rv.url);
+      if (!vs.length) return null;
+      return { masterHUrl: rv.url, variants: vs };
+    } catch (e) { return null; }
+  })();
   var tk = await tokenP;
   var live = tk.live;
   var tid = tk.tid;
@@ -1264,8 +1300,9 @@ async function detail(reqIn) {
   // v10：档位行。有几档出几行（master 变体表实测值，不编造）；取不到变体回单条“播放”。
   var playUrl = '播放$' + vid;
   try {
-    var entry = await withTimeout(entryP, Math.max(1000, detailDeadline - Date.now()), null);
+    var entry = await firstSuccess([entryP, resolveEntryP], Math.max(1000, detailDeadline - Date.now()));
     if (entry && entry.variants && entry.variants.length) {
+      masterCacheSet(vid, entry);
       playUrl = entry.variants.map(function (v) { return v.h + 'p$' + vid + '|q=' + v.h; }).join('#');
     }
   } catch (e) {}
