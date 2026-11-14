@@ -95,7 +95,6 @@ import javxxx from './spider/video/javxxx.js';
 import littlepervert from './spider/video/littlepervert.js';
 import madouai from './spider/video/madouai.js';
 import px8x from './spider/video/px8x.js';
-import wddfa from './spider/video/wddfa.js';
 import wukong from './spider/video/wukong.js';
 import rdd22 from './spider/video/rdd22.js';
 import javass from './spider/video/javass.js';
@@ -221,7 +220,6 @@ const spiders = [
     topjav,
     ultra,
     uu_video,
-    wddfa,
     wukong,
     xingmengasmr,
     xnxx,
