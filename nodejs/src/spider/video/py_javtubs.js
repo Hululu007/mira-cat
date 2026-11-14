@@ -1,0 +1,932 @@
+// JavTubs (https://javtubs.com) -> CatPawOpen spider
+// JAV tube 站：SSR HTML，无 CF 墙（VM 直连 200；iPhone UA）。
+// 分类：最新 / 精选 / Reducing Mosaic（搜索背书，站内无独立 genre 页）+
+//   7 个站内 category（有码/无码/中文字幕/无码中文/素人有码/1080p/4K）；
+//   genre 筛选卡片 43 项（站内 /genres 索引实测在列 + 详情页实测，逐项 HTTP 200 验过）。
+// 列表：post-entry-1 卡片（48 条/页），分页 /page/N；搜索 /search?s=<kw>&page=N。
+// 播放链（2026-11-15 实测）：详情页 hidden #links = base64(embed URL)，可多
+//   server（,, 分隔）；POST /get_link.php {links, option} 取 embed URL；
+//   主腿 earnvidjavgg.xyz（VidHide）：embed 页内 packed JS 解包出 hls2 master
+//   m3u8（urlset 多档：480p/720p/1080p；单档片只出 480p），分片为明文 TS
+//   （无 EXT-X-KEY），分片 Range 206、首字节 0x47；签名 36h 有效。
+//   次腿 voe.sx 实测 404（AVGL-109），只作 embed 回落。
+// 详情当场解出真实档位（只出 master 里有的档，不编造）；play() 用 10 分钟
+//   缓存重解一遍拿新鲜签名；全死时回站内 embed（parse:1）兜底。
+// 字幕：接定版字幕芯（Layer A），有番号一律接。
+import req from '../../util/req.js';
+
+const KEY = 'py_javtubs';
+const NAME = 'JavTubs';
+const HOST = 'https://javtubs.com';
+const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+function headers(referer) {
+  return {
+    'User-Agent': UA,
+    'Referer': referer || (HOST + '/'),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  };
+}
+
+function t(v) {
+  return String(v == null ? '' : v).trim();
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// 实体解码：&amp; &lt; &gt; &quot; &#39; &nbsp; + &#x2013; / &#233; 数字形
+function decodeEntities(s) {
+  return String(s || '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ')
+    .replace(/&#x([0-9a-fA-F]+);/g, (a, h) => { try { return String.fromCharCode(parseInt(h, 16)); } catch (e) { return a; } })
+    .replace(/&#(\d+);/g, (a, d) => { try { return String.fromCharCode(parseInt(d, 10)); } catch (e) { return a; } });
+}
+
+// 顶级分类（站内实测）
+const CLASSES = [
+  { type_id: 'latest', type_name: '最新', path: '/new-post' },
+  { type_id: 'featured', type_name: '精选', path: '/featured' },
+  { type_id: 'rm', type_name: 'Reducing Mosaic', path: '' },
+  { type_id: 'censored', type_name: '有码', path: '/category/censored' },
+  { type_id: 'uncensored', type_name: '无码', path: '/category/uncensored' },
+  { type_id: 'chinese-subtitle', type_name: '中文字幕', path: '/category/chinese-subtitle' },
+  { type_id: 'chinese-uncensored', type_name: '无码中文', path: '/category/chinese-uncensored' },
+  { type_id: 'amateur-censored', type_name: '素人有码', path: '/category/amateur-censored' },
+  { type_id: 'hd1080', type_name: '1080p', path: '/category/1080p' },
+  { type_id: '4k', type_name: '4K', path: '/category/4k' },
+];
+const PATH_BY_ID = {};
+for (const c of CLASSES) PATH_BY_ID[c.type_id] = c.path;
+
+// genre 筛选卡片：43 项，站内 /genres 索引实测在列 + 逐项 HTTP 200 验过
+// （2026-11-15；站方偶发断连属抖动，重试后全通）。
+const GENRE_FILTER = [
+  { n: '全部', v: '' },
+  { n: '美少女', v: 'beautiful-girl' },
+  { n: '专属女优', v: 'featured-actress' },
+  { n: '单体作品', v: 'single-work' },
+  { n: '素人', v: 'amateur' },
+  { n: '肛交', v: 'anal' },
+  { n: '女优', v: 'actress' },
+  { n: '出轨', v: 'affair' },
+  { n: '阿姨', v: 'aunt' },
+  { n: '熟女', v: 'a-mature-woman' },
+  { n: 'ASMR', v: 'asmr' },
+  { n: '动漫', v: 'anime' },
+  { n: '动漫Cosplay', v: 'anime-cosplay' },
+  { n: '阿黑颜', v: 'ahegao' },
+  { n: '通奸', v: 'adultery' },
+  { n: '素人情侣', v: 'amateur-couple' },
+  { n: '姐姐', v: 'お姉さん' },
+  { n: 'Cosplay', v: 'コスプレ' },
+  { n: '苗条', v: 'スレンダー' },
+  { n: '剧情', v: 'ドラマ' },
+  { n: '高清', v: 'ハイビジョン' },
+  { n: '后宫', v: 'ハーレム' },
+  { n: '白虎', v: 'パイパン' },
+  { n: '口交', v: 'フェラ' },
+  { n: '中出', v: '中出し' },
+  { n: '人妻', v: '人妻-主婦' },
+  { n: '单体作品·日', v: '単体作品' },
+  { n: '女大学生', v: '女子大生' },
+  { n: '手交', v: '手コキ' },
+  { n: '潮吹', v: '潮吹き' },
+  { n: '熟女人妻', v: '熟女-人妻' },
+  { n: '美少女·日', v: '美少女' },
+  { n: '美臀', v: '美尻' },
+  { n: '美腿', v: '美脚' },
+  { n: '巨乳', v: '巨乳' },
+  { n: '制服', v: '制服' },
+  { n: '偷窥', v: '偷窥' },
+  { n: '痴女', v: '痴女' },
+  { n: '处男', v: '童貞' },
+  { n: '乱交', v: '乱交' },
+  { n: '萝莉', v: 'ロリ' },
+  { n: '辣妹', v: 'ギャル' },
+  { n: '自慰', v: 'オナニー' },
+  { n: '1080p', v: '1080p' },
+];
+
+function filtersFor() {
+  return { genre: [{ key: 'genre', name: '类型', value: GENRE_FILTER }] };
+}
+
+async function getHtml(url, referer) {
+  const opts = { headers: headers(referer), timeout: 15000, validateStatus: () => true };
+  for (let i = 0; i < 3; i++) {
+    try {
+      const r = await req.get(url, opts);
+      if (r && r.status === 200 && r.data) return String(r.data);
+    } catch (e) {}
+    try {
+      if (typeof fetch === 'function') {
+        const r = await fetch(url, { headers: headers(referer) });
+        if (r && r.ok) return await r.text();
+      }
+    } catch (e) {}
+    await sleep(500);
+  }
+  return '';
+}
+
+// 仅 200 才回正文（master/变体清单用）
+async function getText200(url, referer) {
+  const opts = { headers: headers(referer), timeout: 15000, validateStatus: () => true };
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await req.get(url, opts);
+      if (r && r.status === 200 && r.data) return String(r.data);
+      if (r && r.status) return '';
+    } catch (e) {}
+    try {
+      if (typeof fetch === 'function') {
+        const r = await fetch(url, { headers: headers(referer) });
+        if (r && r.ok) return await r.text();
+        if (r) return '';
+      }
+    } catch (e) {}
+    await sleep(400);
+  }
+  return '';
+}
+
+// get_link.php 只认表单 POST（application/x-www-form-urlencoded）
+async function postForm(url, body, referer) {
+  const opts = {
+    headers: {
+      'User-Agent': UA,
+      'Referer': referer || (HOST + '/'),
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Accept': '*/*',
+    },
+    timeout: 15000,
+    validateStatus: () => true,
+  };
+  for (let i = 0; i < 2; i++) {
+    try {
+      const r = await req.post(url, body, opts);
+      if (r && r.status === 200 && r.data) return String(r.data);
+    } catch (e) {}
+    try {
+      if (typeof fetch === 'function') {
+        const r = await fetch(url, { method: 'POST', headers: opts.headers, body });
+        if (r && r.ok) return await r.text();
+      }
+    } catch (e) {}
+    await sleep(400);
+  }
+  return '';
+}
+
+// 列表卡片：<div class="post-entry-1"><a href="/<slug>" title="<CODE>">
+//   <img src="https://javqw.com/u2/<hash>.jpg" ...>
+function parseList(html) {
+  const list = [];
+  if (!html) return list;
+  const re = /<div class="post-entry-1">[\s\S]*?<a href="(\/[^"]+)" title="([^"]*)">[\s\S]*?<img[^>]*src="([^"]+)"[^>]*>/g;
+  let m;
+  const seen = new Set();
+  while ((m = re.exec(html)) !== null) {
+    const href = m[1];
+    if (seen.has(href)) continue;
+    seen.add(href);
+    let name = decodeEntities(m[2] || '').trim();
+    const pic = m[3] || '';
+    const slug = href.replace(/^\//, '').replace(/\/$/, '');
+    if (!name) {
+      // 回落：slug 转番号形（avgl-109-reduce-mosaic -> AVGL-109）
+      const cm = slug.match(/^([a-z]+-\d+)/i);
+      name = cm ? cm[1].toUpperCase() : slug.toUpperCase();
+    }
+    if (!pic) continue;
+    list.push({
+      vod_id: HOST + href,
+      vod_name: name,
+      vod_pic: pic,
+      vod_remarks: '',
+    });
+  }
+  return list;
+}
+
+function parsePagecount(html) {
+  if (!html) return 1;
+  const pages = [];
+  // 站内两种翻页形：/page/N（分类/genre）与 ?page=N / &page=N（搜索）
+  const re = /(?:\/page\/|[?&]page=)(\d+)/g;
+  let m;
+  while ((m = re.exec(html)) !== null) pages.push(parseInt(m[1], 10) || 1);
+  if (!pages.length) return 1;
+  return Math.max.apply(null, pages);
+}
+
+function listUrl(id, page, genre) {
+  if (genre) {
+    return HOST + '/genre/' + encodeURIComponent(genre) + (page > 1 ? '/page/' + page : '');
+  }
+  if (id === 'rm') {
+    return HOST + '/search?s=' + encodeURIComponent('reducing mosaic') + (page > 1 ? '&page=' + page : '');
+  }
+  const path = PATH_BY_ID[id] || '/new-post';
+  return HOST + path + (page > 1 ? '/page/' + page : '');
+}
+
+async function home() {
+  const cls = CLASSES.map((c) => ({ type_id: c.type_id, type_name: c.type_name }));
+  const filters = {};
+  for (const c of CLASSES) filters[c.type_id] = filtersFor().genre;
+  return { class: cls, filters };
+}
+
+async function category(reqIn) {
+  const body = (reqIn && reqIn.body) || {};
+  const id = String(body.id || body.tid || 'latest');
+  const page = parseInt(body.page || 1, 10) || 1;
+  const flt = body.filters || body.extend || {};
+  const genre = t(flt.genre || (flt.genre && flt.genre.value) || (flt['genre'] && flt['genre'].value) || '');
+  const html = await getHtml(listUrl(id, page, genre));
+  const list = parseList(html);
+  return {
+    page,
+    pagecount: parsePagecount(html),
+    limit: 48,
+    total: list.length,
+    list,
+  };
+}
+
+async function search(reqIn) {
+  const body = (reqIn && reqIn.body) || {};
+  const wd = t(body.wd || '');
+  const page = parseInt(body.page || 1, 10) || 1;
+  if (!wd) return { page, pagecount: 1, limit: 48, total: 0, list: [] };
+  const html = await getHtml(HOST + '/search?s=' + encodeURIComponent(wd) + (page > 1 ? '&page=' + page : ''));
+  const list = parseList(html);
+  return {
+    page,
+    pagecount: parsePagecount(html),
+    limit: 48,
+    total: list.length,
+    list,
+  };
+}
+
+// ---------- 播放链 ----------
+// VidHide embed 页内 packed JS 解包（Dean Edwards packer，纯字符串替换）
+// 注意：payload 内含单引号串（如 '28',），直接找第一个 "'," 会截断；
+// 须逐个候选校验其后是 "<数字>,<数字>,'" 的参数形才算真正的 payload 尾。
+function unpackPacked(html) {
+  const s = String(html || '');
+  const i = s.indexOf('eval(function(p,a,c,k,e,d){');
+  if (i < 0) return '';
+  const j = s.indexOf("}('", i);
+  if (j < 0) return '';
+  const pStart = j + 3;
+  let k1 = -1;
+  let a = 0;
+  let c0 = 0;
+  let kStr = '';
+  let pos = pStart;
+  while (true) {
+    const q = s.indexOf("',", pos);
+    if (q < 0) return '';
+    const rest = s.slice(q + 2);
+    const m = rest.match(/^(\d+),(\d+),'/);
+    if (m) {
+      k1 = q;
+      a = parseInt(m[1], 10);
+      c0 = parseInt(m[2], 10);
+      kStr = rest.slice(m[0].length);
+      break;
+    }
+    pos = q + 2;
+  }
+  const p = s.slice(pStart, k1);
+  const kEnd = kStr.indexOf("'.split('|')");
+  if (kEnd < 0) return '';
+  const k = kStr.slice(0, kEnd).split('|');
+  let out = p;
+  let c = c0;
+  while (c--) {
+    if (k[c]) out = out.replace(new RegExp('\\b' + c.toString(a) + '\\b', 'g'), k[c]);
+  }
+  if (out.indexOf('hls2') < 0 && out.indexOf('jwplayer') < 0) return '';
+  return out;
+}
+
+function labelOf(h) {
+  if (h >= 1080) return '1080p';
+  if (h >= 720) return '720p';
+  if (h >= 480) return '480p';
+  if (h > 0) return h + 'p';
+  return '自适应';
+}
+
+// 单个 VidHide embed -> master 里的真实档位（只出 master 有的档）
+async function tiersFromVidHide(embed, referer) {
+  try {
+    const html = await getHtml(embed, referer);
+    if (!html) return [];
+    const up = unpackPacked(html);
+    if (!up) return [];
+    const m2 = up.match(/"hls2":"([^"]+)"/);
+    if (!m2) return [];
+    const master = m2[1];
+    const mt = await getText200(master, embed);
+    if (!mt || mt.indexOf('#EXTM3U') < 0) return [];
+    const base = master.split('master.m3u8')[0];
+    const tiers = [];
+    const re = /#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)x(\d+)[^\n]*\n([^\n]+)/g;
+    let m;
+    while ((m = re.exec(mt)) !== null) {
+      const h = parseInt(m[2], 10) || 0;
+      const rel = (m[3] || '').trim();
+      if (!rel || rel.charAt(0) === '#') continue;
+      const url = /^https?:\/\//i.test(rel) ? rel : base + rel;
+      tiers.push({ label: labelOf(h), url, h });
+    }
+    tiers.sort((a, b) => b.h - a.h);
+    const seen = {};
+    return tiers.filter((x) => {
+      if (seen[x.label]) return false;
+      seen[x.label] = true;
+      return true;
+    });
+  } catch (e) {
+    return [];
+  }
+}
+
+const tierCache = new Map(); // durl -> {ts, v:{tiers, embed}}
+
+// 详情页 -> {tiers:[{label,url,h}], embed}；10 分钟缓存
+async function resolveTiers(durl) {
+  const hit = tierCache.get(durl);
+  if (hit && Date.now() - hit.ts < 10 * 60 * 1000) return hit.v;
+  const res = { tiers: [], embed: '' };
+  try {
+    const html = await getHtml(durl);
+    if (html) {
+      const lm = html.match(/id="links" value="([^"]+)"/);
+      if (lm) {
+        const linksVal = lm[1];
+        const nBtn = (html.match(/class="btn btn-server[^"]*"/g) || []).length;
+        const nParts = linksVal.split(',,').length;
+        const n = Math.max(nBtn, nParts, 1);
+        for (let opt = 1; opt <= n; opt++) {
+          let embed = '';
+          try {
+            const body = 'links=' + encodeURIComponent(linksVal) + '&option=' + opt;
+            const r = (await postForm(HOST + '/get_link.php', body, durl)).trim();
+            if (/^https?:\/\//i.test(r)) embed = r;
+          } catch (e) {}
+          if (!embed) continue;
+          if (!res.embed) res.embed = embed;
+          if (/earnvidjavgg\.xyz/i.test(embed)) {
+            const tiers = await tiersFromVidHide(embed, durl);
+            if (tiers.length) { res.tiers = tiers; break; }
+          }
+        }
+      }
+    }
+  } catch (e) {}
+  tierCache.set(durl, { ts: Date.now(), v: res });
+  if (tierCache.size > 100) tierCache.delete(tierCache.keys().next().value);
+  return res;
+}
+
+function slugCode(durl) {
+  const slug = String(durl || '').replace(/\/$/, '').split('/').pop() || '';
+  const cm = slug.match(/^([a-z]+-\d+)/i);
+  return cm ? cm[1].toUpperCase() : slug.toUpperCase();
+}
+
+async function detail(reqIn) {
+  const body = (reqIn && reqIn.body) || {};
+  const id = t(body.id || '');
+  if (!id) return { list: [] };
+  const durl = id.indexOf('http') === 0 ? id : HOST + '/' + id.replace(/^\//, '');
+  const html = await getHtml(durl);
+  const title = decodeEntities((html.match(/<title>([^<]*)<\/title>/) || [])[1] || '').trim();
+  const pic = (html.match(/<div class="information[\s\S]{0,2000}?<img[^>]*src="([^"]+)"/) || [])[1] || '';
+  const dur = (html.match(/<span>(\d+)\s*Min\.<\/span>/) || [])[1] || '';
+  const date = (html.match(/<b>([A-Z][a-z]{2}\. \d{1,2}, \d{4})<\/b>/) || [])[1] || '';
+  const r = await resolveTiers(durl);
+  let playUrl;
+  if (r.tiers.length) {
+    playUrl = r.tiers.map((x) => x.label + '$' + durl + '@' + x.label).join('#');
+  } else {
+    // 档位全死：只给站内 embed 行，play() 走 parse:1
+    playUrl = '站内播放$' + durl + '@app';
+  }
+  const vod = {
+    vod_id: durl,
+    vod_name: title || slugCode(durl),
+    vod_pic: pic,
+    vod_remarks: [dur ? dur + ' Min.' : '', date].filter(Boolean).join(' '),
+    vod_play_from: '正片',
+    vod_play_url: playUrl,
+  };
+  try {
+    subRegister([durl], vod);
+  } catch (e) {}
+  return { list: [vod] };
+}
+
+async function play(reqIn) {
+  const body = (reqIn && reqIn.body) || {};
+  let id = t(body.id || '');
+  id = subNormKey(id);
+  if (!id) return { parse: 1, url: '' };
+  const at = id.lastIndexOf('@');
+  let durl = id;
+  let want = '';
+  if (at > 0) {
+    durl = id.slice(0, at);
+    want = id.slice(at + 1);
+  }
+  if (durl.indexOf('http') !== 0) durl = HOST + '/' + durl.replace(/^\//, '');
+  const r = await resolveTiers(durl);
+  if (want === 'app' || !r.tiers.length) {
+    return { parse: 1, url: r.embed || durl };
+  }
+  let tier = null;
+  if (want) {
+    for (const x of r.tiers) { if (x.label === want) { tier = x; break; } }
+  }
+  if (!tier) tier = r.tiers[0];
+  const res = {
+    parse: 0,
+    url: tier.url,
+    header: {
+      'User-Agent': UA,
+      'Referer': r.embed || durl,
+    },
+  };
+  try {
+    const subs = await subSearchAll(durl);
+    if (subs && subs.length) res.subs = subs;
+  } catch (e) {}
+  return res;
+}
+
+
+// ---------------- 字幕聚合 (Layer A 铺开, 2026-10-23) ----------------
+// 与 bestjavporn 试点同一实现 (提交 9c339419, 用户真机确认
+// MiraPlayer 可加载并选择字幕): 点播时按片名/番号并行搜迅雷看看
+// oracle (首档; 「迅雷」与「迅雷看看」实为同一接口) + SubtitleCat
+// (第二档), 合并排序 = 来源档位 -> 语言 (简中>繁中>双语>英文>
+// 其他) -> 番号命中 -> 热度, 只收 .srt/.vtt/.ass/.ssa 直链, 上限
+// 10 条, 以 TVBox 标准 subs:[{name,url,format}] 挂到 play 结果。
+// 总预算 6s、单请求 4~5s、全程框架 req (NOFETCH 安全)、结果缓存
+// 10 分钟 (空结果不缓存); 无命中时不带 subs 键, play 返回与接入
+// 前逐字段一致。SubHD (下载被站方门控) 与射手 (源站 522) 不接入。
+const SUB_UA = (typeof UA !== 'undefined' && UA) ? UA : 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko)';
+
+function subCleanText(s) {
+  return String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+}
+
+// subHttp: 与试点 reqRaw 同语义 (状态码不抛错、仅 2xx 给正文、
+// 文本恒等变换防自动 JSON 解析), 底层框架 req。
+async function subHttp(url, headers, timeoutMs) {
+  try {
+    const r = await req.request({
+      method: 'GET',
+      url,
+      headers: headers || {},
+      timeout: timeoutMs || 10000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+      maxRedirects: 5,
+    });
+    const text = typeof r.data === 'string' ? r.data : (r.data == null ? '' : String(r.data));
+    const ok = r.status >= 200 && r.status < 300;
+    return { status: r.status || 0, body: ok ? text : '' };
+  } catch (e) {
+    return { status: 0, body: '' };
+  }
+}
+
+// play 入参归一: 个别 App 会把 "集名$播放id" 整段传回, 集名短且
+// 不含 {/http 时剥掉前缀, 与 detail 登记的 episode id 对齐。
+function subNormKey(k) {
+  const s = String(k || '');
+  const i = s.indexOf('$');
+  if (i > 0) {
+    const before = s.slice(0, i);
+    if (before.length <= 30 && !/[{/]/.test(before) && !/http/i.test(before)) return s.slice(i + 1).trim();
+  }
+  return s.trim();
+}
+
+// detail 侧登记: 片名按 [detail 入参 id, vod_id, 每个 episode 的
+// 播放 id] 多键写入 subNameCache, 并以首个 episode id 预热搜索。
+function subRegister(detailIds, vod) {
+  try {
+    if (!vod || !vod.vod_name) return;
+    const name = String(vod.vod_name);
+    const keys = new Set();
+    for (const i of (Array.isArray(detailIds) ? detailIds : [detailIds])) {
+      if (i) keys.add(String(i));
+    }
+    if (vod.vod_id) keys.add(String(vod.vod_id));
+    const eps = [];
+    for (const grp of String(vod.vod_play_url || '').split('$$$')) {
+      for (const seg of grp.split('#')) {
+        const k = seg.indexOf('$');
+        if (k >= 0) {
+          const ep = seg.slice(k + 1);
+          if (ep) { keys.add(ep); eps.push(ep); }
+        }
+      }
+    }
+    for (const k of keys) subCacheName(k, name);
+    const warmKey = vod.vod_id ? String(vod.vod_id) : (eps[0] || '');
+    if (warmKey) subWarm(warmKey);
+  } catch (e) { /* 字幕登记失败不影响详情 */ }
+}
+
+// ---------------- 字幕聚合 (Layer A 重写, 2026-10-23) ----------------
+// 按用户自有迅雷看看 REX 组件 (xunlei.subtitle) 的方法重写: 旧版把
+// [番号, 全标题, 番号+标题] 多个键的召回合并成一池只排序不过滤,
+// 全标题键的模糊召回灌进大量别片字幕 (实测 JUR-887 全标题键池
+// 前排即 JUX-021 等别片), 且迅雷档位恒占满上限 10, SubtitleCat
+// 永远挤不进来。新版三招 (与组件一致):
+// (a) 键序逐个查、首个有结果的键即停 — 番号键命中的池小而准;
+// (b) 命中后严过滤: 条目 name/langs/ext 须含番号 (宽松形亦可)
+//     或片名全文, 不含的全扔, 无回退;
+// (c) 组件打分: cid_match 100000、含番号 +25000, 再加 oracle 自
+//     带 score / fingerprintScore / 下载量, 按名+址去重取 top。
+// 槽位 (用户钦定): 迅雷 (键序 [番号, 紧凑番号]) > 迅雷看看
+// (组件完整键序 [番号, 紧凑番号, 番号+标题, 紧凑番号+标题,
+// 全标题]) > SubtitleCat; 两迅雷槽同走同一 oracle 接口、不管
+// 重不重复, 合并按 URL 去重、同条归高档位。合并序 = 档位 ->
+// 语言 (简中>繁中>双语>英文>日文>其他, 沿用 subLangOf 口径)
+// -> 分数; 全局上限 10、单槽软上限 8 (SubtitleCat 留位)。
+// 全程 subHttp (框架 req 主栈), 迅雷系逐请求超时 3s、键序串行
+// 首中即停; 总预算 6s、失败全静默; 无结果时 play 返回对象不带
+// subs 键, 与未接入前逐字段一致。SubHD (下载被站方门控) 与
+// 射手 (源站 522) 仍不接入。
+const SUB_TTL = 10 * 60 * 1000;
+const subNameCache = new Map();   // durl -> 片名 (detail 时 best-effort 写入)
+const subResultCache = new Map(); // durl -> {ts, subs}
+
+function subCacheName(durl, name) {
+  if (!durl || !name) return;
+  subNameCache.set(durl, String(name));
+  if (subNameCache.size > 200) subNameCache.delete(subNameCache.keys().next().value);
+}
+
+// JavTubs URL 形如 https://javtubs.com/fns-276 或 /avgl-109-reduce-mosaic
+function subSlugTitle(durl) {
+  const slug = (String(durl || '').replace(/\/$/, '').split('/').pop() || '');
+  return slug ? subCleanText(slug.replace(/[-_]+/g, ' ')) : '';
+}
+
+// 番号抽取 (移植自迅雷看看 REX 组件 extractSearchCode 的核心档)
+function subExtractCode(text) {
+  const s = String(text || '').toUpperCase().replace(/[._]/g, ' ').replace(/\s+/g, ' ');
+  const pats = [
+    /\bFC2(?:[- ]?PPV)?[- ]?\d{5,8}\b/,
+    /\bCARIB(?:PR)?[- ]?\d{6,8}\b/,
+    /\b1PONDO[- ]?\d{6,8}\b/,
+    /\bHEYZO[- ]?\d{3,6}\b/,
+    /\b[A-Z]{2,10}[- ]\d{2,8}[A-Z]?\b/,
+    /\b[A-Z]{2,10}\d{2,8}[A-Z]?\b/,
+  ];
+  for (const re of pats) {
+    const m = s.match(re);
+    if (m) return m[0].replace(/\s+/g, '-').replace(/-+/g, '-');
+  }
+  return '';
+}
+
+// 搜索上下文: 片名、番号、紧凑番号、标题部分 (去番号与噪声词)
+function subCtx(durl) {
+  const title = (subNameCache.get(durl) || subSlugTitle(durl) || '').trim();
+  const code = subExtractCode(title) || subExtractCode(String(durl || ''));
+  const compact = code ? code.replace(/[-_ ]/g, '') : '';
+  let titlePart = '';
+  if (code && title) {
+    titlePart = title
+      .replace(new RegExp(code.replace(/[-_]/g, '[-_ ]?'), 'i'), ' ')
+      .replace(/\b(UNCENSORED|LEAK|OTHER|COMPLETE|FULL|HDR|WEB|BLURAY|BDRIP|WEBDL|REMUX|X264|X265|10BIT|8BIT|HEVC|AVC)\b/gi, ' ')
+      .replace(/\b(?:EP|E|S|SEASON)\s*\d{1,3}\b/gi, ' ')
+      .replace(/^[\s\-_:]+|[\s\-_:]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (titlePart === code || titlePart === compact) titlePart = '';
+  }
+  return { title, code, compact, titlePart };
+}
+
+// 迅雷槽键序: 只番号两键 (锚定)
+function subKeysX(ctx) {
+  const keys = [];
+  if (ctx.code) {
+    keys.push(ctx.code);
+    if (ctx.compact && ctx.compact !== ctx.code) keys.push(ctx.compact);
+  }
+  return keys;
+}
+
+// 迅雷看看槽键序: 组件完整键序 (番号、紧凑番号、番号+标题、
+// 紧凑番号+标题、全标题), 逐个查、首中即停。
+function subKeysXL(ctx) {
+  const keys = subKeysX(ctx);
+  if (ctx.code && ctx.titlePart) {
+    keys.push(ctx.code + ' ' + ctx.titlePart);
+    keys.push(ctx.compact + ' ' + ctx.titlePart);
+  }
+  if (ctx.title && ctx.title !== ctx.code) keys.push(ctx.title);
+  return [...new Set(keys)].filter((k) => k.length >= 2);
+}
+
+// 严过滤的匹配文本 (组件口径: 片名 + 上下文, 全小写与去分隔符两形)
+function subMatchOf(durl, ctx) {
+  const text = ((ctx.title || '') + ' ' + String(durl || '')).trim().toLowerCase();
+  const title = (ctx.title || '').toLowerCase();
+  return {
+    text,
+    loose: text.replace(/[-_\s.]/g, ''),
+    title,
+    titleLoose: title.replace(/[-_\s.]/g, ''),
+  };
+}
+
+// 语言判定: rank 越小越优先 (简中 > 繁中 > 双语 > 英文 > 其他)
+function subLangOf(name, langs) {
+  const s = (String(name || '') + ' ' + String(langs || '')).toLowerCase();
+  // 尾码优先 (2026-11-07)：SubtitleCat 文件形如 "<标题>-<语码>.srt"，尾码才是文件实际语言；标题里的"简体中文"是原字幕名，不能覆盖尾码。
+  const tail = String(name || '').match(/[-_.]([a-z]{2,3})\.(?:srt|vtt|ass|ssa)$/i);
+  if (tail) {
+    const c = tail[1].toLowerCase();
+    if (c === 'zh' || c === 'chs' || c === 'cn' || c === 'hans') return { tag: '简中', rank: 0 };
+    if (c === 'cht' || c === 'tw' || c === 'hant') return { tag: '繁中', rank: 1 };
+    if (c === 'en' || c === 'eng') return { tag: '英文', rank: 3 };
+    if (c === 'ja' || c === 'jpn' || c === 'jp') return { tag: '日文', rank: 4 };
+    if (/^(fr|fre|de|ger|es|spa|it|ita|pt|por|ru|rus|nl|dut|sv|swe|da|dan|fi|fin|no|nor|pl|pol|cs|cze|sk|slo|hu|hun|ro|rum|bg|bul|uk|ukr|el|gre|tr|tur|ar|ara|he|heb|hi|hin|id|ind|ms|may|vi|vie|th|tha|km|khm|ko|kor|ak|af|afr|sq|alb|eu|baq|ca|cat|gl|glg|cy|wel|ga|gle|gd|gla|br|bre|co|cos|eo|epo|et|est|lv|lav|lt|lit|mt|mlt|sl|slv|mk|mac|sr|srp|hr|hrv|bs|bos|am|amh|so|som|sw|swa|yo|yor|ig|ibo|ha|hau|zu|zul|xh|xho|st|sot|sn|sna|ka|geo|hy|arm|az|aze|kk|kaz|uz|uzb|mn|mon|ky|kir|tg|tgk|tk|tuk|ti|tir|fa|per|ur|urd|bn|ben|ta|tam|te|tel|ml|mal|mr|mar|pa|pan|gu|guj|kn|kan|as|asm|or|ori|sa|san|ne|nep|si|sin|my|bur|lo|lao)$/.test(c)) return { tag: '', rank: 5 };
+  }
+  if (/简体|简中|chs|zh[-_. ]?cn|zh[-_. ]?hans/.test(s)) return { tag: '简中', rank: 0 };
+  if (/繁体|繁中|cht|zh[-_. ]?tw|zh[-_. ]?hk|zh[-_. ]?hant/.test(s)) return { tag: '繁中', rank: 1 };
+  if (/双语|中英|中日|bilingual/.test(s)) return { tag: '双语', rank: 2 };
+  if (/英文|english|eng|(^|[-_. ])en([-_. ]|$)/.test(s)) return { tag: '英文', rank: 3 };
+  if (/日文|日语|japanese|jpn|(^|[-_. ])ja([-_. ]|$)/.test(s)) return { tag: '日文', rank: 4 };
+  return { tag: '', rank: 5 };
+}
+
+const SUB_TEXT_RE = /\.(srt|vtt|ass|ssa)(\?|#|$)/i;
+
+// 文本字幕格式判定: 文件名扩展名 > 条目 ext 字段 > url 后缀;
+// 压缩包一律剔除 (与组件 getExt 口径一致, 只认 srt/vtt/ass/ssa)。
+function subFmtOf(name, ext, url) {
+  const hay = (String(name || '') + ' ' + String(url || '')).toLowerCase();
+  if (/\.(zip|rar|7z)(\?|#|$)/.test(hay)) return '';
+  const fromName = String(name || '').toLowerCase().match(/\.(srt|vtt|ass|ssa)$/);
+  if (fromName) return fromName[1];
+  const e = String(ext || '').toLowerCase().replace(/^\./, '');
+  if (/^(srt|vtt|ass|ssa)$/.test(e)) return e;
+  const fromUrl = String(url || '').match(SUB_TEXT_RE);
+  if (fromUrl) return fromUrl[1].toLowerCase();
+  return '';
+}
+
+// 裸哈希名不可读: 显示名换成番号字幕 (匹配/过滤仍用原名)
+function subDispName(nm, code) {
+  const base = String(nm || '').replace(/\.(srt|vtt|ass|ssa)$/i, '');
+  if (/^[0-9a-f]{24,}$/i.test(base.trim())) return code ? code + ' 字幕' : '字幕';
+  return nm;
+}
+
+// oracle 单键查询 (同趟搜索内按键缓存, 两槽共用, 不重复发请求)
+async function subOracle(key, ocache) {
+  if (ocache.has(key)) return ocache.get(key);
+  const p = (async () => {
+    const r = await subHttp('https://api-shoulei-ssl.xunlei.com/oracle/subtitle?name=' + encodeURIComponent(key),
+      { 'User-Agent': 'ForwardWidgets/1.0.2', Accept: '*/*' }, 3000);
+    if (r.status !== 200 || !r.body) return [];
+    let j;
+    try { j = JSON.parse(r.body); } catch (e) { return []; }
+    if (!j || Number(j.code) !== 0 || !Array.isArray(j.data)) return [];
+    return j.data;
+  })();
+  ocache.set(key, p);
+  return p;
+}
+
+// oracle 条目归一 (组件 normalizeResult 的字段口径)
+function subNormItem(it) {
+  const name = String(it.name || it.Name || it.title || it.Title || it.filename || it.FileName || '字幕');
+  const langs = Array.isArray(it.languages) ? it.languages.join(',')
+    : (Array.isArray(it.Languages) ? it.Languages.join(',') : String(it.langs || it.Langs || it.language || ''));
+  return {
+    name,
+    langs,
+    ext: String(it.ext || it.Ext || it.format || it.Format || ''),
+    url: String(it.url || it.Url || ''),
+    cid: Boolean(it.cid_match ?? it.CidMatch),
+    down: Number(it.down_count || it.DownCount || it.downloads || it.Downloads || 0) || 0,
+    score: Number(it.score || it.Score || 0) || 0,
+    fp: Number(it.fingerprintf_score || it.fingerprint_score || it.FingerprintScore || it.fingerprintfScore || 0) || 0,
+    duration: Number(it.duration || it.Duration || 0) || 0,
+    size: Number(it.file_size || it.FileSize || it.size || it.Size || 0) || 0,
+  };
+}
+
+// 严过滤 (组件口径): 条目 name/langs/ext 须含番号 (原形或宽松
+// 形) 或片名全文, 否则扔掉。片名分支必须守非空。
+function subRelevant(it, ctx, match) {
+  const text = (it.name + ' ' + it.langs + ' ' + it.ext).toLowerCase();
+  const loose = text.replace(/[-_\s.]/g, '');
+  if (ctx.code) {
+    if (text.includes(ctx.code.toLowerCase())) return true;
+    if (ctx.compact && loose.includes(ctx.compact.toLowerCase())) return true;
+  }
+  if (!match.text) return false;
+  return text.includes(match.text) || loose.includes(match.loose)
+    || (match.title ? (text.includes(match.title) || loose.includes(match.titleLoose)) : false)
+    || match.text.includes(text);
+}
+
+// 组件打分 (scoreItem 的电影路径): cid_match 100000、含番号
+// +25000、oracle 自带 score/fingerprintScore、下载量、时长/大小。
+function subScoreItem(it, ctx, match) {
+  const text = (it.name + ' ' + it.langs + ' ' + it.ext).toLowerCase();
+  const loose = text.replace(/[-_\s.]/g, '');
+  let s = (it.cid ? 100000 : 0) + it.down / 10000;
+  if (ctx.code && (text.includes(ctx.code.toLowerCase()) || (ctx.compact && loose.includes(ctx.compact.toLowerCase())))) s += 25000;
+  s += Math.max(0, it.score) + Math.max(0, it.fp);
+  if (it.duration > 0) s += 50;
+  if (it.size > 0) s += Math.min(it.size / 1024 / 1024, 20);
+  if (match.title && (text.includes(match.title) || loose.includes(match.titleLoose))) s += 1000;
+  if (ctx.code) s += 500;
+  if (text.includes('sub') || text.includes('subtitle') || text.includes('字幕')) s += 300;
+  return s;
+}
+
+// 迅雷系槽位 (迅雷 tier 0 / 迅雷看看 tier 1): 键序逐个查、首个
+// 有结果的键即停; 命中池只过严过滤、无任何回退。
+async function subSlotOracle(keys, src, tier, ctx, match, ocache, bag) {
+  let pool = null;
+  for (const k of keys) {
+    const list = await subOracle(k, ocache);
+    if (list && list.length) { pool = list; break; }
+  }
+  if (!pool) return;
+  const items = [];
+  for (const raw of pool) {
+    if (!raw) continue;
+    const it = subNormItem(raw);
+    if (!it.url) continue;
+    const fmt = subFmtOf(it.name, it.ext, it.url);
+    if (!fmt) continue;
+    items.push({ name: it.name, langs: it.langs, ext: it.ext, url: it.url, fmt, norm: it });
+  }
+  if (!items.length) return;
+  const finalItems = items.filter((it) => subRelevant(it, ctx, match));
+  for (const it of finalItems) {
+    const lang = subLangOf(it.name, it.langs);
+    bag.push({ src, tier, name: subDispName(it.name, ctx.code), url: it.url, fmt: it.fmt, lang: lang.tag, langRank: lang.rank, score: subScoreItem(it.norm, ctx, match), dur: it.norm.duration });
+  }
+}
+
+// SubtitleCat 槽 (tier 2): 沿用旧芯搜索/解析 (按番号键搜、逐页
+// 取按语言分的直链), 同样过严过滤 (无回退)。
+async function subFromSubtitleCat(ctx, match, bag) {
+  const key = ctx.code || ctx.title;
+  if (!key) return;
+  const r = await subHttp('https://subtitlecat.com/index.php?search=' + encodeURIComponent(key),
+    { 'User-Agent': SUB_UA, Referer: 'https://subtitlecat.com/' }, 5000);
+  if (r.status !== 200 || !r.body) return;
+  const pages = [];
+  const seen = new Set();
+  for (const m of r.body.matchAll(/href="(subs\/\d+\/[^"]+\.html)"/g)) {
+    if (seen.has(m[1])) continue;
+    seen.add(m[1]);
+    pages.push(m[1]);
+    if (pages.length >= 3) break;
+  }
+  await Promise.all(pages.map(async (p) => {
+    const pr = await subHttp('https://subtitlecat.com/' + p, { 'User-Agent': SUB_UA, Referer: 'https://subtitlecat.com/' }, 4000);
+    if (pr.status !== 200 || !pr.body) return;
+    for (const m of pr.body.matchAll(/href="(\/subs\/\d+\/[^"]+\.(?:srt|vtt|ass))"/gi)) {
+      let nm = m[1].split('/').pop() || '字幕';
+      try { nm = decodeURIComponent(nm); } catch (e) { /* 保持原样 */ }
+      if (!subRelevant({ name: nm, langs: '', ext: '' }, ctx, match)) continue;
+      const lang = subLangOf(nm, '');
+      const fmt = (nm.match(/\.(srt|vtt|ass)$/i) || [])[1].toLowerCase();
+      bag.push({ src: 'SubtitleCat', tier: 2, name: nm, url: 'https://subtitlecat.com' + m[1], fmt, lang: lang.tag, langRank: lang.rank, score: 0 });
+    }
+  }));
+}
+
+// 合并: 档位 -> 语言 -> 分数; 按 URL 去重 (同条归先到高档位);
+// 全局上限 10、单槽软上限 8 (给 SubtitleCat 留位)。
+// 时长后缀（2026-11-02）：oracle 给毫秒（>100000 视为毫秒除 1000），
+// 秒级原值直接用；无时长不显示、不编造。
+// 去重键用秒（2026-11-02 名字+时长口径）：毫秒值 >100000 除 1000；
+// 无时长记 nodur（沿用名字去重）；同名同时长才算重复。
+function subDurSec(v) {
+  let s = Number(v) || 0;
+  if (s > 100000) s = Math.floor(s / 1000);
+  return s > 0 ? s : 0;
+}
+function subDurStr(v) {
+  let s = Number(v) || 0;
+  if (s > 100000) s = Math.floor(s / 1000);
+  if (s <= 0) return '';
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? h + ':' + mm + ':' + ss : mm + ':' + ss;
+}
+function subMerge(items) {
+  const sorted = items.slice().sort((a, b) =>
+    (a.tier - b.tier) || (a.langRank - b.langRank) || (b.score - a.score) || String(a.name).localeCompare(String(b.name)));
+  const seenUrl = new Set();
+  const seenName = new Set();
+  const perTier = {};
+  const out = [];
+  for (const it of sorted) {
+    if (out.length >= 10) break;
+    if (seenUrl.has(it.url)) continue;
+    const nameKey = (it.lang || '') + '|' + it.name.toLowerCase().replace(/\.(srt|vtt|ass|ssa)$/i, '') + '|' + (subDurSec(it.dur) || 'nodur');
+    if (seenName.has(nameKey)) continue;
+    if ((perTier[it.tier] || 0) >= 8) continue;
+    seenUrl.add(it.url);
+    seenName.add(nameKey);
+    perTier[it.tier] = (perTier[it.tier] || 0) + 1;
+    const cleanName = it.name.replace(/\.(srt|vtt|ass|ssa)$/i, '').slice(0, 60);
+    const dur = subDurStr(it.dur);
+    out.push({ name: it.src + '·' + (it.lang ? it.lang + '·' : '') + cleanName + (dur ? '·' + dur : ''), url: it.url, format: it.fmt });
+  }
+  return out;
+}
+
+const subInflight = new Map(); // durl -> Promise<subs> (detail 预热与 play 共用同一趟)
+
+async function subSearchAll(durl) {
+  const hit = subResultCache.get(durl);
+  if (hit && Date.now() - hit.ts < SUB_TTL) return hit.subs;
+  if (subInflight.has(durl)) return subInflight.get(durl);
+  const p = (async () => {
+    const ctx = subCtx(durl);
+    let subs = [];
+    if (ctx.code || ctx.title) {
+      const match = subMatchOf(durl, ctx);
+      const bag = [];
+      const ocache = new Map();
+      const jobs = [
+        subSlotOracle(subKeysX(ctx), '迅雷', 0, ctx, match, ocache, bag),
+        subSlotOracle(subKeysXL(ctx), '迅雷看看', 1, ctx, match, ocache, bag),
+        subFromSubtitleCat(ctx, match, bag),
+      ].map((jp) => Promise.resolve(jp).catch(() => {}));
+      const all = Promise.allSettled(jobs);
+      await Promise.race([all, new Promise((r) => setTimeout(r, 6000))]);
+      subs = subMerge(bag);
+      if (subs.length) {
+        subResultCache.set(durl, { ts: Date.now(), subs });
+        if (subResultCache.size > 200) subResultCache.delete(subResultCache.keys().next().value);
+      } else {
+        all.then(() => {
+          const late = subMerge(bag);
+          if (late.length) {
+            subResultCache.set(durl, { ts: Date.now(), subs: late });
+            if (subResultCache.size > 200) subResultCache.delete(subResultCache.keys().next().value);
+          }
+        }).catch(() => {});
+      }
+    }
+    return subs;
+  })();
+  subInflight.set(durl, p);
+  try { return await p; } finally { subInflight.delete(durl); }
+}
+
+// detail 入口即预热 (不 await): 慢出口下单趟搜索可达数秒, 让它
+// 与详情页的解析链并行跑, 用户点播时 play 直接命中缓存/在途。
+function subWarm(durl) {
+  subSearchAll(durl).catch(() => {});
+}
+
+export default function createSpider() {
+  return {
+    meta: { key: KEY, name: NAME, type: 3 },
+    api: async (fastify) => {
+      fastify.post('/init', async () => ({}));
+      fastify.post('/home', home);
+      fastify.post('/category', category);
+      fastify.post('/detail', detail);
+      fastify.post('/play', play);
+      fastify.post('/search', search);
+    },
+  };
+}
