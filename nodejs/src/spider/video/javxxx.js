@@ -141,6 +141,15 @@
 //    取到的 live/tid 交给 Worker，Worker 只做 /api/play/ POST + embed 取页，不再
 //    自己取详情 HTML（JavRate Worker v2 模式：/api/ 墙比 HTML 墙弱；/resolve 的
 //    HTML 取页是坏 colo 抽奖）。分段路、/resolve、/resolve2 三路并行竞速。
+//  - v16（2026-11-14 第十二轮，v15 仍无档位）：两处改动。
+//    ① 时序 bug：v15 的 resolve2EntryP 是在 `await tokenP` 之后才创建，token 若
+//    拿得慢（10 秒），resolve2 只剩 2 秒、必超时。改成 tokenP.then 链式创建，与
+//    entryP、resolveEntryP 同时起跑（token 一到即发 /resolve2）。
+//    ② 诊断：detail() 回包的 vod_remarks 带腿况（tk=token 来源，r2=/resolve2，
+//    r=/resolve，sp=分段路；ok/空/-），手机实测截图可读，定位手机侧断点。
+//    （另已坐实：live/tid 是每片稳定的——jina 两次取、Worker 取均同一 live
+//    串，tid 596077 不变；token 不绑 IP、不快过期。故断点不在 token 本身，
+//    而在手机侧取 token 或调 /resolve2 的某一步。）
 //  - v11（2026-11-14，第七轮）：v10 仍单条"播放"——Worker 腿死、jina 腿在手机上也没赢。
 //    新路：直连详情页取 token。getBaseAll 的 HTML 回落腿（getHtmlOnly：Worker /f/ +
 //    直连 + fetch 竞速）本来就能取到详情页 HTML、parseDetailHtml 本来就能从中抽
@@ -1368,20 +1377,30 @@ async function detail(reqIn) {
       return await entryFromMasterUrl(rv.url, detailDeadline);
     } catch (e) { return null; }
   })();
+  // v16：resolve2EntryP 改成 tokenP.then 链式创建（与 entryP、resolveEntryP 同时起跑，
+  // token 一到即发 /resolve2，不再等 `await tokenP` 之后才创建）。
+  var diag = { tk: '', r2: '', r: '', sp: '' };
+  var resolve2EntryP = tokenP.then(function (tk2) {
+    return (async function () {
+      try {
+        if (!tk2 || !tk2.live || !tk2.tid) { diag.r2 = '-'; return null; }
+        var rv2 = await withTimeout(getResolve2(tk2.live, tk2.tid, vid, detailDeadline), Math.max(1000, detailDeadline - Date.now()), null);
+        if (!rv2 || !rv2.url) { diag.r2 = 'fail'; return null; }
+        if (rv2.kind !== 'hls' && !/\.m3u8(\?|#|$)/i.test(rv2.url)) { diag.r2 = 'nonhls'; return null; }
+        var e2 = await entryFromMasterUrl(rv2.url, detailDeadline);
+        diag.r2 = e2 ? 'ok' : 'noentry';
+        return e2;
+      } catch (e) { diag.r2 = 'err'; return null; }
+    })();
+  });
+  // 诊断：记录 entryP（分段路）与 resolveEntryP（/resolve）的结果。
+  var entryP2 = entryP.then(function (e) { diag.sp = e ? 'ok' : 'fail'; return e; });
+  var resolveEntryP2 = resolveEntryP.then(function (e) { diag.r = e ? 'ok' : 'fail'; return e; });
   var tk = await tokenP;
   var live = tk.live;
   var tid = tk.tid;
+  diag.tk = (tk.via || '-') ;
   if (live && tid) tokenCacheSet(vid, live, tid, tk.via);
-  // v15：/resolve2 路（手机供 token，Worker 只 POST + 取 embed）。token 未拿到则此路为空。
-  var resolve2EntryP = (async function () {
-    try {
-      if (!live || !tid) return null;
-      var rv2 = await withTimeout(getResolve2(live, tid, vid, detailDeadline), Math.max(1000, detailDeadline - Date.now()), null);
-      if (!rv2 || !rv2.url) return null;
-      if (rv2.kind !== 'hls' && !/\.m3u8(\?|#|$)/i.test(rv2.url)) return null;
-      return await entryFromMasterUrl(rv2.url, detailDeadline);
-    } catch (e) { return null; }
-  })();
   var base = await withTimeout(baseP, Math.max(500, detailDeadline - Date.now()), { name: '', pic: '', desc: '' });
   var name = base.name;
   var pic = base.pic;
@@ -1393,7 +1412,7 @@ async function detail(reqIn) {
   // v10：档位行。有几档出几行（master 变体表实测值，不编造）；取不到变体回单条“播放”。
   var playUrl = '播放$' + vid;
   try {
-    var entry = await firstSuccess([entryP, resolveEntryP, resolve2EntryP], Math.max(1000, detailDeadline - Date.now()));
+    var entry = await firstSuccess([entryP2, resolveEntryP2, resolve2EntryP], Math.max(1000, detailDeadline - Date.now()));
     if (entry && entry.variants && entry.variants.length) {
       masterCacheSet(vid, entry);
       playUrl = entry.variants.map(function (v) { return v.h + 'p$' + vid + '|q=' + v.h; }).join('#');
@@ -1406,6 +1425,7 @@ async function detail(reqIn) {
       vod_pic: pic,
       vod_content: desc,
       vod_play_from: NAME,
+      vod_remarks: 'tk:' + (diag.tk || '-') + ' r2:' + (diag.r2 || '-') + ' r:' + (diag.r || '-') + ' sp:' + (diag.sp || '-'),
       vod_play_url: playUrl,
     }],
   };
