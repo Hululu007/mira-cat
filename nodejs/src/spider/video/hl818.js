@@ -7,7 +7,7 @@ const NAME = '818黑料网';
 const HOST = 'https://818hlw1.com/';
 // 2026-11-01 中转腿：App 内 req 到 818hlw1.com 被拦（首页拿不到、回落 4 写死分类），
 // 直取为空时走 javsb-relay 的 /hl 代取（白名单仅 818hlw1.com，只转文字页）。
-const RELAY_HL = 'https://javsb-relay-production.up.railway.app/hl?url=';
+const RELAY_HL = 'https://javsb-relay.li768435813.workers.dev/hl?url=';
 // round3：m3u8 走独立 CF Worker 中转（用户已部署，见文件头 round3 说明）。
 const RELAY = 'https://818hlw.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';

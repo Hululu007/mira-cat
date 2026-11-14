@@ -248,7 +248,7 @@ async function detail(reqIn) {
 // 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
 // detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
 // 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
-const RELAY_M3U8 = 'https://javsb-relay-production.up.railway.app/m3u8?u=';
+const RELAY_M3U8 = 'https://javsb-relay.li768435813.workers.dev/m3u8?u=';
 
 async function play(reqIn) {
   const body = reqIn?.body || {};

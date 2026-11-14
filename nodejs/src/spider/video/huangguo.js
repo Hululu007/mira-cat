@@ -361,7 +361,7 @@ async function detail(reqIn) {
 // 不给资源，蜘蛛字段再对也播不了。播放时先向用户自建的 javsb-relay 服务（Railway）要一份
 // 中转版 m3u8（服务在 Railway 抓流、字节原样转发、不解密），中转可用就走中转，
 // 中转未部署或同样不可用时回落直连，行为不比原来差。
-const RELAY = 'https://javsb-relay-production.up.railway.app/';
+const RELAY = 'https://javsb-relay.li768435813.workers.dev/';
 async function relayM3u8(m3u8Url) {
   if (!/\.m3u8/i.test(m3u8Url)) return '';
   try {

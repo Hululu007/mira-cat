@@ -78,7 +78,7 @@ async function fetchViaRelay(url, referer) {
 // javneon.tv 的验证拦 App 也拦 CF Worker（实测 403 Just a moment），只有
 // Node fetch/curl 能过；故第 6 页起的深页与深页详情走本中转，不走 CF 中转。
 // JN_RELAY 为 javsb-relay 服务上的 /jn 路由（Railway 部署，见 javsb-relay 仓库 server.js）。
-const JN_RELAY = 'https://javsb-relay-production.up.railway.app/jn';
+const JN_RELAY = 'https://javsb-relay.li768435813.workers.dev/jn';
 async function fetchJn(url, referer) {
   try {
     const res = await req.get(JN_RELAY + '?url=' + encodeURIComponent(url), { headers: H(referer), timeout: 25000, maxRedirects: 10 });
