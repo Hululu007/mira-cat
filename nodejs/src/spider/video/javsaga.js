@@ -3,7 +3,11 @@ import req from '../../util/req.js';
 const KEY = 'py_javsaga';
 const NAME = 'JavSaga';
 const HOST = 'https://javsaga.ninja';
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+// 2026-11-14 v2：用户确认手机 Safari 打开 javsaga.ninja 会自动验证进入（手机 IP
+// 能过墙），但 App 里列表仍空——App 的 axios 请求被墙。直连改发 iPhone Safari
+// 全套浏览器头（UA + Accept + Sec-Fetch），让请求更像 Safari，争取走手机 IP
+// 直接过墙。其它通道（jina/fs/page/Worker）保留作后备。
+const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 // javsaga.ninja（2026-11-11 攻坚）：与 supjav 同款 supjav3 主题（分类页标题
 // 直写 "Supjav.com"，封面走 img.supjav.com），详情/播放沿用 supjav 的
@@ -61,7 +65,17 @@ const SORTS = [
 async function getText(url, timeout = 60000) {
   try {
     const { data } = await req.get(url, {
-      headers: { 'User-Agent': UA },
+      headers: {
+        'User-Agent': UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+      },
       timeout,
     });
     return String(data || '');
