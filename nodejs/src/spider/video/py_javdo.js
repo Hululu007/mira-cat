@@ -19,13 +19,18 @@
 //    proxy_url 实测恒 502（站方媒体代理坏）、dooplayer embed 实测 204 空，
 //    故只出单行「正片」MP4，不编造档位；resolve 失败时回 parse:1 网页嗅探行。
 //    注意：猫源 App 不向蜘蛛回传 Set-Cookie（设备侧已证），真机上直连线
-//    可能 419、只能走网页嗅探兜底；VM harness 能取到 Cookie、直连线可验。
+//    恒 419；2026-11-15 改走 javdo-fetch Worker 中转（单次调用内抓详情页
+//    接 Cookie 再 POST resolve），直连线只作回落；嗅探行仍为最后兜底。
 // 字幕：接定版字幕芯（Layer A，见文件尾），有番号一律接。
 import req from '../../util/req.js';
 
 const KEY = 'py_javdo';
 const NAME = 'jav.do';
 const HOST = 'https://jav.do';
+// javdo-fetch Worker：App 不回传 Set-Cookie，手机直解恒 419，改走 Worker 中转
+// （Worker 单次调用内抓详情页接 Cookie 再 POST resolve；直链不绑 IP/Cookie、
+// 180 秒过期，点播时现调现解）。Worker 未部署/失败时返回空，走直连回落。
+const WORKER = 'https://javdo-fetch.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
 function H(referer) {
@@ -405,6 +410,17 @@ async function resolvePlay(durl, html, cookie) {
   return { url: '', embedUrl };
 }
 
+// Worker 中转解析（主修法）：GET {WORKER}/resolve?u=<详情URL>，Worker 在单次调用内
+// 完成 详情页取 Cookie -> POST resolve 全链，返回新鲜直链；失败返回空，不抛错。
+async function resolveViaWorker(durl) {
+  try {
+    const r = await req.get(WORKER + '/resolve?u=' + encodeURIComponent(durl), { timeout: 20000, validateStatus: () => true });
+    const j = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+    if (j && j.ok && j.url) return { url: String(j.url), embedUrl: j.embedUrl || '' };
+    return { url: '', embedUrl: (j && j.embedUrl) || '' };
+  } catch (e) { return { url: '', embedUrl: '' }; }
+}
+
 async function detail(reqIn) {
   const ids = Array.isArray(reqIn && reqIn.body && reqIn.body.id) ? reqIn.body.id : [reqIn && reqIn.body && reqIn.body.id];
   const list = [];
@@ -446,9 +462,22 @@ async function play(reqIn) {
   }
   if (/jav\.do\/videos\//i.test(id)) {
     const durl = id;
+    // ① Worker 中转（手机直解 419 的主修法）
+    let res = await resolveViaWorker(durl);
+    if (res.url) {
+      const subs = await subSearchAll(durl).catch(() => []);
+      const result = {
+        parse: 0,
+        url: res.url,
+        header: { 'User-Agent': UA, 'Referer': durl },
+      };
+      if (subs && subs.length) result.subs = subs;
+      return result;
+    }
+    // ② 直连回落（VM/harness 侧 Cookie 通时可走；手机侧 419 后继续降级）
     const r = await getFull(durl, HOST + '/');
     const cookie = cookieFromHeaders(r.headers);
-    const res = r.text ? await resolvePlay(durl, r.text, cookie) : { url: '', embedUrl: '' };
+    res = r.text ? await resolvePlay(durl, r.text, cookie) : { url: '', embedUrl: '' };
     if (res.url) {
       const subs = await subSearchAll(durl).catch(() => []);
       const result = {

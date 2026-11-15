@@ -4,8 +4,11 @@
 //   最新走 posts API 按日期倒序。列表走 WP REST API（JSON），封面按 slug 拼 pic.missav.bz/image/<slug>.jpg。
 // 播放链（3 部片实测）：详情页 Rocket base64 脚本 defaultUrl -> xx.videplay.us/v/<id> 嵌页
 //   -> 内联 Dean Edwards 打包脚本解包 -> https://api.videplay.us/vod/v-master.m3u8/<token>（自适应 master）。
-//   token 每片不同、15 分钟以上有效；master 清单经 jina 侧验证 2/3 返回真 HLS（IPZZ-599-RM 回空，
-//   可能是该片 CDN 文件缺失，真机定性）。VM 直取 master 回 CF 拦截页（出口特征，与手机无关）。
+//   token 每片不同、15 分钟以上有效；ply() 解出的就是同一个 master 地址，无备选路。
+//   根因（2026-11-15 实测 8 部）：videplay 后端对多数片子不给真播单——空播单（4/8）、CF 拦截页
+//   dynamicshopping.shop（1/8）、502 datastorageservice.space（1/8），仅 2/8 是真 HLS；
+//   与 Referer/Cookie/Origin/Accept/出口无关，死的片在站内自己的播放器上也播不了。
+//   play() 先探活 master（#EXTM3U 开头才算活），死的直接去掉、回 parse:1 走站内嗅探。
 //   站内无多档位可供选择，单集「正片」出 master 直链，不编造档位。字幕：接定版字幕芯，有番号一律接。
 import req from '../../util/req.js';
 
@@ -227,6 +230,12 @@ async function play(reqIn) {
   const durl = id.indexOf('http') === 0 ? id : HOST + '/' + id.replace(/^\/+|\/+$/g, '') + '/';
   const master = await resolveMaster(durl);
   if (!master) return { parse: 1, url: durl };
+  // master 探活：videplay 后端对多数片子回空播单 / CF 拦截页 / 502，
+  // 直接交给播放器必“视频加载失败”。探活不过的死线直接去掉，
+  // 回 parse:1 走站内嗅探（站方自己的播放器拿的也是这个 master，
+  // 死片在站内也播不了，嗅探只是兜底，不把死地址交给播放器）。
+  const probe = await getText(master, durl, 6000);
+  if (!probe || probe.trimStart().indexOf('#EXTM3U') !== 0) return { parse: 1, url: durl };
   const res = {
     parse: 0,
     url: master,

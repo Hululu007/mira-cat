@@ -8,11 +8,14 @@
 //   REST 无封面字段，逐条取详情页 div.history 的 data-thumb 补（并行、失败留空）。
 // 详情：packed JS（Dean Edwards）里是各集各线路的 iframe；自研纯 JS 解包器（无 eval，
 //   8 个实采样本与 eval 输出逐字节一致）；集数/线路标签从 #episode / #server 读，embed 按定义顺序配对。
-// 播放：play() 现解 embed —— StreamHG 系（iplayerhls / callistanise / minochinos / streamhide /
-//   likessb / sbstream）取 links.hls2 签名 master（实测单档：iplayerhls 720p、callistanise 1080p）；
-//   streamtape 取 robotlink 拼 get_video（VM 直连 000，手机待验）；
+// 播放：详情时现解每条 embed（3 并发、单条 20s 上限），死线（404/删片）直接丢弃，只留能播的行；
+//   StreamHG 系（iplayerhls / callistanise / minochinos / streamhide / likessb / sbstream）
+//   取 links.hls2 签名 master（实测单档：iplayerhls 720p、callistanise 1080p；IP 绑定、同 IP 直取
+//   master 200 / variant 200 / 分片 Range 206 首字节 0x47、无 KEY、Referer 非必需）；
+//   streamtape 取 robotlink 拼 get_video（token 绑定 IP；VM 出口被站方 500 拒，手机待验）；
 //   dood / vsembed / javstream 等解不出直链的回 parse:1 走站内嵌页嗅探；
-//   asianclub.tv（已停放）与 vidoza.net（embed 404）两个死线路在详情直接滤掉。
+//   asianclub.tv（已停放）、vidoza.net（embed 404）、streamsb.net（embed 跳广告停放页）
+//   三个死线路在详情直接滤掉。
 // 字幕：接定版字幕芯（Layer A），有番号一律接。
 import req from '../../util/req.js';
 
@@ -268,8 +271,9 @@ function hostOf(url) {
   try { return new URL(url).hostname.toLowerCase(); } catch (e) { return ''; }
 }
 
-// 2026-11-15 实测死线路：asianclub.tv 已停放（域名出售页），vidoza.net embed 404
-const DEAD_HOSTS = ['asianclub.tv', 'vidoza.net'];
+// 2026-11-15 实测死线路：asianclub.tv 已停放（域名出售页），vidoza.net embed 404；
+// 2026-11-15 补：streamsb.net embed 跳 ww1 停放/广告页（GDPR CMP 脚本，无播放器），同判死线。
+const DEAD_HOSTS = ['asianclub.tv', 'vidoza.net', 'streamsb.net'];
 function isDeadEmbed(url) {
   const h = hostOf(url);
   return DEAD_HOSTS.indexOf(h) >= 0;
@@ -326,9 +330,47 @@ async function resolveStreamtape(embed) {
     }
     return 'https://streamtape.com/get_video?id=' + m[1] + tail;
   }
-  const m2 = html.match(/get_video\?id=([A-Za-z0-9]+)&expires=(\d+)&ip=([^"'\s&]+)&token=([^"'\s&]+)/);
+  // 2026-11-15 修：token/ip 的字符集必须排除 '<'——embed 页 #ideoolink 里 token 后紧跟 </div>，
+  // 旧正则 [^"'\s&] 会把 </div> 吃进 token，拼出的 get_video 带脏 token，站方必拒。
+  const m2 = html.match(/get_video\?id=([A-Za-z0-9]+)&expires=(\d+)&ip=([^"'\s&<>]+)&token=([^"'\s&<>]+)/);
   if (m2) return 'https://streamtape.com/get_video?id=' + m2[1] + '&expires=' + m2[2] + '&ip=' + m2[3] + '&token=' + m2[4];
   return '';
+}
+
+// 详情已解析好的直链（hls2 master / streamtape get_video / mp4 直链），play() 直接交播放器
+function isDirectMedia(u) {
+  return u.indexOf('.m3u8') >= 0 || u.indexOf('/get_video?') >= 0 || /\.mp4(\?|#|$)/.test(u);
+}
+
+// 字幕：只挂 detail() 预热已入缓存的命中（javmove playFinish 同款口径，不再现搜）
+function attachSubs(res, durl) {
+  if (!durl) return;
+  try {
+    const hit = subResultCache.get(durl);
+    if (hit && Date.now() - hit.ts < SUB_TTL && hit.subs && hit.subs.length) res.subs = hit.subs;
+  } catch (e) {}
+}
+
+// 详情时现解全部 embed（3 并发、单条 20s 上限）：超时/抛错的按嗅探保留，play() 再懒解一次。
+// 2026-11-15 由来：详情只列 embed、不验活，404 死线与删片行照常上架，用户一点就是“视频加载失败”。
+async function resolveAll(embeds) {
+  const out = new Array(embeds.length);
+  let idx = 0;
+  async function worker() {
+    while (idx < embeds.length) {
+      const i = idx++;
+      try {
+        out[i] = await Promise.race([
+          resolveEmbed(embeds[i]),
+          new Promise((r) => setTimeout(() => r({ kind: 'sniff', url: embeds[i] }), 20000)),
+        ]);
+      } catch (e) {
+        out[i] = { kind: 'sniff', url: embeds[i] };
+      }
+    }
+  }
+  await Promise.all([worker(), worker(), worker()]);
+  return out;
 }
 
 // embed -> { kind: 'hls'|'mp4'|'sniff'|'dead', url }
@@ -482,18 +524,35 @@ async function detail(reqIn) {
   const durl = id.indexOf('http') === 0 ? id : HOST + id;
   const html = await getHtml(durl);
   const d = parseDetail(html, durl);
+  // 摊平 (集, 标签, embed)，详情时统一现解：死线丢弃，直链直接写进播放 id
+  const jobs = [];
+  {
+    let ei = 0;
+    const nParts0 = Math.max(d.parts.length, 1);
+    for (let pi = 0; pi < nParts0; pi++) {
+      const labels = d.parts[pi] || ['HG'];
+      for (let si = 0; si < labels.length; si++) {
+        const emb = d.embeds[ei++] || '';
+        if (emb) jobs.push({ pi, label: labels[si], embed: emb });
+      }
+    }
+  }
+  const solved = await resolveAll(jobs.map((j) => j.embed));
   const from = [];
   const urls = [];
-  let ei = 0;
   const nParts = Math.max(d.parts.length, 1);
   for (let pi = 0; pi < nParts; pi++) {
-    const labels = d.parts[pi] || ['HG'];
     const lines = [];
-    for (let si = 0; si < labels.length; si++) {
-      const emb = d.embeds[ei++] || '';
-      if (!emb) continue;
-      // 播放 id 埋详情 URL：<durl>@@<embed>，play() 凭 durl 查字幕缓存（javmove 同款 playFinish 口径）
-      lines.push(labels[si] + '$' + durl + '@@' + emb);
+    for (let k = 0; k < jobs.length; k++) {
+      if (jobs[k].pi !== pi) continue;
+      const r = solved[k];
+      if (!r || r.kind === 'dead') continue;
+      // 播放 id 埋详情 URL：<durl>@@<embed 或直链>，play() 凭 durl 查字幕缓存（javmove 同款 playFinish 口径）
+      if (r.kind === 'hls' || r.kind === 'mp4') {
+        lines.push(jobs[k].label + '$' + durl + '@@' + r.url);
+      } else {
+        lines.push(jobs[k].label + '$' + durl + '@@' + jobs[k].embed);
+      }
     }
     if (lines.length) {
       from.push(nParts > 1 ? '第' + (pi + 1) + '集' : '播放线路');
@@ -534,6 +593,19 @@ async function play(reqIn) {
     return { parse: 1, url: embed };
   }
   if (embed.indexOf('http') !== 0) return { parse: 1, url: embed };
+  // 详情已解析好的直链（hls2 master / get_video mp4）：直接交播放器，不再二次解析
+  if (isDirectMedia(embed)) {
+    const res = {
+      parse: 0,
+      url: embed,
+      header: {
+        'User-Agent': UA,
+        'Referer': durl || embed,
+      },
+    };
+    attachSubs(res, durl);
+    return res;
+  }
   const r = await resolveEmbed(embed);
   if (r.kind === 'hls' || r.kind === 'mp4') {
     const res = {
@@ -544,13 +616,7 @@ async function play(reqIn) {
         'Referer': embed,
       },
     };
-    // 字幕：只挂 detail() 预热已入缓存的命中（javmove playFinish 同款口径，不再现搜）
-    if (durl) {
-      try {
-        const hit = subResultCache.get(durl);
-        if (hit && Date.now() - hit.ts < SUB_TTL && hit.subs && hit.subs.length) res.subs = hit.subs;
-      } catch (e) {}
-    }
+    attachSubs(res, durl);
     return res;
   }
   return { parse: 1, url: embed };
