@@ -4,14 +4,26 @@
 //   7 个站内 category（有码/无码/中文字幕/无码中文/素人有码/1080p/4K）；
 //   genre 筛选卡片 43 项（站内 /genres 索引实测在列 + 详情页实测，逐项 HTTP 200 验过）。
 // 列表：post-entry-1 卡片（48 条/页），分页 /page/N；搜索 /search?s=<kw>&page=N。
-// 播放链（2026-11-15 实测）：详情页 hidden #links = base64(embed URL)，可多
-//   server（,, 分隔）；POST /get_link.php {links, option} 取 embed URL；
-//   主腿 earnvidjavgg.xyz（VidHide）：embed 页内 packed JS 解包出 hls2 master
-//   m3u8（urlset 多档：480p/720p/1080p；单档片只出 480p），分片为明文 TS
-//   （无 EXT-X-KEY），分片 Range 206、首字节 0x47；签名 36h 有效。
+// 播放链（2026-11-15 实测）：详情页 hidden #links = base64(embed
+//   URL)，可多 server（,, 分隔）；POST /get_link.php {links, option}
+//   取 embed URL（option 从 1 开始，无需 Cookie）；主腿
+//   earnvidjavgg.xyz（VidHide）：embed 页内 packed JS 解包出 hls2
+//   master m3u8（urlset 多档：480p/720p/1080p；单档片只出 480p），
+//   分片为明文 TS（无 EXT-X-KEY），分片 Range 206、首字节 0x47；签名 36h。
 //   次腿 voe.sx 实测 404（AVGL-109），只作 embed 回落。
-// 详情当场解出真实档位（只出 master 里有的档，不编造）；play() 用 10 分钟
-//   缓存重解一遍拿新鲜签名；全死时回站内 embed（parse:1）兜底。
+// 根因（2026-11-15 坐实）：VidHide 播单 token 绑 IP——master 必须由取
+//   embed 页的同一个出口 IP 来取，换连接/换出口即 nginx 403（curl、
+//   jina、已部署的中转 Worker 共 6 次全 403；同进程内现铸的 hls4
+//   同 host 相对地址回 200（那是前贴片广告播单），hls2 真片跨 host
+//   仍 403——VM 侧变体直出验不到，真机定性）。中转
+//   因此是死腿，不用。手机 Safari 站内自带播放能播，手机网络没问题，
+//   问题在蜘蛛/App 这边。
+// 修法：详情只从 embed 页 qualityLabels 取真实档位（不取 master，不编
+//   造）；play() 点播时现解现取——POST 取 embed → 取 embed 页 → 解包
+//   出 master → 同一次调用、同一 req 池连续取 master（Referer: embed），
+//   按档位返回变体地址 parse:0；master 取数失败回 master 本身让播放器
+//   再试一次（手机侧 spider 与播放器同出口 IP）；embed 取数失败回
+//   parse:1 站内嗅探。详情时缓存的 master 只作参考，play() 绝不用。
 // 字幕：接定版字幕芯（Layer A），有番号一律接。
 import req from '../../util/req.js';
 
@@ -326,48 +338,78 @@ function labelOf(h) {
   return '自适应';
 }
 
-// 单个 VidHide embed -> master 里的真实档位（只出 master 有的档）
-async function tiersFromVidHide(embed, referer) {
+// 从解包文本取 hls2 master 地址（绝对地址；仅作缓存参考，play()
+// 绝不使用详情时缓存的地址，点播时现解现取）。hls2 形如
+// "hls2":"/stream/.../master.m3u8"，或 jwplayer sources[0].file。
+function masterFromEmbedHtml(html, embed) {
+  const up = unpackPacked(html || '');
+  if (!up) return '';
+  let m = up.match(/"hls2"\s*:\s*"([^"]+)"/);
+  let u = m ? m[1] : '';
+  if (!u) {
+    m = up.match(/"file"\s*:\s*"([^"]*master\.m3u8[^"]*)"/);
+    u = m ? m[1] : '';
+  }
+  if (!u) return '';
+  u = u.replace(/\\\//g, '/').replace(/\\u0026/g, '&');
+  if (/^https?:\/\//i.test(u)) return u;
+  if (u.charAt(0) === '/') {
+    const om = String(embed || '').match(/^(https?:\/\/[^\/]+)/);
+    return om ? om[1] + u : '';
+  }
+  return '';
+}
+
+// 变体/分片相对地址按基准地址补全（只用字符串拼接，不依赖 URL）
+function absUrl(base, rel) {
+  if (/^https?:\/\//i.test(rel)) return rel;
+  const m = String(base || '').match(/^(https?:\/\/[^\/]+)(\/.*)?$/);
+  if (!m) return rel;
+  if (rel.charAt(0) === '/') return m[1] + rel;
+  const dir = (m[2] || '/').replace(/[^\/]*$/, '');
+  return m[1] + dir + rel;
+}
+
+// 单个 VidHide embed -> 解包文本里 qualityLabels 的真实档位（只出
+//   embed 页写明的档，不编造）+ hls2 master 地址（仅作缓存参考）。
+async function labelsFromVidHide(embed, referer) {
   try {
     const html = await getHtml(embed, referer);
-    if (!html) return [];
-    const up = unpackPacked(html);
-    if (!up) return [];
-    const m2 = up.match(/"hls2":"([^"]+)"/);
-    if (!m2) return [];
-    const master = m2[1];
-    const mt = await getText200(master, embed);
-    if (!mt || mt.indexOf('#EXTM3U') < 0) return [];
-    const base = master.split('master.m3u8')[0];
-    const tiers = [];
-    const re = /#EXT-X-STREAM-INF:[^\n]*RESOLUTION=(\d+)x(\d+)[^\n]*\n([^\n]+)/g;
-    let m;
-    while ((m = re.exec(mt)) !== null) {
-      const h = parseInt(m[2], 10) || 0;
-      const rel = (m[3] || '').trim();
-      if (!rel || rel.charAt(0) === '#') continue;
-      const url = /^https?:\/\//i.test(rel) ? rel : base + rel;
-      tiers.push({ label: labelOf(h), url, h });
-    }
-    tiers.sort((a, b) => b.h - a.h);
-    const seen = {};
-    return tiers.filter((x) => {
-      if (seen[x.label]) return false;
-      seen[x.label] = true;
-      return true;
-    });
+    if (!html) return { labels: [], master: '' };
+    return { labels: labelsFromEmbedHtml(html), master: masterFromEmbedHtml(html, embed) };
   } catch (e) {
-    return [];
+    return { labels: [], master: '' };
   }
+}
+
+// qualityLabels 在解包文本里是转义引号形：\'qualityLabels\':{\"2934\":\"1080p\",...}
+function labelsFromEmbedHtml(html) {
+  const up = unpackPacked(html || '');
+  if (!up) return [];
+  const m = up.match(/qualityLabels[^}]*\}/);
+  if (!m) return [];
+  const clean = m[0].replace(/\\"/g, '"').replace(/\\'/g, "'");
+  const out = [];
+  const seen = {};
+  for (const mm of clean.matchAll(/"(\d+)"\s*:\s*"([^"]+)"/g)) {
+    const label = labelOf(parseInt(mm[2].replace(/[^0-9]/g, ''), 10) || 0);
+    if (!label || label === '自适应') continue;
+    if (seen[label]) continue;
+    seen[label] = true;
+    out.push({ label, h: parseInt(mm[2].replace(/[^0-9]/g, ''), 10) || 0 });
+  }
+  out.sort((a, b) => b.h - a.h);
+  return out;
 }
 
 const tierCache = new Map(); // durl -> {ts, v:{tiers, embed}}
 
-// 详情页 -> {tiers:[{label,url,h}], embed}；10 分钟缓存
+// 详情页 -> {tiers:[{label,h}], embed, master}；10 分钟缓存
+// （master 仅作缓存参考，play() 绝不用，点播时现解现取）
 async function resolveTiers(durl) {
   const hit = tierCache.get(durl);
   if (hit && Date.now() - hit.ts < 10 * 60 * 1000) return hit.v;
-  const res = { tiers: [], embed: '' };
+  const res = { tiers: [], embed: '', master: '' };
   try {
     const html = await getHtml(durl);
     if (html) {
@@ -387,8 +429,8 @@ async function resolveTiers(durl) {
           if (!embed) continue;
           if (!res.embed) res.embed = embed;
           if (/earnvidjavgg\.xyz/i.test(embed)) {
-            const tiers = await tiersFromVidHide(embed, durl);
-            if (tiers.length) { res.tiers = tiers; break; }
+            const r2 = await labelsFromVidHide(embed, durl);
+            if (r2.labels.length) { res.tiers = r2.labels; if (r2.master) res.master = r2.master; break; }
           }
         }
       }
@@ -437,6 +479,75 @@ async function detail(reqIn) {
   return { list: [vod] };
 }
 
+// 点播时现解现取（不要用详情时的缓存地址）：详情与点播可能隔几秒，
+// 连接可能已断；embed 页与 master 必须在同一次 play() 调用内、同一
+// 个 req 池里连续取——VidHide 的播单 token 只认取 embed 页的那个
+// 出口 IP，换连接/换出口即 403。
+async function resolveFresh(durl) {
+  const out = { tiers: [], embed: '', master: '' };
+  try {
+    const html = await getHtml(durl);
+    if (!html) return out;
+    const lm = html.match(/id="links" value="([^"]+)"/);
+    if (!lm) return out;
+    const linksVal = lm[1];
+    const nBtn = (html.match(/class="btn btn-server[^"]*"/g) || []).length;
+    const nParts = linksVal.split(',,').length;
+    const n = Math.max(nBtn, nParts, 1);
+    for (let opt = 1; opt <= n; opt++) {
+      let embed = '';
+      try {
+        const body = 'links=' + encodeURIComponent(linksVal) + '&option=' + opt;
+        const r = (await postForm(HOST + '/get_link.php', body, durl)).trim();
+        if (/^https?:\/\//i.test(r)) embed = r;
+      } catch (e) {}
+      if (!embed) continue;
+      if (!out.embed) out.embed = embed;
+      if (!/earnvidjavgg\.xyz/i.test(embed)) continue;
+      let ehtml = '';
+      try { ehtml = await getHtml(embed, durl); } catch (e) {}
+      if (!ehtml) continue;
+      const labels = labelsFromEmbedHtml(ehtml);
+      const master = masterFromEmbedHtml(ehtml, embed);
+      if (!master) continue;
+      out.master = master;
+      if (labels.length) out.tiers = labels;
+      break;
+    }
+  } catch (e) {}
+  return out;
+}
+
+// master 变体播单里按档位挑变体地址（相对地址按 master 所在目录补全；
+// 点的档位不在播单里时回 ''，由调用方回 master 本身让播放器自适应）
+function variantForTier(masterText, masterUrl, want) {
+  const lines = String(masterText || '').split('\n');
+  const vars = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.indexOf('#EXT-X-STREAM-INF') !== 0) continue;
+    const rm = line.match(/RESOLUTION=(\d+)x(\d+)/);
+    const h = rm ? parseInt(rm[2], 10) || 0 : 0;
+    let uri = '';
+    for (let j = i + 1; j < lines.length; j++) {
+      const u = lines[j].trim();
+      if (!u) continue;
+      if (u.charAt(0) === '#') continue;
+      uri = u;
+      break;
+    }
+    if (!uri) continue;
+    vars.push({ label: labelOf(h), h, url: absUrl(masterUrl, uri) });
+  }
+  vars.sort((a, b) => b.h - a.h);
+  if (!vars.length) return '';
+  if (want) {
+    for (const v of vars) { if (v.label === want) return v.url; }
+    return '';
+  }
+  return vars[0].url;
+}
+
 async function play(reqIn) {
   const body = (reqIn && reqIn.body) || {};
   let id = t(body.id || '');
@@ -450,28 +561,35 @@ async function play(reqIn) {
     want = id.slice(at + 1);
   }
   if (durl.indexOf('http') !== 0) durl = HOST + '/' + durl.replace(/^\//, '');
-  const r = await resolveTiers(durl);
-  if (want === 'app' || !r.tiers.length) {
-    return { parse: 1, url: r.embed || durl };
-  }
-  let tier = null;
-  if (want) {
-    for (const x of r.tiers) { if (x.label === want) { tier = x; break; } }
-  }
-  if (!tier) tier = r.tiers[0];
-  const res = {
-    parse: 0,
-    url: tier.url,
-    header: {
-      'User-Agent': UA,
-      'Referer': r.embed || durl,
-    },
-  };
   try {
-    const subs = await subSearchAll(durl);
-    if (subs && subs.length) res.subs = subs;
-  } catch (e) {}
-  return res;
+    const fr = await resolveFresh(durl);
+    // 嗅探行（详情时就没档位）或现解没拿到 master：回站内 embed
+    if (want === 'app' || !fr.master) {
+      return { parse: 1, url: fr.embed || durl };
+    }
+    // master 现取：必须与 embed 页同一次调用、同一 req 池连续取，
+    // token 只认取 embed 页的出口 IP（Referer: embed，15 秒超时）。
+    let url = '';
+    try {
+      const mt = await getText200(fr.master, fr.embed);
+      if (mt && mt.indexOf('#EXTM3U') >= 0) url = variantForTier(mt, fr.master, want);
+    } catch (e) {}
+    // 变体没取到（VM 出口轮换/403）：把 master 本身交给播放器试一次，
+    // 手机侧 spider 与播放器同出口 IP，token 是通的。
+    if (!url) url = fr.master;
+    const res = {
+      parse: 0,
+      url,
+      header: { 'User-Agent': UA, 'Referer': fr.embed },
+    };
+    try {
+      const subs = await subSearchAll(durl);
+      if (subs && subs.length) res.subs = subs;
+    } catch (e) {}
+    return res;
+  } catch (e) {
+    return { parse: 1, url: durl };
+  }
 }
 
 
