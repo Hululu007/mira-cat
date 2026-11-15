@@ -18,6 +18,7 @@ const NAME = '八卦';
 const BASE_URL = 'https://www.mrds66.com';
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 const IMG_PROXY_51 = 'https://51chigua.li768435813.workers.dev/img?url=';
+const RELAY_HL = 'https://javsb-relay.li768435813.workers.dev/hl?url=';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
 
 const CATS = [
@@ -127,16 +128,50 @@ function pagecountFor(html, list, page) {
   return page;
 }
 
-async function fetchHtml(url) {
-  const { data } = await req.get(url, {
-    headers: {
-      'User-Agent': UA,
-      'Referer': BASE_URL + '/',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    },
-    timeout: 20000,
+function isBaguaPage(html) {
+  const s = String(html || '');
+  return s.length > 3000 && (s.indexOf('/archives/') >= 0 || s.indexOf('BlogPosting') >= 0);
+}
+
+// 2026-11-16 并行竞速 + 重试（57吃瓜模式）：单次直取在手机上抖动即空，
+// 分类表现为“有分类无内容”。直连与 javsb-relay /hl 两腿并行，首个真页胜出；
+// 两腿都空时整体重试一次。/hl 白名单目前仅 818hlw1.com，mrds66.com 未放行
+// 时该腿回 403、无害；白名单放行后自动生效。
+async function fetchHtmlOnce(url) {
+  return new Promise((resolve) => {
+    let done = false, settled = 0;
+    const finish = (html) => {
+      if (done) return;
+      if (html) { done = true; resolve(html); return; }
+      settled++;
+      if (settled >= 2) { done = true; resolve(''); }
+    };
+    (async () => {
+      try {
+        const { data } = await req.get(url, {
+          headers: {
+            'User-Agent': UA,
+            'Referer': BASE_URL + '/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+          timeout: 15000,
+        });
+        if (isBaguaPage(data)) finish(String(data)); else finish('');
+      } catch { finish(''); }
+    })();
+    (async () => {
+      try {
+        const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
+        if (isBaguaPage(data)) finish(String(data)); else finish('');
+      } catch { finish(''); }
+    })();
   });
-  return String(data || '');
+}
+
+async function fetchHtml(url) {
+  let html = await fetchHtmlOnce(url);
+  if (!html) html = await fetchHtmlOnce(url);
+  return html;
 }
 
 function parseList(html) {
@@ -190,7 +225,12 @@ function extractVideoUrl(html) {
 }
 
 async function home() {
-  return { class: CATS };
+  let list = [];
+  try {
+    const html = await fetchHtml(BASE_URL + '/');
+    list = parseList(html);
+  } catch (e) { /* 列表失败时分类照常出 */ }
+  return { class: CATS, filters: {}, list };
 }
 
 async function category(reqIn) {

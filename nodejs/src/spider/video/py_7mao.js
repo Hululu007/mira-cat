@@ -200,16 +200,35 @@ async function category(reqIn) {
   }
 }
 
-function mediaKey(eps, cover) {
+function mediaKey(eps) {
   for (const ep of eps || []) {
     const u = ep.seoContentUrl || '';
     const m = u.match(/\/7cat\/([^/]+)\/hls\//);
     if (m) return m[1];
   }
-  if (cover) {
-    const m = cover.match(/\/7cat\/([^/]+)\/cover/);
-    if (m) return m[1];
-  }
+  // 2026-11-16：封面已换成哈希路径（7cat-pic.bedfpk.cn/cover-compression/
+  // variants/v1/cover/<sha256>.jpg），里面没有 key，旧 cover 兜底已死，删掉。
+  // 无 seo URL 的剧（抽查 2/10，多为单集锁定剧）没有公开的 key 来源：
+  // /dramas/{id}/episodes/{epId}/play 需登录（401），封面/列表均无 key。
+  // 这类剧暂时播不了，见报告；有 key 的剧按 key 合成全集地址（已实测 m3u8 200）。
+  return '';
+}
+
+// 2026-11-16：媒体 host 7cat-media.bedfpk.cn 疑似在用户网络侧被拦（与橙果/
+// 黄果同类；javsb-relay 白名单不含该 host，回 403 Host not allowed）。
+// 播放走 7mao-media Worker（duanju91-fetch 同款清单改写+分片代理）中转，
+// 验 #EXTM3U 后才用；Worker 未部署或不可用回落直连。
+// Worker 代码见 7mao-media-worker.js（用户部署）。
+const M7_MEDIA = 'https://7mao-media.li768435813.workers.dev/';
+async function relayM3u8(m3u8Url) {
+  if (!/\.m3u8/i.test(m3u8Url)) return '';
+  try {
+    const relayUrl = M7_MEDIA + 'playlist.m3u8?u=' + encodeURIComponent(m3u8Url);
+    const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 15000 });
+    const d = res && res.data;
+    const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
+    if (text.indexOf('#EXTM3U') >= 0) return relayUrl;
+  } catch (e) {}
   return '';
 }
 
@@ -227,7 +246,7 @@ async function detail(reqIn) {
   if (!obj) return { list: [] };
   const cover = obj.coverUrl || '';
   const eps = Array.isArray(obj.episodes) ? obj.episodes : [];
-  const key = mediaKey(eps, cover);
+  const key = mediaKey(eps);
   const parts = [];
   eps.forEach((ep, i) => {
     const n = parseInt(ep.indexNo || (i + 1), 10) || (i + 1);
@@ -266,7 +285,8 @@ async function play(reqIn) {
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
   if (id.includes('$')) id = id.split('$').pop();
   if (!id) return { parse: 0, url: '' };
-  return { parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+  const relay = await relayM3u8(id);
+  return { parse: 0, url: relay || id, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
 }
 
 export default function createSpider() {

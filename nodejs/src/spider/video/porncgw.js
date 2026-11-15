@@ -399,6 +399,47 @@ function selectPlaySrc(html) {
   return src0 || hevc;
 }
 
+// 2026-11-16 播放根因：站方 SSR 的 videoSrc/videoSrcHevc 已改为空串，
+// VideoObject 也无 contentUrl，旧 selectPlaySrc 永远取不到地址，play()
+// 只能回 parse:1 嗅探详情页，播放器在页内找不到视频，转圈约 10 秒后失败。
+// 现行播放地址只走 POST /api/videos/{id}/playback（短剧分集走
+// /api/videos/{id}/episodes/{ep}/playback），且站方把全部 /api/* 请求
+// 桥接到 POST /api/edge/request（body: {method, path, body: base64, content_type}），
+// 回 {status:1, data:{manifest_method:'GET', streams:{main}, cdn:{...}, timestamp}}。
+// m3u8 照旧走 Worker /p/ 中转；cdn auth 头一并带给播放器。
+const EDGE_BRIDGE = HOST + '/api/edge/request';
+function b64std(s) {
+  try { return Buffer.from(String(s), 'utf8').toString('base64'); } catch (e) { return ''; }
+}
+function playHeader(cdn) {
+  const h = { 'User-Agent': UA, 'Referer': HOST + '/' };
+  if (cdn && cdn.authKey && cdn.authValue) {
+    h[cdn.authKey] = cdn.authValue;
+    if (cdn.app) h['x-cdn-app'] = cdn.app;
+  }
+  return h;
+}
+async function fetchPlayback(path) {
+  const m = String(path || '').match(/^\/(video|drama)\/(\d+)(?:\/(\d+))?\//);
+  if (!m) return null;
+  const apiPath = m[1] === 'drama'
+    ? '/api/videos/' + m[2] + '/episodes/' + (m[3] || '1') + '/playback'
+    : '/api/videos/' + m[2] + '/playback';
+  const payload = { method: 'POST', path: apiPath, body: b64std('{}'), content_type: 'application/json' };
+  try {
+    const res = await req.post(EDGE_BRIDGE, JSON.stringify(payload), {
+      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Content-Type': 'application/json', 'Referer': HOST + path },
+      timeout: 15000,
+    });
+    let d = res && res.data;
+    if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = null; } }
+    const p = (d && d.data) || d;
+    if (!p || !p.streams || !p.streams.main) return null;
+    if (p.manifest_method && p.manifest_method !== 'GET') return null;
+    return { url: String(p.streams.main), cdn: p.cdn || null };
+  } catch (e) { return null; }
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -424,6 +465,17 @@ async function play(reqIn) {
       return { parse: 0, url: proxy || src, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
     }
     return { parse: 0, url: src, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };
+  }
+  // SSR 已无地址：走桥接 API 现取播放地址
+  const api = await fetchPlayback(path);
+  if (api && api.url) {
+    if (/\.m3u8(\?|#|$)/i.test(api.url)) {
+      const relay = pgRelayPlaylist(api.url, pageUrl);
+      if (relay) return { parse: 0, url: relay, header: playHeader(api.cdn) };
+      const proxy = proxyUrl(reqIn, api.url, pageUrl);
+      return { parse: 0, url: proxy || api.url, header: playHeader(api.cdn) };
+    }
+    return { parse: 0, url: api.url, header: playHeader(api.cdn) };
   }
   // 兜底: 交嗅探打开页面本身
   return { parse: 1, url: pageUrl, header: { 'User-Agent': UA, 'Referer': HOST + '/' } };

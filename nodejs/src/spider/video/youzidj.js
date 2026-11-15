@@ -10,15 +10,22 @@ import req from '../../util/req.js';
 //   详情: 剧集页内嵌 JSON-LD (TVSeason)，含剧名/简介/封面/episode 数组 (url+name+episodeNumber)。
 //   搜索: /search/?q={wd} 服务端渲染，单页最多 24 条，站方无搜索分页。
 //   播放: 集页面只有 data-video={videoId}/data-price，无裸流地址；
-//         真链路 = 访客会话 + 播放授权，两步接口:
-//         1) POST /api/account/bootstrap (需 Origin/Referer) -> 建访客账户，
-//            Set-Cookie: eden_account (长效，模块内缓存复用)。
-//         2) POST /api/playback/{videoId}?mode=native (带 eden_account Cookie)
+//         真链路 = 年龄确认 + 访客会话 + 播放授权，三步接口（2026-11-16 实测）：
+//         0) POST /age-check（decision=accepted&return_to=/）-> 303，
+//            Set-Cookie: eden_age_v2=accepted.<ts>.<ts+86400>.<sig>（24 小时）。
+//            不带它调 playback 回 403「请先完成网站入口的年龄确认」。
+//         1) POST /api/account/bootstrap（带 eden_age_v2）-> 建访客账户，
+//            Set-Cookie: eden_account。
+//         2) POST /api/playback/{videoId}?mode=hls（带两个 Cookie）
 //            -> JSON {url: /media/{vid}/{ver}/master.m3u8, expires_at}
-//               + Set-Cookie: eden_play_{videoId} (限定 /media/{vid}/ 路径，约 36 分钟)。
-//         3) 播放器直取 m3u8/分片时必须同带这两个 Cookie，否则 403「播放凭证已过期」。
-//         play() 把 Cookie 写进返回 header (与 UA/Referer 一起)，实测全链 200:
-//         master.m3u8 / init.mp4 / seg00000.m4s 均可达。
+//               + Set-Cookie: eden_play_{videoId}。
+//            mode=native 时回同路径的 native-current.mp4，同样要 Cookie。
+//         3) 播放器直取 m3u8/分片时必须同带这三个 Cookie，否则 403；
+//            播放器不转发 play 的 header，直链从根上播不了，
+//            故 play() 改走 youzidj-fetch Worker 在服务端走完三步取流、
+//            改写清单、分片代理（duanju91-fetch 同款），见 play()。
+//   VIP: 站内有付费解锁机制，但抽查 18 部剧 35 集 data-price 全部为 0，
+//        playback 均正常发授权。若某集 price>0，play() 落 parse:1 嗅探兜底。
 //   VIP: 站内有付费解锁机制 (播放器 JS 有 402->unlock 分支、/api/orders)，
 //        但抽查 18 部剧 35 集 (修仙/都市/古装/家庭伦理/武侠等，含首集与末集)
 //        data-price 全部为 0、data-free=true，playback 均正常发授权。
@@ -37,6 +44,11 @@ const NAME = '柚子短剧';
 const SITE = 'https://youzidj.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
 const REFERER = SITE + '/';
+// 2026-11-16：站方新加年龄确认门 + Cookie 绑定播放，见 play() 注释。
+// 播放走 youzidj-fetch Worker（duanju91-fetch 同款），代码见
+// youzidj-fetch-worker.js（用户部署）；Worker 未部署前 play() 自动
+// 回落嗅探兜底，行为与现在一致。
+const YZ_FETCH = 'https://youzidj-fetch.li768435813.workers.dev';
 
 const GENRES = [
   { slug: 'cultivation', name: '修仙' },
@@ -117,63 +129,6 @@ async function getHtml(url) {
     if (status === 200 && typeof data === 'string' && data) return data;
   } catch (e) { /* 换 fetch */ }
   return timedFetchText(url, headers, 12000);
-}
-
-// POST JSON 接口 (bootstrap/playback 用): 返回 { status, data, setCookie[] }
-// req 优先、fetch 兜底; 两条通道都带 Origin/Referer (接口校验来源)
-async function postJson(url, referer, cookie) {
-  const headers = {
-    'User-Agent': UA,
-    'Referer': referer || REFERER,
-    'Origin': SITE,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-  };
-  if (cookie) headers['Cookie'] = cookie;
-  try {
-    const r = await req.post(url, {}, { headers, timeout: 10000, validateStatus: () => true });
-    const sc = (r.headers && r.headers['set-cookie']) || [];
-    return { status: r.status, data: r.data, setCookie: Array.isArray(sc) ? sc : [sc] };
-  } catch (e) { /* 换 fetch */ }
-  try {
-    const ctl = new AbortController();
-    const to = setTimeout(() => ctl.abort(), 10000);
-    const r = await fetch(url, { method: 'POST', headers, body: '{}', signal: ctl.signal });
-    clearTimeout(to);
-    let data = null;
-    try { data = await r.json(); } catch (e) { /* 非 JSON */ }
-    let sc = [];
-    if (typeof r.headers.getSetCookie === 'function') sc = r.headers.getSetCookie();
-    else if (r.headers.get('set-cookie')) sc = [r.headers.get('set-cookie')];
-    return { status: r.status, data, setCookie: sc };
-  } catch (e) {
-    return { status: 0, data: null, setCookie: [] };
-  }
-}
-
-function pickCookie(setCookie, namePrefix) {
-  for (const line of setCookie || []) {
-    const m = String(line).match(new RegExp('^(' + namePrefix + '[^=]*)=([^;]+)'));
-    if (m) return { name: m[1], value: m[2], pair: m[1] + '=' + m[2] };
-  }
-  return null;
-}
-
-// ---------- 访客会话 (eden_account) ----------
-let accountPair = '';
-let accountAt = 0;
-
-async function ensureAccount(force) {
-  // eden_account 服务端有效期很长，本地缓存 12 小时复用，避免每次 play 都建新访客
-  if (!force && accountPair && Date.now() - accountAt < 12 * 3600 * 1000) return accountPair;
-  const r = await postJson(SITE + '/api/account/bootstrap', REFERER, '');
-  const c = pickCookie(r.setCookie, 'eden_account');
-  if (r.status === 200 && c) {
-    accountPair = c.pair;
-    accountAt = Date.now();
-    return accountPair;
-  }
-  return accountPair || '';
 }
 
 // ---------- 列表解析 ----------
@@ -356,28 +311,32 @@ async function play(reqIn) {
   const videoId = vm[1];
   const pm = html.match(/data-price="([^"]*)"/);
   const price = pm ? pm[1] : '0';
-
-  let acct = await ensureAccount(false);
-  let r = await postJson(SITE + '/api/playback/' + videoId + '?mode=native', epUrl, acct);
-  if (r.status === 401 && acct) {
-    // 会话失效: 强制重建访客账户再试一次
-    acct = await ensureAccount(true);
-    r = await postJson(SITE + '/api/playback/' + videoId + '?mode=native', epUrl, acct);
-  }
-  if (r.status === 402 || price !== '0') {
+  if (price !== '0') {
     // 付费集 (解锁制): 接口不发授权，交嗅探打开集页面走站方解锁流程
     return { parse: 1, jx: 0, url: epUrl, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
-  const data = r.data && typeof r.data === 'object' ? r.data : null;
-  const playCookie = pickCookie(r.setCookie, 'eden_play_');
-  if (r.status !== 200 || !data || !data.url || !playCookie) {
+  // 2026-11-16：站方新加年龄确认门，播放链现为 age-check → bootstrap →
+  // playback ?mode=hls，且 /media/ 下的 m3u8/分片必须同带三个 Cookie
+  // （eden_age_v2、eden_account、eden_play_{videoId}）否则 403；
+  // 播放器不转发 play 的 header，直链从根上播不了（已实测：无 Cookie
+  // 的 m3u8/MP4 一律 403，javsb-relay 也取不到）。
+  // 改走 youzidj-fetch Worker：Worker 在服务端走完三步取流、改写清单、
+  // 分片代理（duanju91-fetch 同款），播放器只向 Worker 要流。
+  // Worker 存活探针：根路径回版本字样才走 Worker，否则嗅探兜底
+  // （Worker 未部署前行为与现在一致）。
+  let workerOk = false;
+  try {
+    const probe = await req.get(YZ_FETCH + '/', { headers: { 'User-Agent': UA }, timeout: 5000 });
+    const txt = probe && probe.data != null ? String(probe.data) : '';
+    workerOk = txt.indexOf('youzidj fetch ok') >= 0;
+  } catch (e) { workerOk = false; }
+  if (!workerOk) {
     return { parse: 1, jx: 0, url: epUrl, header: { 'User-Agent': UA, 'Referer': REFERER } };
   }
-  const cookie = [acct, playCookie.pair].filter(Boolean).join('; ');
   return {
     parse: 0,
-    url: fixUrl(data.url),
-    header: { 'User-Agent': UA, 'Referer': epUrl, 'Cookie': cookie },
+    url: YZ_FETCH + '/play.m3u8?videoId=' + encodeURIComponent(videoId) + '&ep=' + encodeURIComponent(epUrl),
+    header: { 'User-Agent': UA, 'Referer': epUrl },
   };
 }
 

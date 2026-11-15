@@ -19,7 +19,7 @@ const HOSTS = [
   'https://carrier.oqzbuzeo.cc/',
   'https://di59h5e63i08h.cloudfront.net/',
 ];
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const IMG_PROXY = 'https://51chigua.li768435813.workers.dev/img?url=';
 // 2026-10-28 四轮：pic.*.cn 图床的图片是加密存储的密文（直取不是合法图片，
 // App 无法显示）；51chigua 代理实测可解密 pic.hdhwqx.cn（返回合法 JPEG），无需另部署。
@@ -37,7 +37,7 @@ function H(host) {
   return {
     'User-Agent': UA,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Accept-Language': 'en-US,en;q=0.9',
     'Referer': host,
   };
 }
@@ -59,13 +59,25 @@ async function getText(url, host) {
 }
 
 // 首个能出文章的镜像域即为当前域；会话内缓存，失败则回落线路一。
+// 2026-11-16 并行竞速：旧顺序试镜时任一镜像挂起即拖满 15s×2，冷启动极慢；
+// 五路并行，首个出文章的胜出，其余后台结算。
 async function pickHost() {
   if (ACTIVE_HOST) return ACTIVE_HOST;
-  for (const h of HOSTS) {
-    const html = await getText(h, h);
-    if (html && html.indexOf('/archives/') >= 0) { ACTIVE_HOST = h; return h; }
-  }
-  ACTIVE_HOST = HOSTS[0];
+  const found = await new Promise((resolve) => {
+    let done = false, settled = 0;
+    for (const h of HOSTS) {
+      (async () => {
+        try {
+          const html = await getText(h, h);
+          if (!done && html && html.indexOf('/archives/') >= 0) { done = true; resolve(h); return; }
+        } catch {}
+        if (done) return;
+        settled++;
+        if (settled >= HOSTS.length) { done = true; resolve(''); }
+      })();
+    }
+  });
+  ACTIVE_HOST = found || HOSTS[0];
   return ACTIVE_HOST;
 }
 

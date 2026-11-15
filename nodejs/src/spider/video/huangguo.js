@@ -358,14 +358,17 @@ async function detail(reqIn) {
 
 // 2026-10-29：HLS 中转。站方自带播放器在用户手机浏览器里也报“资源加载失败”，
 // 91 还明说“留言您所在地区”——即放视频的 CDN（yd-hls / tp*.drleao.cn）对用户所在地区
-// 不给资源，蜘蛛字段再对也播不了。播放时先向用户自建的 javsb-relay 服务（Railway）要一份
-// 中转版 m3u8（服务在 Railway 抓流、字节原样转发、不解密），中转可用就走中转，
-// 中转未部署或同样不可用时回落直连，行为不比原来差。
-const RELAY = 'https://javsb-relay.li768435813.workers.dev/';
+// 不给资源，蜘蛛字段再对也播不了。播放时先向用户自建的 javsb-relay 服务要一份
+// 中转版 m3u8，中转可用就走中转，中转未部署或同样不可用时回落直连，行为不比原来差。
+// 2026-11-16 修正：javsb-relay 白名单不含黄果 CDN（yd-lphu-hls.hzjvlo.cn /
+// tp*.drleao.cn），/m3u8?u= 回 403 Host not allowed，中转从未生效。
+// 改走已部署的 duanju91-fetch Worker（通用 ?u= 代理，白名单含 *.hzjvlo.cn 与
+// *.drleao.cn，实测回改写版清单、密钥与分片均走 Worker）；不可用回落直连。
+const RELAY = 'https://duanju91-fetch.li768435813.workers.dev/';
 async function relayM3u8(m3u8Url) {
   if (!/\.m3u8/i.test(m3u8Url)) return '';
   try {
-    const relayUrl = RELAY + 'hls?url=' + encodeURIComponent(m3u8Url);
+    const relayUrl = RELAY + 'playlist.m3u8?u=' + encodeURIComponent(m3u8Url);
     const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 15000 });
     const d = res && res.data;
     const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
@@ -379,27 +382,55 @@ async function play(reqIn) {
   // 会被 App 按 $$$ 分隔线路时拆坏, 是不能播放的主因之一 —— 新版 id 不含任何分隔符。
   const pageUrl = absUrl(String(reqIn?.body?.id || '').trim());
   if (!pageUrl) return { parse: 0, url: '', header: {} };
+  // 2026-11-16：站方改走加密 edge API（dx150-edge-v1）取数，详情页
+  // videoInitialData 的 videoSrc / epPlaySrcs 已全空（旧取法回空地址=无限转圈）。
+  // 改走网页播放器同款播放接口（见站方 /static/web/js/services/playback.js 的
+  // video(id, ep)）：POST /api/videos/{vid}/episodes/{ep}/playback，空 JSON 体，
+  // 回 {data:{streams:{main: 签名 m3u8, hevc: ...}}}；实测全集 200，m3u8 与分片
+  // 裸取均 200、无需额外头。分集号从分集页 URL（/video/{vid}/ 或 /ep-{n}/）解析。
+  let url = '';
   try {
-    const html = await getHtml(pageUrl, HOST + '/');
-    const j = parseInitialData(html);
-    let url = '';
-    if (j) {
-      // 分集页的 videoSrc 即本集正片; epPlaySrcs[本集] 兜底; previewSrc 兜底;
-      // 2026-10-29 加固：再补一级 videoSrcHevc（个别剧目主 videoSrc 为空时才用）
-      url = j.videoSrc || (j.epPlaySrcs && j.ep ? j.epPlaySrcs[String(j.ep)] : '') || j.previewSrc || j.videoSrcHevc || '';
+    const m = pageUrl.match(/\/video\/(\d+)\/(?:ep-(\d+)\/)?/);
+    if (m) {
+      const vid = m[1];
+      const ep = m[2] ? parseInt(m[2], 10) : 1;
+      const apiUrl = HOST + '/api/videos/' + vid + '/episodes/' + ep + '/playback';
+      const res = await req.post(apiUrl, '{}', {
+        headers: {
+          ...HTML_HEADERS,
+          'Content-Type': 'application/json',
+          'Accept': 'application/json, text/plain, */*',
+          'Referer': HOST + '/video/' + vid + '/',
+        },
+        timeout: 15000,
+      });
+      let d = res && res.data;
+      if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) { d = null; } }
+      const main = d && d.data && d.data.streams && d.data.streams.main;
+      if (typeof main === 'string' && main) {
+        url = main.replace(/\\u0026/g, '&').replace(/\\\//g, '/').trim();
+      }
     }
-    if (!url) {
-      const m = html.match(/"videoSrc"\s*:\s*"([^"]+)"/);
-      if (m) url = m[1];
-    }
-    url = String(url || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&').trim();
-    if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '', header: {} };
-    // 2026-10-29 加固：Referer 改为分集页 URL 本身（原 HOST 根路径在个别 CDN 校验下更弱）
-    const relay = await relayM3u8(url);
-    return { parse: 0, url: relay || url, header: { 'User-Agent': UA, 'Referer': pageUrl } };
-  } catch (e) {
-    return { parse: 0, url: '', header: {} };
+  } catch (e) {}
+  if (!url) {
+    // 兜底：旧版 videoInitialData 取法（videoSrc/epPlaySrcs/previewSrc）
+    try {
+      const html = await getHtml(pageUrl, HOST + '/');
+      const j = parseInitialData(html);
+      if (j) {
+        url = j.videoSrc || (j.epPlaySrcs && j.ep ? j.epPlaySrcs[String(j.ep)] : '') || j.previewSrc || j.videoSrcHevc || '';
+      }
+      if (!url) {
+        const m2 = html.match(/"videoSrc"\s*:\s*"([^"]+)"/);
+        if (m2) url = m2[1];
+      }
+      url = String(url || '').replace(/\\u0026/g, '&').replace(/\\\//g, '/').replace(/&amp;/g, '&').trim();
+    } catch (e) {}
   }
+  if (!/^https?:\/\//i.test(url)) return { parse: 0, url: '', header: {} };
+  // 2026-10-29 加固：Referer 改为分集页 URL 本身（原 HOST 根路径在个别 CDN 校验下更弱）
+  const relay = await relayM3u8(url);
+  return { parse: 0, url: relay || url, header: { 'User-Agent': UA, 'Referer': pageUrl } };
 }
 
 async function search(reqIn) {

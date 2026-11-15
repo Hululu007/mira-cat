@@ -10,7 +10,7 @@ const HOST = 'https://818hlw1.com/';
 const RELAY_HL = 'https://javsb-relay.li768435813.workers.dev/hl?url=';
 // round3：m3u8 走独立 CF Worker 中转（用户已部署，见文件头 round3 说明）。
 const RELAY = 'https://818hlw.li768435813.workers.dev';
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 // 封面为 AES-128-CBC 加密存储（key f5d965df75336270 / iv 97b60394abc2fbe1），走解密代理出图
 // 2026-10-28 四轮：cell 域每次 301 到随机 jvtshrap.cc 子域，设备端加载不出内容；
 // 改走站方自报永久地址 818hlw1.com（实测直出 30 篇、无跳转）；分类仍取所有 /category/ 链接；
@@ -57,7 +57,7 @@ function H() {
   return {
     'User-Agent': UA,
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Accept-Language': 'en-US,en;q=0.9',
     'Referer': HOST,
     'Origin': HOST.replace(/\/$/, ''),
   };
@@ -72,16 +72,31 @@ function isRealPage(html) {
   return s.indexOf('818黑料网') >= 0 && (s.indexOf('/category/') >= 0 || s.indexOf('/archives/') >= 0);
 }
 
+// 2026-11-16 并行竞速（mrds 模式）：旧顺序回落里直连在手机上常挂满 15s
+// 才轮到中转，App 早已超时、分类翻页表现为“加载不出更多”。两腿并行，
+// 首个真页胜出；败者后台跑完自行结算，不阻塞返回。
 async function getText(url) {
-  try {
-    const { data } = await req.get(url, { headers: H(), timeout: 15000 });
-    if (isRealPage(data)) return String(data);
-  } catch { /* 换中转腿 */ }
-  try {
-    const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
-    if (isRealPage(data)) return String(data);
-  } catch { /* 两腿都失败 */ }
-  return '';
+  return new Promise((resolve) => {
+    let done = false, settled = 0;
+    const finish = (html) => {
+      if (done) return;
+      if (html) { done = true; resolve(html); return; }
+      settled++;
+      if (settled >= 2) { done = true; resolve(''); }
+    };
+    (async () => {
+      try {
+        const { data } = await req.get(url, { headers: H(), timeout: 15000 });
+        if (isRealPage(data)) finish(String(data)); else finish('');
+      } catch { finish(''); }
+    })();
+    (async () => {
+      try {
+        const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
+        if (isRealPage(data)) finish(String(data)); else finish('');
+      } catch { finish(''); }
+    })();
+  });
 }
 
 function imgOf(html) {

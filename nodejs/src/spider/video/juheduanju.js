@@ -106,6 +106,49 @@ const CG_CATS = [
   { type_id: 'browse', type_name: '全部' },
 ];
 function cgHeaders() { return { 'User-Agent': UA, 'Referer': CG_SITE + '/', 'Accept-Language': 'zh-CN,zh;q=0.9' }; }
+// 2026-11-16：频道翻页走加密 API（独立版 chengguo.js 同款，实测）：
+// POST https://api2.chengguodj.com/api/v1/channels/{code}?page={n}，空 JSON 体，
+// 回包 {errcode:0, data:"<base64>"}，data 为 AES-128-CBC（key "2acf7e91e9864673"、
+// iv "1c29882d3ddfcfd6"、Pkcs7）加密的 JSON，内层 {success:true,
+// data:{items, pagination:{total_pages}}}。旧代码 POST 明文到 chengguodj.com
+// 的 /api/v1/channels/，站方早已不认，p2+ 恒空。
+const CG_API2 = 'https://api2.chengguodj.com';
+const CG_API_KEY = Buffer.from('2acf7e91e9864673', 'utf8');
+const CG_API_IV = Buffer.from('1c29882d3ddfcfd6', 'utf8');
+function cgApiDecrypt(b64) {
+  try {
+    const d = crypto.createDecipheriv('aes-128-cbc', CG_API_KEY, CG_API_IV);
+    d.setAutoPadding(true);
+    const plain = Buffer.concat([d.update(Buffer.from(String(b64 || ''), 'base64')), d.final()]).toString('utf8');
+    return JSON.parse(plain);
+  } catch (e) {
+    return null;
+  }
+}
+async function cgApiPost(path) {
+  let env = null;
+  try {
+    env = await httpPostJson(CG_API2 + path, {}, { ...cgHeaders(), 'Content-Type': 'application/json', 'Accept': 'application/json' });
+  } catch (e) { return null; }
+  if (typeof env === 'string') { try { env = JSON.parse(env); } catch (e) { return null; } }
+  if (!env || typeof env !== 'object' || env.errcode !== 0 || typeof env.data !== 'string') return null;
+  const inner = cgApiDecrypt(env.data);
+  if (!inner || inner.success !== true) return null;
+  return inner.data || null;
+}
+// 媒体 host 疑似在用户网络侧被拦（独立版橙果同因），走 javsb-relay V2 中转。
+const CG_RELAY = 'https://javsb-relay.li768435813.workers.dev/';
+async function cgRelayM3u8(m3u8Url) {
+  if (!/\.m3u8/i.test(m3u8Url)) return '';
+  try {
+    const relayUrl = CG_RELAY + 'm3u8?u=' + encodeURIComponent(m3u8Url);
+    const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 10000 });
+    const d = res && res.data;
+    const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
+    if (text.indexOf('#EXTM3U') >= 0) return relayUrl;
+  } catch (e) {}
+  return '';
+}
 function cgProxyPic(u) {
   let s = String(u || '').replace(/\\u002F/g, '/').replace(/\\\//g, '/').trim();
   if (!s) return '';
@@ -146,19 +189,17 @@ function cgParseList(html) {
   return vods;
 }
 async function cgApiList(channel, page) {
-  // 站点改版后 ?page= 参数被忽略,翻页走 POST /api/v1/channels/{channel}?page=
-  let j = null;
-  try {
-    j = await httpPostJson(CG_SITE + '/api/v1/channels/' + encodeURIComponent(channel) + '?page=' + page, {},
-      { ...cgHeaders(), 'Content-Type': 'application/json', 'Accept': 'application/json', 'X-Requested-With': 'XMLHttpRequest' });
-  } catch (e) { return null; }
-  if (!j || typeof j !== 'object') return null;
-  const d = (j.data && typeof j.data === 'object') ? j.data : j;
-  const arr = Array.isArray(d) ? d : (Array.isArray(d.list) ? d.list : (Array.isArray(d.items) ? d.items : null));
-  if (!arr || !arr.length) return null;
+  // 频道翻页：加密 API（api2），真分页，pagecount 取 total_pages。
+  // browse（全部）走 /api/v1/dramas，其他频道走 channels。
+  const path = channel === 'browse'
+    ? '/api/v1/dramas?page=' + page
+    : '/api/v1/channels/' + encodeURIComponent(channel) + '?page=' + page;
+  let d = null;
+  try { d = await cgApiPost(path); } catch (e) { return null; }
+  if (!d || !Array.isArray(d.items) || !d.items.length) return null;
   const vods = [];
   const seen = new Set();
-  for (const item of arr) {
+  for (const item of d.items) {
     if (!item || typeof item !== 'object') continue;
     const title = item.title, slug = item.slug;
     if (!title || typeof title !== 'string' || !slug || typeof slug !== 'string' || seen.has(slug)) continue;
@@ -173,19 +214,18 @@ async function cgApiList(channel, page) {
     vods.push({ vod_id: 'chengguo:' + slug, vod_name: title, vod_pic: pic, vod_remarks: eps ? (eps + '集') : '' });
   }
   if (!vods.length) return null;
-  const total = parseInt((d && d.total) || j.total || 0, 10) || 0;
-  const hasMore = total > 0 ? (page * arr.length < total) : (arr.length >= 20);
-  return { list: vods, hasMore };
+  const pg = d.pagination || {};
+  const totalPages = (typeof pg.total_pages === 'number' && pg.total_pages) ? pg.total_pages : (page + 1);
+  return { list: vods, hasMore: page < totalPages, pagecount: totalPages };
 }
 const cg = {
   cats: CG_CATS,
   async list(cat, page) {
     const ch = cat || 'yuanchuang';
-    if (page > 1) {
-      const r = await cgApiList(ch, page);
-      if (r) return r;
-      return { list: [], hasMore: false };
-    }
+    // p1 也优先加密 API（真分页）；API 不通时 p1 回落频道 HTML 页，p2+ 回空。
+    const r = await cgApiList(ch, page);
+    if (r) return r;
+    if (page > 1) return { list: [], hasMore: false };
     const html = await httpGet(CG_SITE + '/' + ch, cgHeaders());
     const list = cgParseList(html);
     return { list, hasMore: list.length >= 12 };
@@ -207,6 +247,21 @@ const cg = {
     let pic = '';
     const pm = html.match(/(?:z-image-loader-url|data-cover-fb|data-src|src)="([^"]+)"/i);
     if (pm) pic = cgProxyPic(pm[1]);
+    // 2026-11-16：先从 __NUXT_DATA__ 取 total_episode_count 合成全集
+    // （独立版同款；详情页 /play/ 链接可能缺失），再用页内 /play/ 链接补集名。
+    let total = 0;
+    const nm = html.match(/<script[^>]+id=["']__NUXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/);
+    if (nm) {
+      try {
+        const arr = JSON.parse(nm[1].trim());
+        for (const item of arr) {
+          if (item && typeof item === 'object' && ('total_episode_count' in item)) {
+            const v = cgResolve(arr, item.total_episode_count);
+            if (typeof v === 'number' && v > 0) { total = v; break; }
+          }
+        }
+      } catch (e) {}
+    }
     const labels = {};
     const re = new RegExp('<a\\b[^>]*href="/play/' + slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/(\\d+)"[^>]*>([\\s\\S]*?)</a>', 'gi');
     let m;
@@ -215,16 +270,41 @@ const cg = {
       if (n > 0 && !labels[n]) labels[n] = clean(m[2]) || ('第' + n + '集');
     }
     const keys = Object.keys(labels).map(Number).sort((a, b) => a - b);
-    if (!keys.length) return null;
-    const eps = keys.map(n => ({ no: n, name: labels[n], url: 'chengguo://' + slug + '/' + n }));
+    const maxEp = total > 0 ? total : (keys.length ? keys[keys.length - 1] : 0);
+    if (!maxEp) return null;
+    const eps = [];
+    for (let n = 1; n <= maxEp; n++) {
+      eps.push({ no: n, name: labels[n] || ('第' + n + '集'), url: 'chengguo://' + slug + '/' + n });
+    }
     return { name: name || slug, pic, desc, eps };
   },
   async play(slug, no) {
-    let html = await httpGet(CG_SITE + '/play/' + encodeURIComponent(slug) + '/' + no, cgHeaders());
+    const html = await httpGet(CG_SITE + '/play/' + encodeURIComponent(slug) + '/' + no, cgHeaders());
     if (!html) return '';
-    html = html.replace(/\\u0026/g, '&').replace(/\\u002F/g, '/').replace(/\\\//g, '/');
-    const m = html.match(/https?:\/\/[^\s"'\\]{10,300}\.m3u8[^\s"'\\]{0,200}/i);
-    return m ? m[0] : '';
+    // 2026-11-16：页内 m3u8 藏在 __NUXT_DATA__ 里（JSON 转义形态），独立版
+    // 同款解析；旧正则抠不到转义 URL 恒回空。
+    let url = '';
+    const nm = html.match(/<script[^>]+id=["']__NUXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/);
+    if (nm) {
+      try {
+        const arr = JSON.parse(nm[1].trim());
+        for (const v of arr) {
+          if (typeof v === 'string' && v.indexOf('.m3u8') >= 0 && v.indexOf('http') === 0) {
+            url = v.replace(/\\u002[fF]/g, '/').replace(/\\\//g, '/');
+            break;
+          }
+        }
+      } catch (e) {}
+    }
+    if (!url) {
+      const clean = html.replace(/\\u0026/g, '&').replace(/\\u002F/g, '/').replace(/\\\//g, '/');
+      const m = clean.match(/https?:\/\/[^\s"'\\]{10,300}\.m3u8[^\s"'\\]{0,200}/i);
+      if (m) url = m[0];
+    }
+    if (!url) return '';
+    // 媒体 host 疑似在用户网络侧被拦（独立版橙果同因），走 javsb-relay 中转。
+    const relay = await cgRelayM3u8(url);
+    return relay || url;
   },
 };
 
@@ -649,7 +729,8 @@ const kuwo = {
 };
 
 /* ================= 平台: 剧屋(MacCMS) ================= */
-const JW_SITE = 'https://www.juwu.tv';
+// 2026-11-16：站方换域（实测：www.juwu.tv 301 到 www.juwu.app），改走新域省一跳。
+const JW_SITE = 'https://www.juwu.app';
 const JW_CATS = [
   { type_id: '1', type_name: '短剧' },
   { type_id: '2', type_name: '情色电影' },
@@ -711,7 +792,9 @@ const juwu = {
   cats: JW_CATS,
   async list(cat, page) {
     // 剧屋 API 每页只给 3 条（limit 参数无效）：App 一页映射为 M 页 API，并行合并凑满一排
-    const M = 8;
+    // 2026-11-16：M 8→4。实测 8 路并行 11–20 秒（站方并行越慢），超 App 超时致空；
+    // 4 路直连新域约 6 秒、12 条/页。
+    const M = 4;
     const start = (page - 1) * M + 1, end = page * M;
     const jobs = [];
     for (let pg = start; pg <= end; pg++) jobs.push(jwQueryPage({ ac: 'detail', t: cat || '1', pg: String(pg) }).catch(() => ({ items: [], hasMore: false, total: 0, apiPagecount: 0 })));

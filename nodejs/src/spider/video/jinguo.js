@@ -7,6 +7,13 @@ const NAME = '禁果短剧';
 const API_BASE = 'https://jinguoduanju.app';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15';
 
+// 2026-11-16：站方 API 在 VM 侧全通（鉴权 200、列表 200），手机侧直连失败
+// （与 7mao 2026-11-05 注记、mrds 旧案同类：手机直连被按出口指纹拦）。
+// 复用 mrds 并行竞速：每请求直连腿与 Worker 腿同跑，先成功者胜。
+// Worker（jinguo-fetch）为直通代理，部署后才生效；未部署前 Worker 腿失败
+// 即跳过，行为与现在一致。Worker 代码见 jinguo-fetch-worker.js（用户部署）。
+const JG_FETCH = 'https://jinguo-fetch.li768435813.workers.dev';
+
 let _token = '';
 let _deviceId = '';
 
@@ -21,34 +28,55 @@ function randDevice() {
   return s;
 }
 
-async function ensureToken() {
-  if (_token) return _token;
-  if (!_deviceId) _deviceId = randDevice();
-  const url = API_BASE + '/api/v1/auth/device';
-  const { data } = await req.post(url, {
-    deviceId: 'h5:' + _deviceId,
-    channelCode: '',
-    attributionToken: '',
-  }, {
-    headers: {
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': UA,
-      'Referer': API_BASE + '/',
-      'Origin': API_BASE,
-    },
-    timeout: 20000,
-  });
-  let d = data;
-  if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) {} }
-  _token = t(d && d.token);
-  if (!_token) throw new Error('设备登录失败');
-  return _token;
+function parseJsonBody(d) {
+  if (d == null) return null;
+  if (typeof d === 'object') return d;
+  try { return JSON.parse(String(d)); } catch (e) { return null; }
 }
 
-async function apiGet(path, query) {
-  await ensureToken();
-  let url = API_BASE + '/api/v1' + path;
+// 两腿其一先成功即取（mrds 并行竞速）：每腿失败只记 null，不抛错。
+async function raceOk(jobs) {
+  return new Promise((resolve) => {
+    let pending = jobs.length;
+    let done = false;
+    if (!pending) { resolve(null); return; }
+    jobs.forEach((p) => {
+      Promise.resolve(p).then((v) => {
+        if (done) return;
+        if (v !== null && v !== undefined) { done = true; resolve(v); return; }
+        pending -= 1;
+        if (pending <= 0) resolve(null);
+      }).catch(() => {
+        if (done) return;
+        pending -= 1;
+        if (pending <= 0) resolve(null);
+      });
+    });
+  });
+}
+
+// leg 0 = 直连站方，leg 1 = jinguo-fetch Worker 直通代理（转发方法/头/体）。
+async function postVia(leg, path, body) {
+  const base = leg === 1 ? JG_FETCH : API_BASE;
+  const headers = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'User-Agent': UA,
+    'Referer': API_BASE + '/',
+    'Origin': API_BASE,
+  };
+  try {
+    const r = await req.post(base + '/api/v1' + path, body, {
+      headers, timeout: leg === 1 ? 12000 : 8000, validateStatus: () => true,
+    });
+    if (!r || r.status < 200 || r.status >= 300) return null;
+    return parseJsonBody(r.data);
+  } catch (e) { return null; }
+}
+
+async function getVia(leg, path, query, token) {
+  const base = leg === 1 ? JG_FETCH : API_BASE;
+  let url = base + '/api/v1' + path;
   const params = new URLSearchParams();
   for (const k of Object.keys(query || {})) {
     const v = query[k];
@@ -57,19 +85,38 @@ async function apiGet(path, query) {
   }
   const qs = params.toString();
   if (qs) url += '?' + qs;
-  const { data } = await req.get(url, {
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': UA,
-      'Referer': API_BASE + '/',
-      'Origin': API_BASE,
-      'Authorization': 'Bearer ' + _token,
-    },
-    timeout: 20000,
-  });
-  let d = data;
-  if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) {} }
-  if (d && d.status === 401) {
+  const headers = {
+    'Accept': 'application/json',
+    'User-Agent': UA,
+    'Referer': API_BASE + '/',
+    'Origin': API_BASE,
+    'Authorization': 'Bearer ' + token,
+  };
+  try {
+    const r = await req.get(url, {
+      headers, timeout: leg === 1 ? 12000 : 8000, validateStatus: () => true,
+    });
+    if (!r) return null;
+    if (r.status === 401) return '__HTTP401__';
+    if (r.status < 200 || r.status >= 300) return null;
+    return parseJsonBody(r.data);
+  } catch (e) { return null; }
+}
+
+async function ensureToken() {
+  if (_token) return _token;
+  if (!_deviceId) _deviceId = randDevice();
+  const body = { deviceId: 'h5:' + _deviceId, channelCode: '', attributionToken: '' };
+  const d = await raceOk([postVia(0, '/auth/device', body), postVia(1, '/auth/device', body)]);
+  _token = t(d && d.token);
+  if (!_token) throw new Error('设备登录失败');
+  return _token;
+}
+
+async function apiGet(path, query) {
+  await ensureToken();
+  const d = await raceOk([getVia(0, path, query, _token), getVia(1, path, query, _token)]);
+  if (d === '__HTTP401__' || (d && d.status === 401)) {
     _token = '';
     return apiGet(path, query);
   }

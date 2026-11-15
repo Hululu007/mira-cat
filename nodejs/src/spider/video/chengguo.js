@@ -349,6 +349,23 @@ async function detail(reqIn) {
   };
 }
 
+// 2026-11-16：媒体 host hls.ohjzmm.cn 直链 VM 侧全通（m3u8/分片/密钥均 200），
+// 用户点开仍“直接视频加载失败”——疑似该 host 在用户网络侧被拦（与黄果旧注记的
+// CDN 地区拦同类）。播放走 javsb-relay V2（/m3u8?u=，已实测回改写版清单）
+// 中转版，验 #EXTM3U 后才用；中转不可用回落直连。
+const RELAY = 'https://javsb-relay.li768435813.workers.dev/';
+async function relayM3u8(m3u8Url) {
+  if (!/\.m3u8/i.test(m3u8Url)) return '';
+  try {
+    const relayUrl = RELAY + 'm3u8?u=' + encodeURIComponent(m3u8Url);
+    const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 15000 });
+    const d = res && res.data;
+    const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
+    if (text.indexOf('#EXTM3U') >= 0) return relayUrl;
+  } catch (e) {}
+  return '';
+}
+
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '');
@@ -364,9 +381,10 @@ async function play(reqIn) {
   if (!payload || !payload.path) return { parse: 0, url: '' };
   const url = await resolvePlay(payload.path);
   if (!url) return { parse: 0, url: '' };
+  const relay = await relayM3u8(url);
   return {
     parse: 0,
-    url,
+    url: relay || url,
     header: { 'User-Agent': UA, 'Referer': SITE + '/' },
   };
 }
