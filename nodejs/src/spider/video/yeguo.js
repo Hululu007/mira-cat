@@ -6,6 +6,7 @@ import crypto from 'crypto';
 const KEY = 'py_yeguo';
 const NAME = '野果短剧';
 const API_BASE = 'https://www.yeguodj.com/api.php';
+const YG_FETCH = 'https://yeguo-fetch.li768435813.workers.dev/api.php';
 const SITE = 'https://yeguodj.com';
 const IMG_WORKER = 'https://bagua-img-proxy.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
@@ -42,8 +43,8 @@ function aesDecrypt(b64) {
   return plain;
 }
 
-async function apiPost(path, body) {
-  const url = API_BASE + path;
+async function apiPostOnce(base, path, body) {
+  const url = base + path;
   const { data } = await req.post(url, body || {}, {
     headers: {
       'Accept': 'application/json, text/plain, */*',
@@ -56,15 +57,26 @@ async function apiPost(path, body) {
   });
   let d = data;
   if (typeof d === 'string') { try { d = JSON.parse(d); } catch (e) {} }
-  if (!d) throw new Error('空响应: ' + path);
+  if (!d || typeof d !== 'object') throw new Error('空响应: ' + path);
   if (typeof d.data === 'string' && d.data.length > 20) {
-    try {
-      d.data = JSON.parse(aesDecrypt(d.data));
-    } catch (e) {
-      throw new Error('API 解密失败: ' + e.message);
-    }
+    d.data = JSON.parse(aesDecrypt(d.data));
   }
   return d;
+}
+async function apiPost(path, body) {
+  // 双腿回落：先走 yeguo-fetch Worker 腿（设备侧到 yeguodj.com 不通），
+  // 失败再走直连腿；Worker 未部署时直连腿照常工作。
+  const bases = [YG_FETCH, API_BASE];
+  let lastErr = null;
+  for (const base of bases) {
+    try {
+      return await apiPostOnce(base, path, body);
+    } catch (e) {
+      lastErr = e;
+      if (e && /解密失败/.test(String(e.message || ''))) throw e;
+    }
+  }
+  throw lastErr || new Error('请求失败: ' + path);
 }
 
 function unwrap(d) {
