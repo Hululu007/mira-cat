@@ -59,6 +59,7 @@ import shipin51 from './spider/video/51shipin.js';
 import javneon from './spider/video/javneon.js';
 import dycg66 from './spider/video/dycg66.js';
 import cg91 from './spider/video/cg91.js';
+import njav from './spider/video/py_njav.js';
 import noodle from './spider/video/noodle.js';
 import ultra from './spider/video/ultra.js';
 import asian from './spider/video/asian.js';
@@ -211,6 +212,7 @@ const spiders = [
     mitao,
     littlepervert,
     mogu,
+    njav,
     noodle,
     one,
     pandalive,
