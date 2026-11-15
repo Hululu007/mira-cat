@@ -91,8 +91,6 @@ import a91porn from './spider/video/a91porn.js';
 import av01 from './spider/video/av01.js';
 import avporn from './spider/video/avporn.js';
 import chineseav from './spider/video/chineseav.js';
-import javsaga from './spider/video/javsaga.js';
-import javxxx from './spider/video/javxxx.js';
 import littlepervert from './spider/video/littlepervert.js';
 import madouai from './spider/video/madouai.js';
 import px8x from './spider/video/px8x.js';
@@ -196,9 +194,7 @@ const spiders = [
     javplayer,
     javportals,
     javrate,
-    javsaga,
     javtiful,
-    javxxx,
     jinguo,
     juheduanju,
     kanav,
