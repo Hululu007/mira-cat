@@ -12,8 +12,10 @@
 //   StreamHG 系（iplayerhls / callistanise / minochinos / streamhide / likessb / sbstream）
 //   取 links.hls2 签名 master（实测单档：iplayerhls 720p、callistanise 1080p；IP 绑定、同 IP 直取
 //   master 200 / variant 200 / 分片 Range 206 首字节 0x47、无 KEY、Referer 非必需）；
-//   streamtape 取 robotlink 拼 get_video（token 绑定 IP；VM 出口被站方 500 拒，手机待验）；
-//   dood / vsembed / javstream 等解不出直链的回 parse:1 走站内嵌页嗅探；
+//   streamtape 取 robotlink 拼 get_video（token 绑定 IP；VM 侧 get_video 常回站方 500，
+//   偶尔 302 到 tapecontent 直链 MP4——play() 点播时跟 302 拿最终直链交给播放器）；
+//   vsembed 走站内下载 API（/api/download/tiers 取真实档位，/api/download/get 302 到直链 MP4，
+//   token 同样绑 IP，点播时现取现跟）；dood / javstream 等解不出直链的回 parse:1 走站内嵌页嗅探；
 //   asianclub.tv（已停放）、vidoza.net（embed 404）、streamsb.net（embed 跳广告停放页）
 //   三个死线路在详情直接滤掉。
 // 2026-11-15 v2（SIM-082 三线同死坐实）：VS/EV 的 hls2 签名 master 与 ST 的 get_video
@@ -22,6 +24,12 @@
 //   作兜底附带），play() 点播时对点的那条线重新现解（单线 20s 上限），拿新鲜直链
 //   parse:0 交播放器；现解失败回详情时旧地址让播放器再试一次，旧地址也没有回
 //   parse:1 站内嗅探。
+// 2026-11-15 v3（SIM-082 真机：EV 能播，ST/VS 仍失败）：ST 在 play() 点播时现解 get_video 后
+//   跟 302 拿 tapecontent 直链 MP4（播放器不再碰站方常 500 的 get_video）；VS 原是 JS SPA 空壳解不出，
+//   现走站内下载 API——详情时 /api/download/tiers 取真实档位（1080p/720p/540p）出三集，点播时
+//   /api/download/get?s=<id>&t=<档位> 跟 302 拿直链 MP4；标签筛选卡片由前 40 扩到前 60（WP tags
+//   接口按 count 取，41–60 名逐个验过列表 p1 非空）。新顶级分类没有：WP categories 仅 7 个且已全在，
+//   iv（イメージビデオ）count=0 不收。
 // 字幕：接定版字幕芯（Layer A），有番号一律接。
 import req from '../../util/req.js';
 
@@ -62,7 +70,7 @@ const CLASSES = [
 const PATH_BY_ID = {};
 for (const c of CLASSES) PATH_BY_ID[c.type_id] = c.path;
 
-// 标签筛选卡片（WP tags 接口前 40，2026-11-15 实测；榜单页不挂）
+// 标签筛选卡片（WP tags 接口前 60，2026-11-15 实测；榜单页不挂）
 const TAG_FILTER = [
   { n: '全部', v: '' },
   { n: '単体作品', v: '%e5%8d%98%e4%bd%93%e4%bd%9c%e5%93%81' },
@@ -105,6 +113,26 @@ const TAG_FILTER = [
   { n: '制服', v: '%e5%88%b6%e6%9c%8d' },
   { n: '巨尻', v: '%e5%b7%a8%e5%b0%bb' },
   { n: 'イラマチオ', v: '%e3%82%a4%e3%83%a9%e3%83%9e%e3%83%81%e3%82%aa' },
+  { n: '美尻', v: '%e7%be%8e%e5%b0%bb' },
+  { n: '女子大生', v: '%e5%a5%b3%e5%ad%90%e5%a4%a7%e7%94%9f' },
+  { n: 'マドンナ', v: '%e3%83%9e%e3%83%89%e3%83%b3%e3%83%8a' },
+  { n: 'キス・接吻', v: '%e3%82%ad%e3%82%b9%e3%83%bb%e6%8e%a5%e5%90%bb' },
+  { n: '妄想族', v: '%e5%a6%84%e6%83%b3%e6%97%8f' },
+  { n: '羞恥', v: '%e7%be%9e%e6%81%a5' },
+  { n: 'デビュー作品', v: '%e3%83%87%e3%83%93%e3%83%a5%e3%83%bc%e4%bd%9c%e5%93%81' },
+  { n: 'ぶっかけ', v: '%e3%81%b6%e3%81%a3%e3%81%8b%e3%81%91' },
+  { n: 'OL', v: 'ol' },
+  { n: 'ムーディーズ', v: '%e3%83%a0%e3%83%bc%e3%83%87%e3%82%a3%e3%83%bc%e3%82%ba' },
+  { n: 'クンニ', v: '%e3%82%af%e3%83%b3%e3%83%8b' },
+  { n: '乱交', v: '%e4%b9%b1%e4%ba%a4' },
+  { n: 'ドキュメンタリー', v: '%e3%83%89%e3%82%ad%e3%83%a5%e3%83%a1%e3%83%b3%e3%82%bf%e3%83%aa%e3%83%bc' },
+  { n: 'ギャル', v: '%e3%82%ae%e3%83%a3%e3%83%ab' },
+  { n: '4K', v: '4k' },
+  { n: 'SODクリエイト', v: 'sod%e3%82%af%e3%83%aa%e3%82%a8%e3%82%a4%e3%83%88' },
+  { n: '淫語', v: '%e6%b7%ab%e8%aa%9e' },
+  { n: 'ケイ・エム・プロデュース', v: '%e3%82%b1%e3%82%a4%e3%83%bb%e3%82%a8%e3%83%a0%e3%83%bb%e3%83%97%e3%83%ad%e3%83%87%e3%83%a5%e3%83%bc%e3%82%b9' },
+  { n: 'おもちゃ', v: '%e3%81%8a%e3%82%82%e3%81%a1%e3%82%83' },
+  { n: 'アナル', v: '%e3%82%a2%e3%83%8a%e3%83%ab' },
 ];
 
 function filtersFor(id) {
@@ -395,6 +423,79 @@ async function resolveEmbed(embed) {
   return { kind: 'sniff', url: embed };
 }
 
+// 跟 302 拿最终直链文件地址（streamtape get_video -> tapecontent MP4；
+// vsembed /api/download/get -> 直链 MP4）：axios maxRedirects: 0 拿 Location 手动跟，
+// 最多 2 跳；跟不到回 ''。绝不抛错。
+function isMediaFileUrl(u) {
+  return /tapecontent\.net|\.mp4(\?|#|$)/i.test(u || '');
+}
+async function followRedirect(url, referer) {
+  let cur = url;
+  for (let hop = 0; hop < 2; hop++) {
+    let loc = '';
+    let done = '';
+    try {
+      const r = await req.get(cur, { headers: headers(referer), timeout: 6000, maxRedirects: 0, validateStatus: () => true });
+      if (r) {
+        if (r.status >= 300 && r.status < 400) {
+          loc = (r.headers && (r.headers.location || r.headers.Location)) || '';
+        } else if (r.status === 200) {
+          done = r.finalUrl || (r.headers && r.headers['x-final-url']) || '';
+        }
+      }
+    } catch (e) {}
+    if (!loc && !done) {
+      try {
+        if (typeof fetch === 'function') {
+          const fr = await fetch(cur, { headers: headers(referer), redirect: 'manual' });
+          if (fr.status >= 300 && fr.status < 400) loc = fr.headers.get('location') || '';
+          else if (fr.status === 200 && fr.url && fr.url !== cur) done = fr.url;
+        }
+      } catch (e) {}
+    }
+    if (loc) {
+      try { cur = new URL(loc, cur).toString(); } catch (e) { return ''; }
+      if (isMediaFileUrl(cur)) return cur;
+      continue;
+    }
+    if (done && isMediaFileUrl(done)) return done;
+    return '';
+  }
+  return isMediaFileUrl(cur) ? cur : '';
+}
+
+function vsIdOf(embed) {
+  const parts = String(embed || '').split('/').filter(Boolean);
+  return parts.length ? parts[parts.length - 1] : '';
+}
+
+// vsembed 下载档位：/api/download/tiers?s=<id> -> [{file:'1080p',label,size_bytes}]
+// （站内下载按钮同款公开接口，无鉴权；档位真实，不编造）
+async function vsTiers(embed) {
+  try {
+    const id = vsIdOf(embed);
+    if (!id) return [];
+    const r = await req.get('https://vsembed.com/api/download/tiers?s=' + encodeURIComponent(id), {
+      headers: { 'User-Agent': UA, 'Accept': 'application/json', 'Referer': embed },
+      timeout: 10000, validateStatus: () => true,
+    });
+    if (!r || r.status !== 200 || !r.data) return [];
+    const j = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+    const tiers = (j && j.data && j.data.tiers) || [];
+    return tiers.filter((x) => x && /^\d+p$/.test(String(x.file || ''))).map((x) => String(x.file));
+  } catch (e) { return []; }
+}
+
+// vsembed 点播：/api/download/get?s=<id>&t=<档位> 302 -> 直链 MP4，跟 302 拿最终地址
+async function vsDownloadUrl(embed, tier) {
+  try {
+    const id = vsIdOf(embed);
+    if (!id || !tier) return '';
+    const u = 'https://vsembed.com/api/download/get?s=' + encodeURIComponent(id) + '&t=' + encodeURIComponent(tier);
+    return await followRedirect(u, embed);
+  } catch (e) { return ''; }
+}
+
 function parseList(html) {
   const list = [];
   if (!html) return list;
@@ -544,6 +645,29 @@ async function detail(reqIn) {
     }
   }
   const solved = await resolveAll(jobs.map((j) => j.embed));
+  // VS：下载 API 有真实档位（1080p/720p/540p），详情时取档位出多集；取不到只留嗅探行
+  const vsTierMap = {};
+  {
+    const vsJobs = [];
+    const vsSeen = {};
+    for (let k = 0; k < jobs.length; k++) {
+      const emb = jobs[k].embed || '';
+      if (hostOf(emb) !== 'vsembed.com' || vsSeen[emb]) continue;
+      vsSeen[emb] = true;
+      const r = solved[k];
+      if (r && (r.kind === 'hls' || r.kind === 'mp4')) continue;
+      vsJobs.push((async () => {
+        try {
+          const tiers = await Promise.race([
+            vsTiers(emb),
+            new Promise((res) => setTimeout(() => res([]), 10000)),
+          ]);
+          if (tiers && tiers.length) vsTierMap[emb] = tiers;
+        } catch (e) {}
+      })());
+    }
+    await Promise.all(vsJobs);
+  }
   const from = [];
   const urls = [];
   const nParts = Math.max(d.parts.length, 1);
@@ -559,6 +683,10 @@ async function detail(reqIn) {
       // （javmove 同款 playFinish 口径）。
       if (r.kind === 'hls' || r.kind === 'mp4') {
         lines.push(jobs[k].label + '$' + durl + '@@' + jobs[k].embed + '@@' + r.url);
+      } else if (vsTierMap[jobs[k].embed]) {
+        for (const tier of vsTierMap[jobs[k].embed]) {
+          lines.push(jobs[k].label + '·' + tier + '$' + durl + '@@' + jobs[k].embed + '@@' + tier);
+        }
       } else {
         lines.push(jobs[k].label + '$' + durl + '@@' + jobs[k].embed);
       }
@@ -613,6 +741,32 @@ async function play(reqIn) {
       return { parse: 1, url: embed };
     }
     if (embed.indexOf('http') !== 0) return { parse: 1, url: embed };
+    // VS：play id 第 3 段是档位（1080p/720p/540p），走下载 API 现取直链 MP4
+    if (hostOf(embed) === 'vsembed.com') {
+      let tier = /^\d+p$/.test(oldUrl || '') ? oldUrl : '';
+      if (!tier) {
+        try {
+          const tiers = await Promise.race([
+            vsTiers(embed),
+            new Promise((res) => setTimeout(() => res([]), 10000)),
+          ]);
+          if (tiers && tiers.length) tier = tiers[0];
+        } catch (e) {}
+      }
+      if (tier) {
+        const u = await vsDownloadUrl(embed, tier);
+        if (u) {
+          const res = {
+            parse: 0,
+            url: u,
+            header: { 'User-Agent': UA, 'Referer': embed },
+          };
+          attachSubs(res, durl);
+          return res;
+        }
+      }
+      return { parse: 1, url: embed };
+    }
     // 老格式：id 里直接是详情时铸好的直链（无 embed 可重解），沿用旧行为直接交播放器
     if (isDirectMedia(embed) && !oldUrl) {
       const res = {
@@ -638,9 +792,17 @@ async function play(reqIn) {
       r = null;
     }
     if (r && (r.kind === 'hls' || r.kind === 'mp4')) {
+      let playUrl = r.url;
+      // ST：跟 302 拿 tapecontent 直链 MP4，播放器不再碰站方常 500 的 get_video
+      if (r.kind === 'mp4' && r.url.indexOf('/get_video?') >= 0) {
+        try {
+          const followed = await followRedirect(r.url, embed);
+          if (followed) playUrl = followed;
+        } catch (e) {}
+      }
       const res = {
         parse: 0,
-        url: r.url,
+        url: playUrl,
         header: {
           'User-Agent': UA,
           'Referer': embed,
@@ -651,9 +813,17 @@ async function play(reqIn) {
     }
     // 现解失败（超时/抛错/死线/解不出）：回详情时旧直链让播放器再试一次
     if (oldUrl && isDirectMedia(oldUrl)) {
+      let playUrl = oldUrl;
+      // ST 旧地址也是 get_video：同样跟 302 拿最终直链
+      if (oldUrl.indexOf('/get_video?') >= 0) {
+        try {
+          const followed = await followRedirect(oldUrl, embed);
+          if (followed) playUrl = followed;
+        } catch (e) {}
+      }
       const res = {
         parse: 0,
-        url: oldUrl,
+        url: playUrl,
         header: {
           'User-Agent': UA,
           'Referer': durl || embed,
