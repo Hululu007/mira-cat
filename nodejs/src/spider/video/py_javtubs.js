@@ -25,6 +25,10 @@
 //   再试一次（手机侧 spider 与播放器同出口 IP）；embed 取数失败回
 //   parse:1 站内嗅探。详情时缓存的 master 只作参考，play() 绝不用。
 // 字幕：接定版字幕芯（Layer A），有番号一律接。
+// v3（2026-11-15）：Reducing Mosaic 片走 dramiyos-cdn，播放器拿到播单后卡在变体/
+//   分片取数上转圈——用户手机 Safari 站内自带播放能播（2026-11-15 18:32 真机鉴别），
+//   内容是活的，问题在 App 取数路径。新增蜘蛛本地代理（照抄 py_24jav / py_5lxtv
+//   已证模式）：只对 dramiyos-cdn 的 master 走代理，acek-cdn 保持 v2 原样直出。
 import req from '../../util/req.js';
 
 const KEY = 'py_javtubs';
@@ -548,6 +552,171 @@ function variantForTier(masterText, masterUrl, want) {
   return vars[0].url;
 }
 
+// ---------------- 播单/分片本地代理（2026-11-15 v3：修 Reducing Mosaic 点播转圈） ----------------
+// 病因（2026-11-15 坐实）：RM 重编码片的 hls2 走 dramiyos-cdn.com；播放器拿到播单后
+// 卡在变体/分片取数上转圈（分片要 Referer 而 system 播放器不带，或该 CDN 拒播放器
+// 请求）；用户手机 Safari 站内自带播放能播（2026-11-15 18:32 真机鉴别），内容本身
+// 是活的。修法照抄 py_24jav / py_5lxtv 已证的本地代理模式：播单与分片全部经蜘蛛
+// 本机代理取回，代理代带 Referer（嵌页地址），分片原样透传 video/mp2t + Range；
+// 只对 dramiyos-cdn 的 master 走代理，acek-cdn（FNS-276 等普通片，现已能播）
+// 保持 v2 原样直出，绝不回归。
+// 地址形态同 24jav/5lxtv 先例：播放地址查询串形式 /proxy/m3u8?u=&r=（&m= 为父播单
+// 地址，供取数失败时换 Referer 重试）；改写后的清单行一律用请求 Host 拼完整
+// http:// 绝对地址；媒体清单的分片行走路径段形式并带 .ts 后缀（过 ffmpeg
+// 分片后缀白名单）。分片是明文 TS，无 PNG 头，不剥头（与 5lxtv 同款直通）。
+function b64url(s) {
+  try {
+    return Buffer.from(String(s), 'utf8').toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+  } catch (e) { return ''; }
+}
+
+function unb64url(s) {
+  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+}
+
+// 构造本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 24jav/5lxtv 先例：
+// 查询串形式 /proxy/m3u8?u=&r=）
+function proxyUrl(reqIn, path, targetUrl, referer) {
+  try {
+    const server = reqIn?.server;
+    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
+    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
+    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+
+async function fetchBytes(url, referer) {
+  try {
+    const r = await req.get(url, {
+      headers: { 'User-Agent': UA, 'Referer': referer || (HOST + '/'), 'Accept': '*/*' },
+      timeout: 30000,
+      responseType: 'arraybuffer',
+      validateStatus: () => true,
+    });
+    if (!r || r.status < 200 || r.status >= 300 || !r.data) return null;
+    return Buffer.isBuffer(r.data) ? r.data : Buffer.from(r.data);
+  } catch (e) {
+    try {
+      if (typeof fetch === 'function') {
+        const r = await fetch(url, { headers: { 'User-Agent': UA, 'Referer': referer || (HOST + '/') } });
+        if (!r || !r.ok) return null;
+        return Buffer.from(await r.arrayBuffer());
+      }
+    } catch (e2) {}
+    return null;
+  }
+}
+
+// 改写清单正文：# 行的 URI="..."（音频轨/密钥）与非 # 行（variant/分片）一律改指回本地代理。
+// selfBase 是完整 http:// 绝对基址（同 24jav/5lxtv：取请求 Host 拼 http://<host>/spider/py_javtubs/3）。
+// master 的 variant 行与音频/密钥 URI 行是子播单，走查询串形式 /proxy/m3u8?u=&r=&m=；
+// 媒体清单的分片行走路径段形式并在末尾加 .ts 后缀（过 ffmpeg 分片后缀白名单；
+// b64url 字母表无 '.'，后缀无歧义）。m= 是父播单地址：代理取数失败时换它作 Referer 再试一次。
+function rewriteJavtubsM3u8(raw, playlistUrl, selfBase, referer) {
+  const isMaster = String(raw).includes('#EXT-X-STREAM-INF');
+  const lines = String(raw).split(/\r?\n/);
+  const out = lines.map((line) => {
+    const s = line.trim();
+    if (!s) return line;
+    if (s.startsWith('#')) {
+      if (s.includes('URI="')) {
+        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
+          try {
+            const abs = new URL(uri, playlistUrl).toString();
+            return `URI="${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}&m=${b64url(playlistUrl)}"`;
+          } catch (e) { return all; }
+        });
+      }
+      return line;
+    }
+    try {
+      const abs = new URL(s, playlistUrl).toString();
+      if (isMaster) return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}&m=${b64url(playlistUrl)}`;
+      return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}/${b64url(playlistUrl)}.ts`;
+    } catch (e) { return line; }
+  });
+  return out.join('\n');
+}
+
+// 代理入口（两种地址格式都接受）：
+// 主格式（本版 play 发出）：/proxy/m3u8?u={b64url}&r={b64url}[&m={b64url 父播单}]，同 24jav/5lxtv 先例；
+// 分片格式：/proxy/{b64url 目标}/{b64url referer}/{b64url 父播单}.ts。
+// 取回的文本是 #EXTM3U 即按清单改写；否则按分片字节原样透传 video/mp2t（支持 Range）。
+// 取数失败时：有父播单地址 m= 就换它作 Referer 再试一次；仍失败则 302 回源地址
+// （播放器直取，等价于 v2 回落），绝不挂住播放器。
+async function m3u8Proxy(request, reply) {
+  const q = request?.query || {};
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  let mEnc = q.m || '';
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    // 分片行带 .ts 后缀（过 ffmpeg 分片后缀白名单）；b64url 无 '.'，剥后缀无歧义。
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; mEnc = segs[2] || ''; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  let parent = '';
+  try {
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
+    if (mEnc) parent = unb64url(mEnc) || '';
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  // 改写基址：同 24jav/5lxtv，用请求 Host 拼完整 http:// 绝对地址；无 Host 时退回
+  // proxyUrl 拼出的 js2p:// 形式。
+  const host = request.headers && request.headers.host;
+  const selfBase = host
+    ? `http://${host}/spider/${KEY}/3`
+    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
+  try {
+    let buf = await fetchBytes(target, referer);
+    if (!buf || !buf.length) {
+      // 换父播单地址作 Referer 再试一次（dramiyos-cdn 可能认播单地址不认嵌页）
+      if (parent && parent !== referer) buf = await fetchBytes(target, parent);
+    }
+    if (!buf || !buf.length) { reply.redirect(target); return; }
+    const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+    if (head.trimStart().startsWith('#EXTM3U')) {
+      reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+      reply.header('Cache-Control', 'no-cache');
+      reply.send(rewriteJavtubsM3u8(buf.toString('utf8'), target, selfBase, referer));
+      return;
+    }
+    // 分片：明文 TS 原样透传，不剥头；回 video/mp2t + Range。
+    const range = request?.headers && request.headers.range;
+    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      const start = Math.min(parseInt(m[1], 10) || 0, buf.length);
+      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
+      if (start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', 'bytes ' + start + '-' + end + '/' + buf.length);
+        reply.send(buf.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(buf);
+  } catch (e) {
+    try { reply.redirect(target); } catch (e2) { /* 已发送则忽略 */ }
+  }
+}
+
 async function play(reqIn) {
   const body = (reqIn && reqIn.body) || {};
   let id = t(body.id || '');
@@ -567,6 +736,28 @@ async function play(reqIn) {
     if (want === 'app' || !fr.master) {
       return { parse: 1, url: fr.embed || durl };
     }
+    // dramiyos-cdn（RM 重编码片）：走本地代理——播单与分片全由蜘蛛代取并带
+    // Referer（嵌页），播放器只跟本机代理说话；代理取数失败时 302 回源地址。
+    if (/dramiyos-cdn\.com/i.test(fr.master)) {
+      let target = '';
+      try {
+        const mt = await getText200(fr.master, fr.embed);
+        if (mt && mt.indexOf('#EXTM3U') >= 0) target = variantForTier(mt, fr.master, want) || fr.master;
+      } catch (e) {}
+      if (!target) target = fr.master;
+      const proxied = proxyUrl(reqIn, '/proxy/m3u8', target, fr.embed);
+      const pres = {
+        parse: 0,
+        url: proxied || target,
+        header: { 'User-Agent': UA, 'Referer': fr.embed },
+      };
+      try {
+        const subs = await subSearchAll(durl);
+        if (subs && subs.length) pres.subs = subs;
+      } catch (e) {}
+      return pres;
+    }
+    // acek-cdn（普通片，现已能播）：v2 原样直出，一字不动。
     // master 现取：必须与 embed 页同一次调用、同一 req 池连续取，
     // token 只认取 embed 页的出口 IP（Referer: embed，15 秒超时）。
     let url = '';
@@ -1044,6 +1235,8 @@ export default function createSpider() {
       fastify.post('/category', category);
       fastify.post('/detail', detail);
       fastify.post('/play', play);
+      fastify.get('/proxy/*', m3u8Proxy);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
       fastify.post('/search', search);
     },
   };
