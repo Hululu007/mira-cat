@@ -16,6 +16,12 @@
 //   dood / vsembed / javstream 等解不出直链的回 parse:1 走站内嵌页嗅探；
 //   asianclub.tv（已停放）、vidoza.net（embed 404）、streamsb.net（embed 跳广告停放页）
 //   三个死线路在详情直接滤掉。
+// 2026-11-15 v2（SIM-082 三线同死坐实）：VS/EV 的 hls2 签名 master 与 ST 的 get_video
+//   token 都绑 IP，详情时铸好的直链到点播时再交播放器——中间隔的时间 + 出口 IP 可能
+//   已变，地址就死了。修法（JavTubs 同款）：detail() 只把 embed 写进 play id（直链仅
+//   作兜底附带），play() 点播时对点的那条线重新现解（单线 20s 上限），拿新鲜直链
+//   parse:0 交播放器；现解失败回详情时旧地址让播放器再试一次，旧地址也没有回
+//   parse:1 站内嗅探。
 // 字幕：接定版字幕芯（Layer A），有番号一律接。
 import req from '../../util/req.js';
 
@@ -547,9 +553,12 @@ async function detail(reqIn) {
       if (jobs[k].pi !== pi) continue;
       const r = solved[k];
       if (!r || r.kind === 'dead') continue;
-      // 播放 id 埋详情 URL：<durl>@@<embed 或直链>，play() 凭 durl 查字幕缓存（javmove 同款 playFinish 口径）
+      // 播放 id 埋详情 URL + embed + 详情时旧直链：<durl>@@<embed>@@<旧直链>，
+      // play() 点播时用 embed 重新现解（IP 绑定地址现铸现用），旧直链只作现解失败
+      // 时的兜底；嗅探行无旧直链，仍为 <durl>@@<embed>。play() 凭 durl 查字幕缓存
+      // （javmove 同款 playFinish 口径）。
       if (r.kind === 'hls' || r.kind === 'mp4') {
-        lines.push(jobs[k].label + '$' + durl + '@@' + r.url);
+        lines.push(jobs[k].label + '$' + durl + '@@' + jobs[k].embed + '@@' + r.url);
       } else {
         lines.push(jobs[k].label + '$' + durl + '@@' + jobs[k].embed);
       }
@@ -583,43 +592,80 @@ async function play(reqIn) {
   let id = t(body.id || '');
   id = subNormKey(id);
   if (!id) return { parse: 1, url: '' };
-  // 播放 id 形如 <durl>@@<embed>（detail 时埋的；老格式裸 embed 也兼容）
-  let durl = '';
-  let embed = id;
-  const sep = id.indexOf('@@');
-  if (sep > 0) { durl = id.slice(0, sep); embed = id.slice(sep + 2); }
-  // 嗅探行：站内详情页本身
-  if (embed.indexOf('openload.mov') >= 0 && embed.indexOf('/op-') >= 0) {
+  try {
+    // 播放 id：新格式 <durl>@@<embed>@@<旧直链>；嗅探行 <durl>@@<embed>；
+    // 老格式 <durl>@@<直链>（旧包）与裸 embed / 裸详情 URL 兼容。
+    // 直链里不含 '@@'，按 '@@' 切分安全。
+    let durl = '';
+    let embed = id;
+    let oldUrl = '';
+    const parts = id.split('@@');
+    if (parts.length >= 3) {
+      durl = parts[0];
+      embed = parts[1];
+      oldUrl = parts.slice(2).join('@@');
+    } else if (parts.length === 2) {
+      durl = parts[0];
+      embed = parts[1];
+    }
+    // 嗅探行：站内详情页本身
+    if (embed.indexOf('openload.mov') >= 0 && embed.indexOf('/op-') >= 0) {
+      return { parse: 1, url: embed };
+    }
+    if (embed.indexOf('http') !== 0) return { parse: 1, url: embed };
+    // 老格式：id 里直接是详情时铸好的直链（无 embed 可重解），沿用旧行为直接交播放器
+    if (isDirectMedia(embed) && !oldUrl) {
+      const res = {
+        parse: 0,
+        url: embed,
+        header: {
+          'User-Agent': UA,
+          'Referer': durl || embed,
+        },
+      };
+      attachSubs(res, durl);
+      return res;
+    }
+    // 点播时对点的这条线重新现解（单线 20s 上限）：IP 绑定地址必须现铸现用，
+    // 详情时铸好的到点播时可能已死（SIM-082 三线同死，2026-11-15 真机坐实）。
+    let r = null;
+    try {
+      r = await Promise.race([
+        resolveEmbed(embed),
+        new Promise((res) => setTimeout(() => res(null), 20000)),
+      ]);
+    } catch (e) {
+      r = null;
+    }
+    if (r && (r.kind === 'hls' || r.kind === 'mp4')) {
+      const res = {
+        parse: 0,
+        url: r.url,
+        header: {
+          'User-Agent': UA,
+          'Referer': embed,
+        },
+      };
+      attachSubs(res, durl);
+      return res;
+    }
+    // 现解失败（超时/抛错/死线/解不出）：回详情时旧直链让播放器再试一次
+    if (oldUrl && isDirectMedia(oldUrl)) {
+      const res = {
+        parse: 0,
+        url: oldUrl,
+        header: {
+          'User-Agent': UA,
+          'Referer': durl || embed,
+        },
+      };
+      attachSubs(res, durl);
+      return res;
+    }
     return { parse: 1, url: embed };
+  } catch (e) {
+    return { parse: 1, url: '' };
   }
-  if (embed.indexOf('http') !== 0) return { parse: 1, url: embed };
-  // 详情已解析好的直链（hls2 master / get_video mp4）：直接交播放器，不再二次解析
-  if (isDirectMedia(embed)) {
-    const res = {
-      parse: 0,
-      url: embed,
-      header: {
-        'User-Agent': UA,
-        'Referer': durl || embed,
-      },
-    };
-    attachSubs(res, durl);
-    return res;
-  }
-  const r = await resolveEmbed(embed);
-  if (r.kind === 'hls' || r.kind === 'mp4') {
-    const res = {
-      parse: 0,
-      url: r.url,
-      header: {
-        'User-Agent': UA,
-        'Referer': embed,
-      },
-    };
-    attachSubs(res, durl);
-    return res;
-  }
-  return { parse: 1, url: embed };
 }
 
 
