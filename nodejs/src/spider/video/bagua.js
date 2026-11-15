@@ -18,7 +18,11 @@ const NAME = '八卦';
 const BASE_URL = 'https://www.mrds66.com';
 const IMG_PROXY = 'https://bagua-img-proxy.li768435813.workers.dev/img?url=';
 const IMG_PROXY_51 = 'https://51chigua.li768435813.workers.dev/img?url=';
-const RELAY_HL = 'https://javsb-relay.li768435813.workers.dev/hl?url=';
+// 2026-11-16：javsb-relay /hl 白名单只认 818hlw1.com，mrds66.com 回 403——
+// 这就是八卦“分类能出、内容全空”的根因（直连腿手机侧被 CF 指纹拦、/hl 腿 403，
+// 两腿全灭）。改走同站家族已部署的 mrds-fetch Worker（/f/?u= 通用取页，
+// 白名单只认 mrds66.com，正好对口；实测 /category/xazd/ 回真页 30 篇）。
+const MRDS_FETCH = 'https://mrds-fetch.li768435813.workers.dev/f/?u=';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36';
 
 const CATS = [
@@ -154,14 +158,14 @@ async function fetchHtmlOnce(url) {
             'Referer': BASE_URL + '/',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           },
-          timeout: 15000,
+          timeout: 5000,
         });
         if (isBaguaPage(data)) finish(String(data)); else finish('');
       } catch { finish(''); }
     })();
     (async () => {
       try {
-        const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
+        const { data } = await req.get(MRDS_FETCH + encodeURIComponent(url), { timeout: 8000 });
         if (isBaguaPage(data)) finish(String(data)); else finish('');
       } catch { finish(''); }
     })();

@@ -75,7 +75,10 @@ function isRealPage(html) {
 // 2026-11-16 并行竞速（mrds 模式）：旧顺序回落里直连在手机上常挂满 15s
 // 才轮到中转，App 早已超时、分类翻页表现为“加载不出更多”。两腿并行，
 // 首个真页胜出；败者后台跑完自行结算，不阻塞返回。
-async function getText(url) {
+// 2026-11-16：直连腿超时 15s→5s（mrds 同款：手机直连常被 CF 按出口指纹拦、挂满
+// 超时；若 App 的 req 把两腿串行，15s 直连会拖垮整次取数；5s 快速失败让中转腿接管）。
+// 中转腿 10s。getText 空结果再重试一轮。
+async function getTextOnce(url) {
   return new Promise((resolve) => {
     let done = false, settled = 0;
     const finish = (html) => {
@@ -86,17 +89,23 @@ async function getText(url) {
     };
     (async () => {
       try {
-        const { data } = await req.get(url, { headers: H(), timeout: 15000 });
+        const { data } = await req.get(url, { headers: H(), timeout: 5000 });
         if (isRealPage(data)) finish(String(data)); else finish('');
       } catch { finish(''); }
     })();
     (async () => {
       try {
-        const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 15000 });
+        const { data } = await req.get(RELAY_HL + encodeURIComponent(url), { timeout: 10000 });
         if (isRealPage(data)) finish(String(data)); else finish('');
       } catch { finish(''); }
     })();
   });
+}
+
+async function getText(url) {
+  let html = await getTextOnce(url);
+  if (!html) html = await getTextOnce(url);
+  return html;
 }
 
 function imgOf(html) {

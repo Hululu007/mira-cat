@@ -95,13 +95,23 @@ async function api(path) {
   return null;
 }
 
+// 2026-11-16：约 9% 的封面 URL 含 %XX 编码中文文件名（covers/<id>/<id>-<中文名>.jpg|png）。
+// App 侧图片加载器疑似对 %XX 再编码一次（%→%25）致 404，造成“有的出有的不出”。
+// 这里把 %XX 解回原文字符交 App 编码一次；decodeURI 不动 %2F/%3F 等保留字符，
+// 解失败回原串。非编码封面不受影响。
+function decodePic(u) {
+  const s = String(u || '').trim();
+  if (!s || s.indexOf('%') < 0) return s;
+  try { return decodeURI(s); } catch (e) { return s; }
+}
+
 function vod(j) {
   if (!j) return null;
   const n = parseInt(j.episodeCount || 0, 10) || 0;
   return {
     vod_id: j.dramaId || j.id || '',
     vod_name: j.title || '',
-    vod_pic: j.coverUrl || '',
+    vod_pic: decodePic(j.coverUrl || ''),
     vod_remarks: n > 0 ? ('共' + n + '集') : '',
     type_name: (Array.isArray(j.tags) && j.tags.length) ? j.tags.join(' · ') : '短剧',
   };
@@ -244,7 +254,7 @@ async function detail(reqIn) {
   if (!vid) return { list: [] };
   const obj = await api('/dramas/' + encodeURIComponent(vid));
   if (!obj) return { list: [] };
-  const cover = obj.coverUrl || '';
+  const cover = decodePic(obj.coverUrl || '');
   const eps = Array.isArray(obj.episodes) ? obj.episodes : [];
   const key = mediaKey(eps);
   const parts = [];

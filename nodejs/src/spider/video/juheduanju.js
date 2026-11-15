@@ -742,9 +742,12 @@ function jwCleanPic(pic) {
   let host = '';
   try { host = (new URL(s).hostname || '').toLowerCase(); } catch (e) { return ''; }
   if (!host) return '';
-  if (host === 'img.test.com') {
+  // 2026-11-16：static.juwu.tv / static.juwu.app 已死（DNS 指到不可达地址，
+  // 裸取 000），站方现用 www.juwu.app 域名；详情接口给的 img.test.com 图
+  // 一律改走 www.juwu.app + 原路径（实测回 200 真 JPEG）。
+  if (host === 'img.test.com' || host === 'static.juwu.tv' || host === 'static.juwu.app') {
     const u = new URL(s);
-    u.hostname = 'static.juwu.tv';
+    u.hostname = 'www.juwu.app';
     u.protocol = 'https:';
     return u.toString();
   }
