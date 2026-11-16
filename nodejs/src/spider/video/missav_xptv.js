@@ -6,6 +6,8 @@ const NAME = 'MissAV';
 // 源文件(XPTV)里的 site 是 https://missav.ai，但实测该域名不通(超时)，
 // 用户此前已确认可用域名为 missav.fans，此处使用可用域名
 const HOST = 'https://missav.fans';
+// HTML 抓取走 missav-fetch Worker（绕设备侧 CF 指纹拦截），未部署时回落直连
+const MISSAV_FETCH = 'https://missav-fetch.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko)';
 
 // 源文件 appConfig.tabs 映射 (31 个分类)
@@ -155,6 +157,12 @@ function headers(referer) {
 }
 
 async function getHtml(url, referer) {
+  // 先走 Worker 腿（绕设备侧 CF 指纹拦截）；Worker 未部署或返回无效时回落直连
+  try {
+    const { data } = await req.get(MISSAV_FETCH + '/?u=' + encodeURIComponent(url), { timeout: 20000 });
+    const s = String(data || '');
+    if (s && !s.includes('Just a moment...') && (s.includes('thumbnail') || s.includes('og:title'))) return s;
+  } catch (e) {}
   try {
     const { data } = await req.get(url, { headers: headers(referer), timeout: 20000 });
     return String(data || '');
