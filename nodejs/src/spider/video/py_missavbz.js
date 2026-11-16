@@ -219,6 +219,24 @@ async function detail(reqIn) {
   return { list: [vod] };
 }
 
+// master 播单里第一条 variant 地址（#EXT-X-STREAM-INF 下一行；相对地址按 master 解析）
+function firstVariantUri(masterText, masterUrl) {
+  const lines = String(masterText || '').split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i].trim();
+    if (ln.indexOf('#EXT-X-STREAM-INF') === 0) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const u = lines[j].trim();
+        if (!u) continue;
+        if (u.charAt(0) === '#') break;
+        try { return new URL(u, masterUrl).toString(); } catch (e) { return u; }
+      }
+      return '';
+    }
+  }
+  return '';
+}
+
 async function play(reqIn) {
   const body = (reqIn && reqIn.body) || {};
   let id = t(body.id || '');
@@ -236,6 +254,16 @@ async function play(reqIn) {
   // 死片在站内也播不了，嗅探只是兜底，不把死地址交给播放器）。
   const probe = await getText(master, durl, 6000);
   if (!probe || probe.trimStart().indexOf('#EXTM3U') !== 0) return { parse: 1, url: durl };
+  // 2026-11-17 修：master 活不等于能播——FPRE-239-RM master 活但 variant 回 nginx 403，
+  // 播放器取 variant 403 而失败。须再探第一条 variant，同样 #EXTM3U 开头才算活；
+  // 媒体播单（含 #EXTINF）无 variant，直接算活。variant 死的回嗅探，不交死链。
+  if (probe.indexOf('#EXTINF') < 0) {
+    const vu = firstVariantUri(probe, master);
+    if (vu) {
+      const vp = await getText(vu, durl, 6000);
+      if (!vp || vp.trimStart().indexOf('#EXTM3U') !== 0) return { parse: 1, url: durl };
+    }
+  }
   const res = {
     parse: 0,
     url: master,
