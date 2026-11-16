@@ -116,7 +116,6 @@ import openload from './spider/video/py_openload.js';
 import javtubs from './spider/video/py_javtubs.js';
 import javlust from './spider/video/py_javlust.js';
 import javdo from './spider/video/py_javdo.js';
-import missavbz from './spider/video/py_missavbz.js';
 
 const spiders = [
     missav_xptv,
@@ -127,7 +126,6 @@ const spiders = [
     javtubs,
     javlust,
     javdo,
-    missavbz,
     porno4k,
     lxtv5,
     mmtv,
