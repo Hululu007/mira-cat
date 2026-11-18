@@ -21,8 +21,6 @@ const SOURCES = [
   ['py_hanime', 'Hanime'],
   ['py_hanime_new', 'Hanime(新版)'],
   ['py_huadu', '花都影院'],
-  ['py_huangdou', '黄豆短剧'],
-  ['py_huangdou_rex', '黄豆短剧(REX)'],
   ['py_huangguo', '黄果短剧'],
   ['py_kanav', 'KanAV'],
   ['py_madou', '麻豆社'],

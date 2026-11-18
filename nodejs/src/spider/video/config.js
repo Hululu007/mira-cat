@@ -30,8 +30,6 @@ const DEFAULT_SOURCES = [
     { key: 'py_hanime', name: 'Hanime' },
     { key: 'py_hanime_new', name: 'Hanime(新版)' },
     { key: 'py_huadu', name: '花都影院' },
-    { key: 'py_huangdou', name: '黄豆短剧' },
-    { key: 'py_huangdou_rex', name: '黄豆短剧(REX)' },
     { key: 'py_huangguo', name: '黄果短剧' },
     { key: 'py_kanav', name: 'KanAV' },
     { key: 'py_madou', name: '麻豆社' },

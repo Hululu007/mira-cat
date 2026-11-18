@@ -11,7 +11,6 @@ import ppp from './spider/video/ppp.js';
 import xvideos from './spider/video/xvideos.js';
 import xxxfollow from './spider/video/xxxfollow.js';
 import spankbang from './spider/video/spankbang_new.js';
-import huangdou from './spider/video/huangdou.js';
 import huangguo from './spider/video/huangguo.js';
 import av123 from './spider/video/av123.js';
 import chigua57 from './spider/video/chigua57.js';
@@ -165,7 +164,6 @@ const spiders = [
     hlbdy,
     hohoj,
     hornyjav,
-    huangdou,
     huangguo,
     huangvideo,
     sanjipian,
