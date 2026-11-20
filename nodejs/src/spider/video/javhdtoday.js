@@ -11,6 +11,11 @@ import req from '../../util/req.js';
 //   embed_server3 (vidara m3u8 直链, 分片最快) > embed_server9 (streamtape MP4) > embed.php (站方代理 HLS)
 //   > f4 系 (api/play 降级) > parse:1 嗅探
 //   注意: vidara 分片带 Referer 会被限速, 返回的 header 只带 UA 不带 Referer
+// 2026-11-21 v2（本轮）：(1) 详情并行解析全部服务器线路（15s 封顶），
+//   vidara master 多档按分辨率展开；未解出的服保留播放器地址，点播时再解；
+//   (2) play 按点中的服定向解析；(3) F4 识别改 isF4Url（认 f4splay.vip）；
+//   (4) parseVariants 补回 master 的 token 查询串（变体相对地址会丢 token）；
+//   (5) ?json=1 空回包重试一次（站方限流偶发回空）。
 
 const KEY = 'py_javhdtoday';
 const NAME = 'JavHD.Today';
@@ -106,7 +111,7 @@ async function getHtml(url, referer) {
   return '';
 }
 
-async function getJson(url, referer) {
+async function getJson(url, referer, timeoutMs) {
   const headers = {
     'User-Agent': UA,
     'Accept': 'application/json',
@@ -114,7 +119,7 @@ async function getJson(url, referer) {
   };
   const doParse = (txt) => { try { return JSON.parse(txt); } catch (e) { return null; } };
   try {
-    const { data, status } = await req.get(url, { headers, timeout: 25000 });
+    const { data, status } = await req.get(url, { headers, timeout: timeoutMs || 12000 });
     if (status === 200 && data) return typeof data === 'string' ? doParse(data) : data;
   } catch (e) { /* 换通道2 */ }
   try {
@@ -270,6 +275,100 @@ async function resolveF4(embedUrl, referer) {
   return '';
 }
 
+// 自有服识别：不认 host（host 会换：javhdz.today / workerN.savedvids.com …），
+// 只认路径 embed(_serverN).php + p token——这是站方自有播放器 ?json=1 API
+// 的形态；外站嵌页（Javtiful / Mycloudz / Dood / Streamtape / Lulustream /
+// F4）不用这形态。
+function isSelfPlayer(u) {
+  try {
+    const uu = new URL(u);
+    return /\/embed(_server\d+)?\.php$/i.test(uu.pathname) && !!uu.searchParams.get('p');
+  } catch (e) { return false; }
+}
+
+// 服务器展示顺序：自有（vidara 档位展开在前）> 外站；F4splay 垫底（host 502）
+const SERVER_ORDER = ['Mangocloud', 'Myserver', 'Limecloud', 'BpServer', 'Topserver', 'Mycloudz', 'Cloudwish', 'Dood', 'Javtiful', 'Lulustream', 'F4splay'];
+
+// 详情：解析全部服务器线路。data-embeds 里同服常有多个镜像地址，详情期
+// 每服最多试 2 个镜像（同服共用同一 p token），其余留到点播时按需处理。
+// 关键：封顶时按已解出的组装、未解出的服保留播放器地址，绝不整页丢线
+// （2026-11-21 实测：?json=1 从 VM 单次 4–8s，15s 总封顶一到就整页塌回
+// 正片单线——旧版 bug 的根源）。
+async function resolveAllLines(durl, html) {
+  const embedUrl = extractEmbed(html);
+  if (!embedUrl) return null;
+  const embedHtml = await getHtml(embedUrl, durl);
+  if (!embedHtml) return null;
+  const players = extractPlayers(embedHtml);
+  if (!players.length) return null;
+  // 按服务器名分组
+  const groups = new Map();
+  for (const p of players) {
+    const nm = p.name || '外站';
+    if (!groups.has(nm)) groups.set(nm, []);
+    groups.get(nm).push(p.url);
+  }
+  const isSelf = (nm) => isSelfPlayer(groups.get(nm)[0] || '');
+  const selfNames = [...groups.keys()].filter(isSelf);
+  const extNames = [...groups.keys()].filter((nm) => !isSelf(nm));
+  // 自有服务器并行 ?json=1，结果完成即写入 resolved（不等全部）；
+  // 8s 封顶——超时未解出的服不堵整页，留到点播时再解。
+  // 详情期单次 5s 超时、每服最多试 2 个镜像。
+  const resolved = new Map();
+  const jobs = selfNames.map(async (nm) => {
+    for (const u of groups.get(nm).slice(0, 2)) {
+      const r = await resolveServerJson(u, embedUrl, 5000);
+      if (r && r.url) { resolved.set(nm, { name: nm, playerUrl: u, r }); return; }
+    }
+  });
+  await Promise.race([Promise.allSettled(jobs), new Promise((res) => setTimeout(res, 8000))]);
+  // vidara master 变体并行展开（各 3s 封顶），只认带 RESOLUTION 的档位
+  const variantMap = new Map();
+  const vjobs = [...resolved.values()]
+    .filter((v) => v.r.kind === 'hls' && /master\.m3u8/i.test(v.r.url))
+    .map(async (v) => {
+      const vs = await withTimeout(expandVariants(v.r.url, embedUrl), 3000);
+      if (vs && vs.length >= 2) variantMap.set(v.name, vs);
+    });
+  await Promise.race([Promise.allSettled(vjobs), new Promise((res) => setTimeout(res, 3000))]);
+  // 组装：已解出的服给直链（vidara 多档展开），未解出的服给播放器地址（点播再解）
+  const lines = [];
+  for (const nm of selfNames) {
+    const v = resolved.get(nm);
+    if (v) {
+      const vs = variantMap.get(nm);
+      if (vs) {
+        for (const x of vs) lines.push({ name: nm + '·' + x.label, url: x.url });
+        continue;
+      }
+      lines.push({ name: nm, url: v.r.url });
+    } else {
+      lines.push({ name: nm, url: groups.get(nm)[0] });
+    }
+  }
+  // 外站服务器各出一集（点播时解析/嗅探）
+  for (const nm of extNames) {
+    lines.push({ name: nm, url: groups.get(nm)[0] });
+  }
+  // 排序：SERVER_ORDER 在前，未知服在后；同名保持原顺序
+  const rank = (nm) => {
+    const base = nm.split('·')[0];
+    const i = SERVER_ORDER.indexOf(base);
+    return i === -1 ? 90 : i;
+  };
+  lines.sort((a, b) => rank(a.name) - rank(b.name));
+  if (!lines.length) return null;
+  return lines.map(l => l.name + '$' + l.url);
+}
+
+async function expandVariants(masterUrl, referer) {
+  const txt = await getHtml(masterUrl, referer);
+  if (!txt || !txt.includes('#EXTM3U')) return null;
+  const vs = parseVariants(txt, masterUrl);
+  return (vs && vs.length >= 2) ? vs : null;
+}
+
+
 async function detail(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
@@ -300,12 +399,15 @@ async function detail(reqIn) {
     vod_play_from: 'JavHD.Today',
     vod_play_url: `正片$${durl}`,
   };
-  // s3 (vidara) 有多档时把各档列为分集 (集名取实测高度, 降序), 末尾保留原正片
-  // (点播仍走原 s3 分支); 解不到/单档/超时(8s)保持原单集
-  const vs = await withTimeout(tryQualityEpisodes(durl, html), 8000);
-  if (vs && vs.length >= 2) {
-    vod.vod_play_url = vs.map(v => v.label + '$' + v.url).join('#') + '#正片$' + durl;
+  // 全部服务器线路并行解析（15s 封顶）：自有服务器各调 ?json=1 取直链，
+  // vidara 的 master 有多档时按分辨率展开；外站服务器各出一集，点播时再解。
+  // ?json=1 偶发回空（站方限流，2026-11-21 实测），单服失败不堵其他服；
+  // 全失败回落单集正片（点播走整站链路）。
+  const lines = await withTimeout(resolveAllLines(durl, html), 15000);
+  if (lines && lines.length) {
+    vod.vod_play_url = lines.join('#');
   }
+
   subRegister(id, vod);
   return { list: [vod] };
 }
@@ -316,7 +418,7 @@ async function detail(reqIn) {
 //   embed_server3.php (Mangocloud) -> type vidara: master.m3u8 直链 (97bf1.com, 多码率 480/720/1080, 分片 200)
 //   embed_server9.php (STserver)  -> type streamtape: /universal-stream/{hash} MP4 直链
 //   embed.php (Myserver)          -> type streamhg: /universal-stream-hls/{hash}/playlist.m3u8 站方代理分片
-async function resolveServerJson(playerUrl, referer) {
+async function resolveServerJson(playerUrl, referer, timeoutMs) {
   const pM = String(playerUrl).match(/[?&]p=([^&]+)/);
   if (!pM) return '';
   let host = '';
@@ -328,15 +430,15 @@ async function resolveServerJson(playerUrl, referer) {
   } catch (e) { return ''; }
   const token = pM[1];
   const apiUrl = `${host}/${page}?json=1&next=0&p=${encodeURIComponent(token)}`;
-  const j = await getJson(apiUrl, referer);
+  const j = await getJson(apiUrl, referer, timeoutMs);
   if (!j || !j.success) return '';
   if (j.src && typeof j.src === 'string') {
     const src = j.src.startsWith('http') ? j.src : host + j.src;
-    return { kind: 'hls', url: src, playerUrl };
+    return { kind: 'hls', url: src, playerUrl, page };
   }
   if (j.media && typeof j.media === 'string') {
     const src = j.media.startsWith('http') ? j.media : host + j.media;
-    return { kind: 'mp4', url: src, playerUrl };
+    return { kind: 'mp4', url: src, playerUrl, page };
   }
   return '';
 }
@@ -353,6 +455,7 @@ async function resolveSelfPlayer(playerUrl, referer) {
 // 变体 URI 相对 master 地址解析 (自带 token 查询串, 原样保留); 同高度只留带宽最大者。
 function parseVariants(masterText, masterUrl) {
   const lines = String(masterText || '').split('\n');
+  const q = (String(masterUrl).split('?')[1] || '');
   const byHeight = new Map();
   for (let i = 0; i < lines.length; i++) {
     const m = lines[i].match(/#EXT-X-STREAM-INF:([^\n]*)/);
@@ -363,13 +466,19 @@ function parseVariants(masterText, masterUrl) {
     const h = parseInt(res, 10);
     if (!h || !uri || uri.startsWith('#')) continue;
     let abs = '';
-    try { abs = new URL(uri, masterUrl).toString(); } catch (e) { continue; }
+    try {
+      abs = new URL(uri, masterUrl).toString();
+      // 变体相对地址会丢掉 master 的 token 查询串（?token=…），补回；
+      // 变体自带查询串时不动（2026-11-21 防御性修复，待真机验）
+      if (q && abs.indexOf('?') === -1) abs += '?' + q;
+    } catch (e) { continue; }
     const prev = byHeight.get(h);
     if (!prev || bw > prev.bw) byHeight.set(h, { label: h + 'p', url: abs, bw });
   }
   return [...byHeight.values()].sort((a, b) => parseInt(b.label, 10) - parseInt(a.label, 10))
     .map(v => ({ label: v.label, url: v.url }));
 }
+
 
 // 超时即 resolve null (永不 reject), 供 detail 期封顶用
 function withTimeout(p, ms) {
@@ -379,35 +488,60 @@ function withTimeout(p, ms) {
 // s3 (vidara) detail 期解变体: 详情页 embed -> s3 ?json=1 -> master -> parseVariants;
 // >=2 档才返回, 否则 null (detail 回退原单集)。只动 s3 分支, 其他 server 不动。
 // 实测: vidara master 含 480/720/1080 三档 (RESOLUTION, 相对路径 + token)。
-async function tryQualityEpisodes(durl, html) {
-  try {
-    const embedUrl = extractEmbed(html);
-    if (!embedUrl) return null;
-    const embedHtml = await getHtml(embedUrl, durl);
-    if (!embedHtml) return null;
-    const players = extractPlayers(embedHtml);
-    const s3 = players.find(p => /javhdz\.today\//i.test(p.url) && /embed_server3\.php/i.test(p.url));
-    if (!s3) return null;
-    const r = await resolveServerJson(s3.url, embedUrl);
-    if (!r || r.kind !== 'hls' || !r.url) return null;
-    const txt = await getHtml(r.url, embedUrl);
-    if (!txt || !txt.includes('#EXTM3U')) return null;
-    const vs = parseVariants(txt, r.url);
-    return (vs && vs.length >= 2) ? vs : null;
-  } catch (e) { return null; }
-}
-
 async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
   if (id.includes('$')) id = id.split('$').pop().trim();
   const subsP = subSearchAll(subNormKey(id)).catch(() => []);
-  if (/\.m3u8(\?|$)/i.test(id)) {
+  if (/\.m3u8(\?|$)/i.test(id) || /\.mp4(\?|$)/i.test(id)) {
     return subAttach({ parse: 0, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } }, subsP);
   }
-  const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
 
+  // 1) 点中的就是自有服务器播放器地址：只解这一服（?json=1 空回包重试一次）。
+  //    ?json=1 对 Referer 不敏感（2026-11-21 实测：embed 页/站根/播放器地址
+  //    三种 Referer 均回 success:true，各发新播单），用站根即可。
+  //    自有服不认 host（javhdz.today / workerN.savedvids.com 都会换），只认
+  //    embed*.php + p token 的形态（见 isSelfPlayer）。
+  if (isSelfPlayer(id)) {
+    let r = await resolveServerJson(id, REFERER);
+    if (!r) {
+      await new Promise((res) => setTimeout(res, 800));
+      r = await resolveServerJson(id, REFERER);
+    }
+    if (r && r.url) {
+      return subAttach({ parse: 0, url: r.url, header: headerForServer(r) }, subsP);
+    }
+    // 这一服解不出：嗅探播放器页（整站链路需要详情页地址，此处没有，
+    // 无法转其他服；嗅探至少让播放器有机会抓到 ?json=1 的播单请求）。
+    return subAttach({ parse: 1, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } }, subsP);
+  }
+  // 2) 点中的是 f4 嵌页：api/play 降级
+  if (isF4Url(id)) {
+    const r = await resolveF4(id, REFERER);
+    if (r && r.url) {
+      return subAttach({
+        parse: 0,
+        url: r.url,
+        header: { 'User-Agent': UA, 'Referer': id, 'Origin': r.origin },
+      }, subsP);
+    }
+  }
+  // 3) 点中的是其他外站嵌页（详情行直接给的播放器地址，如 Javtiful）：嗅探。
+  //    注意：此时 id 本身就是嵌页地址，绝不能拿它当详情页抓（旧写法
+  //    durl=id 再走整站链路必空——2026-11-21 实测 Javtiful 线点播空返回）。
+  //    自有服地址不进这里（分支 1 已处理，失败也已在分支 1 内嗅探返回）；
+  //    旧版“正片”id（= javhd.today 详情页地址）也不进这里，必须落到分支 4
+  //    的整站链路（2026-11-21 实测：不排除它，分支 4 永远走不到，点播只
+  //    会嗅探详情页本身）。
+  if (/^https?:\/\//i.test(id) && !/javhd\.today\//i.test(id) && !/javhdz\.today\//i.test(id)) {
+    return subAttach({ parse: 1, url: id, header: { 'User-Agent': UA, 'Referer': REFERER } }, subsP);
+  }
+
+  // 4) 旧正片 id（= 详情页地址本身）：整站链路，按优先级逐服解。
+  //    新版详情行给的 id 都是播放器地址/直链，不会走到这里；这里只为兼容
+  //    旧包里已存的“正片$详情地址”集。
+  const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
   const html = await getHtml(durl);
   if (!html) return { parse: 0, url: '' };
   const embedUrl = extractEmbed(html);
@@ -418,13 +552,10 @@ async function play(reqIn) {
   const players = extractPlayers(embedHtml);
   if (!players.length) return { parse: 0, url: '' };
 
-  // 播放链路优先级 (2026-10-21 实测):
-  // 1) embed_server3.php (vidara m3u8 直链, 不经站方代理, 分片最快; 但不是每个视频都有源)
-  // 2) embed_server9.php (streamtape MP4 直链)
-  // 3) embed.php (站方代理 HLS, 分片慢但基本必有源)
-  // 4) f4 系 (降级)  5) 嗅探兜底
-  // 注意: vidara 分片带 Referer 会被限速到近乎不可用, 故 1)/2) 只带 UA 不带 Referer
-  const findServer = (pageRe) => players.find(p => /javhdz\.today\//i.test(p.url) && pageRe.test(p.url));
+  // 播放链路优先级（2026-10-21 实测，2026-11-21 扩展到全部自有服）：
+  //   vidara（server3，多档）> streamtape（server9）> 自有代理 HLS
+  //   （embed.php/server4/server5/server7，?json=1 通用解）> f4 降级 > 嗅探
+  const findServer = (pageRe) => players.find(p => isSelfPlayer(p.url) && pageRe.test(p.url));
   const s3 = findServer(/embed_server3\.php/i);
   if (s3) {
     const r = await resolveServerJson(s3.url, embedUrl);
@@ -435,28 +566,21 @@ async function play(reqIn) {
   const s9 = findServer(/embed_server9\.php/i);
   if (s9) {
     const r = await resolveServerJson(s9.url, embedUrl);
-    if (r && r.kind === 'mp4' && r.url) {
-      return subAttach({ parse: 0, url: r.url, header: { 'User-Agent': UA } }, subsP);
-    }
-    if (r && r.kind === 'hls' && r.url) {
+    if (r && (r.kind === 'mp4' || r.kind === 'hls') && r.url) {
       return subAttach({ parse: 0, url: r.url, header: { 'User-Agent': UA } }, subsP);
     }
   }
-  const mainSelf = findServer(/\/embed\.php(\?|$)/i);
-  const selfPlayers = mainSelf ? [mainSelf] : players.filter(p => /javhdz\.today\/embed\.php/i.test(p.url));
-  for (const sp of selfPlayers) {
-    const r = await resolveSelfPlayer(sp.url, embedUrl);
+  // 其余自有服（embed.php / server4 / server5 / server7 …）逐个解
+  for (const p of players) {
+    if (!isSelfPlayer(p.url)) continue;
+    if (p === s3 || p === s9) continue;
+    const r = await resolveServerJson(p.url, embedUrl);
     if (r && r.url) {
-      return subAttach({
-        parse: 0,
-        url: r.url,
-        header: { 'User-Agent': UA, 'Referer': r.playerUrl },
-      }, subsP);
+      return subAttach({ parse: 0, url: r.url, header: headerForServer(r) }, subsP);
     }
   }
-
-  // f4 系 (m3u8 token 疑似绑定请求 IP，仅作降级)
-  const f4 = players.find(p => /f4\w*\.com|f4scdn/i.test(p.url));
+  // f4 系（m3u8 token 疑似绑定请求 IP，仅作降级）
+  const f4 = players.find(p => isF4Url(p.url));
   if (f4) {
     const r = await resolveF4(f4.url, durl);
     if (r && r.url) {
@@ -467,10 +591,26 @@ async function play(reqIn) {
       }, subsP);
     }
   }
-  // 3. 其他 embed 走嗅探
+  // 其他 embed 走嗅探
   const first = players[0];
   return subAttach({ parse: 1, url: first.url, header: { 'User-Agent': UA, 'Referer': durl } }, subsP);
 }
+
+// 自有服返回头：vidara/streamtape 直链只带 UA（分片带 Referer 会被限速）；
+// 站方代理 HLS（embed.php 系）带 Referer=播放器地址。
+function headerForServer(r) {
+  const page = (r && r.page) || '';
+  if (/embed\.php$/i.test(page)) return { 'User-Agent': UA, 'Referer': r.playerUrl };
+  return { 'User-Agent': UA };
+}
+
+function isF4Url(u) {
+  try {
+    const h = new URL(u).hostname;
+    return /f4scdn|f4jav|f4splay/i.test(h);
+  } catch (e) { return /f4scdn|f4jav|f4splay/i.test(String(u || '')); }
+}
+
 
 async function search(reqIn) {
   // 搜索页为 JS 动态渲染，服务端拿不到结果

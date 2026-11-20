@@ -26,6 +26,10 @@
 //  - WAF：VM 直连 403；蜘蛛先 GET 首页暖会话再抓详情/ajax；App 的 req
 //    能否过墙、cookie 是否跨请求保持、/ajax/player 实况、DD/US 嵌页 host、
 //    正片 master 档位，均待真机验（见 REPORT_javplayer.md）。
+// 2026-11-21 v2（本轮）：(1) isF4Host 补 f4splay.vip；(2) ajax 改中转优先
+//   （site-fetch POST 透传实测通）+ pt 烧毁感知重试（重试页必须带 __pt）；
+//   (3) 非 F4 嵌页先蜘蛛侧 XFS 直解（hls3 > hls2，hls4 永不取），解不出回
+//   Worker /v；(4) 字幕与 ajax 并行发起。
 import req from '../../util/req.js';
 
 const KEY = 'py_javplayer';
@@ -97,7 +101,7 @@ function xorDecrypt(enc, key) {
   return latin1ToUtf8(xorStr(decoded, key));
 }
 
-function isF4Host(host) { return /f4scdn\.com|f4jav\.xyz/i.test(host || ''); }
+function isF4Host(host) { return /f4scdn\.com|f4jav\.xyz|f4splay\.vip/i.test(host || ''); }
 function hostOf(url) {
   const m = String(url || '').match(/^https?:\/\/([^/]+)/i);
   return m ? m[1] : '';
@@ -109,6 +113,92 @@ function workerUrl(embed, durl) {
 }
 
 // ---------- 列表解析（javct 同款：锚点扫描 + 锚点前 900 字内最后一个 img + 顺序对齐标题/番号） ----------
+// ===== shared XFS helpers (spider-side, req-based; Worker /v 同款逻辑) =====
+// Worker /v 从 CF 出口取某些 XFS 嵌页播单会 502（hls3 525 / hls2 403 ASN 绑定 /
+// embed 页 403）：失败是出口问题，不是嵌页死了。手机住宅出口直接取嵌页、
+// 解包取 hls3（无 token）优先、hls2 其次，优先验播单含 #EXTM3U；
+// 验不过回直链原地址（/v 已实测 502）；hls4 永不取
+// （诱饵播单，见 2026-11-15 定论）。解包是纯字符串操作，不用 eval。
+// 注意：不用 Range 探首字节——StreamHG 分片常带 70 字节假 PNG 头再接真 TS，
+// Range 取首字节必看成 PNG；整取播单文本验 #EXTM3U 才是有效探活。
+function jsUnescapeSingle(s) {
+  return s.replace(/\\(.)/g, (m, c) => {
+    if (c === 'n') return '\n';
+    if (c === 'r') return '\r';
+    if (c === 't') return '\t';
+    return c;
+  });
+}
+function unpackDeanEdwards(html) {
+  const m = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:[^'\\]|\\.)*)'\.split\('\|'\)/);
+  if (!m) return '';
+  let p = jsUnescapeSingle(m[1]);
+  const a = parseInt(m[2], 10);
+  const c = parseInt(m[3], 10);
+  const k = jsUnescapeSingle(m[4]).split('|');
+  const enc = (n) => (n < a ? '' : enc(Math.floor(n / a))) + ((n % a) > 35 ? String.fromCharCode((n % a) + 29) : (n % a).toString(36));
+  let i = c;
+  while (i--) {
+    if (k[i]) {
+      const word = k[i];
+      p = p.replace(new RegExp('\\b' + enc(i) + '\\b', 'g'), () => word);
+    }
+  }
+  return p;
+}
+function extractXfsLinks(text) {
+  const links = {};
+  for (const m of text.matchAll(/"hls(\d+)"\s*:\s*"([^"]+)"/g)) {
+    links['hls' + m[1]] = m[2];
+  }
+  if (!Object.keys(links).length) {
+    const f = text.match(/"file"\s*:\s*"(https?:[^"]+?\.m3u8[^"]*)"/) || text.match(/(https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*)/);
+    if (f) links.hls2 = f[1];
+  }
+  return links;
+}
+// 取 XFS 嵌页直链：hls3 > hls2（hls4 永不取）；优先验播单含 #EXTM3U。
+// 验播单失败时回 hls2（dramiyos 稳定 CDN）/ hls3 原地址，不回 Worker /v：
+//   /v 对这类嵌页已实测 502（CF 出口取播单 hls3 525 / hls2 403），回 /v 必死；
+//   直链在手机稳定 IP 下仍有机会（验播单失败可能是瞬时网络问题）。
+//   注意：VM 出口按连接轮换 IP，token 恒对不上，验播单在 VM 侧恒败
+//   （2026-11-21 实测：同进程背靠背取 embed→hls2 仍 403），属 VM 局限，
+//   直解腿只能真机定性。
+async function resolveXfsDirect(embedUrl, referer) {
+  let eu = embedUrl;
+  try {
+    const uu = new URL(eu);
+    if (/(^|\.)hglink\.to$/i.test(uu.hostname)) { uu.hostname = 'trailerhg.xyz'; eu = uu.href; }
+  } catch (e) { /* ignore */ }
+  let page = '';
+  try {
+    const r = await req.get(eu, { headers: { 'User-Agent': UA, 'Referer': referer || '', 'Accept': 'text/html,*/*' }, timeout: 10000, responseType: 'text', transformResponse: [(d) => d] });
+    if (r.status === 200 && typeof r.data === 'string') page = r.data;
+  } catch (e) { return ''; }
+  if (!page) return '';
+  const unpacked = unpackDeanEdwards(page);
+  const links = extractXfsLinks(unpacked || page);
+  for (const key of ['hls3', 'hls2']) {
+    const raw = links[key];
+    if (!raw) continue;
+    let abs = '';
+    try { abs = new URL(raw, eu).href; } catch (e) { continue; }
+    try {
+      const r = await req.get(abs, { headers: { 'User-Agent': UA, 'Referer': eu, 'Accept': '*/*' }, timeout: 8000, responseType: 'text', transformResponse: [(d) => d] });
+      if (r.status === 200 && typeof r.data === 'string' && r.data.includes('#EXTM3U')) {
+        return abs;
+      }
+    } catch (e) { /* 下一条 */ }
+  }
+  // 无一腿验过：回直链原地址（见上注），不回 /v
+  for (const key of ['hls2', 'hls3']) {
+    if (!links[key]) continue;
+    try { return new URL(links[key], eu).href; } catch (e) { /* 下一条 */ }
+  }
+  return '';
+}
+
+
 function parseCards(html) {
   const items = [];
   const seen = new Set();
@@ -452,9 +542,14 @@ async function detail(reqIn) {
   return { list };
 }
 
+// ---------- ajax（2026-11-21 v2：pt 烧毁感知 + 重试取新 pt 必须带 __pt） ----------
+// 实测：/ajax/player 经 site-fetch 中转 POST 回 200 + player_enc（2026-11-21，
+// F4/DD 两线皆通），直连 POST 从机房出口 403/超时。pt 疑似一次一用：中转
+// 拿到站方错误回包即视为 pt 已烧，不再用同一 pt 试直连，直接重抓详情换新 pt。
+// 重试取详情必须拿到含 __pt 的页：jina 加工页会剥掉 script，__pt 取不到，重试必败。
 async function ajaxPlayer(filmId, episode, pt, durl) {
   let ajaxUrl = '';
-  try { ajaxUrl = new URL(durl).origin + '/ajax/player'; } catch { return null; }
+  try { ajaxUrl = new URL(durl).origin + '/ajax/player'; } catch (e) { return null; }
   const body = 'episode=' + encodeURIComponent(episode) + '&filmId=' + encodeURIComponent(filmId) + '&pt=' + encodeURIComponent(pt);
   const headers = {
     'User-Agent': UA,
@@ -463,24 +558,53 @@ async function ajaxPlayer(filmId, episode, pt, durl) {
     'Accept': 'application/json, text/javascript, */*; q=0.01',
     'X-Requested-With': 'XMLHttpRequest',
   };
-  // ① 中转 POST（需 site-fetch v3：allowlist 含 javplayer.org + POST 透传；
-  // 未更新前中转回 400/非 JSON，自动落到直连，不影响旧行为）
+  const parse = (data) => {
+    if (data == null) return null;
+    try { return typeof data === 'string' ? JSON.parse(data) : data; } catch (e) { return null; }
+  };
+  // ① 中转 POST（需 site-fetch：allowlist 含 javplayer.org + POST 透传）
   try {
     const r = await req.post(SITE_FETCH + '/?u=' + encodeURIComponent(ajaxUrl), body, { headers, timeout: 15000 });
-    if (r.status === 200 && r.data != null) {
-      const j = typeof r.data === 'string' ? JSON.parse(r.data) : r.data;
+    if (r.status === 200) {
+      const j = parse(r.data);
       if (j && (j.player || j.player_enc)) return j;
+      if (j && j.error) return { __stationError: true };
     }
-  } catch (e) {}
-  // ② 直连 POST
+  } catch (e) { /* 落到直连 */ }
+  // ② 直连 POST（手机住宅出口可能直接过墙；VM 侧 403/超时，仅作回落）
   try {
-    const { data, status } = await req.post(ajaxUrl, body, { headers, timeout: 15000 });
-    if (status === 200 && data != null) {
-      return typeof data === 'string' ? JSON.parse(data) : data;
+    const r = await req.post(ajaxUrl, body, { headers, timeout: 15000 });
+    if (r.status === 200) {
+      const j = parse(r.data);
+      if (j && (j.player || j.player_enc)) return j;
+      if (j && j.error) return { __stationError: true };
     }
-  } catch (e) {}
+  } catch (e) { /* fallthrough */ }
   return null;
 }
+
+// 重抓详情取新 pt/pk 与同服务器 episode：只认含 __pt 的页（jina 页无 __pt，
+// 取到了也解不出，直接判失败，不拿它烧第二次机会）。
+async function freshDetail(durl, episode) {
+  const html = await getText(durl, HOST + '/');
+  if (!html) return null;
+  const ptM = html.match(/window\.__pt\s*=\s*"([^"]+)"/i);
+  const pkM = html.match(/window\.__pk\s*=\s*"([^"]+)"/i);
+  if (!ptM) return null;
+  const btnRe = /<button[^>]*class="[^"]*btn-player[^"]*"[^>]*>([\s\S]{0,80}?)<\/button>/gi;
+  let bm;
+  while ((bm = btnRe.exec(html)) !== null) {
+    const cm = bm[0].match(/class="([^"]*)"/i);
+    if (cm && /\bvip\b/i.test(cm[1])) continue;
+    const dm = bm[0].match(/data-id="(\d+)"/i);
+    const sm = bm[0].match(/data-source="(\d+)"/i);
+    if (dm && dm[1] === episode) {
+      return { filmId: sm ? sm[1] : '', episode: dm[1], pt: ptM[1], pk: pkM ? pkM[1] : '' };
+    }
+  }
+  return null;
+}
+
 
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
@@ -495,38 +619,26 @@ async function play(reqIn) {
   }
   const filmId = parts[0], episode = parts[1];
   let pt = parts[2];
-  const pk = parts[3];
+  let pk = parts[3];
   const durl = parts.slice(4).join('|');
   // 字幕与 ajax 并行发起（不串行叠加延迟）
   const subsP = subSearchAll(id).catch(() => []);
   let json = await ajaxPlayer(filmId, episode, pt, durl);
-  if (!json || json.error) {
-    // pt 可能已轮换过期：重抓详情取新 pt/pk 与同服务器 episode，重试一次
-    try {
-      const html = await getText(durl, HOST + '/');
-      const ptM = html.match(/window\.__pt\s*=\s*"([^"]+)"/i);
-      const pkM = html.match(/window\.__pk\s*=\s*"([^"]+)"/i);
-      const btnRe = /<button[^>]*class="[^"]*btn-player[^"]*"[^>]*>([\s\S]{0,80}?)<\/button>/gi;
-      let bm, newEp = '', newFilm = '';
-      while ((bm = btnRe.exec(html)) !== null) {
-        if (/btn-player-vip/i.test(bm[0])) continue;
-        const dm = bm[0].match(/data-id="(\d+)"/i);
-        const sm = bm[0].match(/data-source="(\d+)"/i);
-        if (dm && dm[1] === episode) { newEp = dm[1]; newFilm = sm ? sm[1] : filmId; break; }
-      }
-      if (ptM && newEp) {
-        pt = ptM[1];
-        json = await ajaxPlayer(newFilm, newEp, pt, durl);
-        if (json && !json.error && pkM) {
-          // 用新 pk 解密（见下）
-          json.__freshPk = pkM[1];
-        }
-      }
-    } catch (e) {}
+  if (!json || json.__stationError) {
+    // pt 可能已轮换过期/烧掉：重抓详情取新 pt/pk 与同服务器 episode，重试一次
+    const fresh = await freshDetail(durl, episode);
+    if (fresh && fresh.filmId) {
+      pt = fresh.pt;
+      pk = fresh.pk || pk;
+      json = await ajaxPlayer(fresh.filmId, fresh.episode, fresh.pt, durl);
+      if (!json || json.__stationError) json = null;
+    } else {
+      json = null;
+    }
   }
   if (!json || json.error) return { parse: 0, url: '' };
   let playerHtml = '';
-  const usePk = (json.__freshPk || pk || '');
+  const usePk = pk || '';
   if (json.player_enc) playerHtml = xorDecrypt(json.player_enc, usePk);
   else if (json.player) playerHtml = String(json.player);
   if (!playerHtml) return { parse: 0, url: '' };
@@ -536,6 +648,21 @@ async function play(reqIn) {
   if (em) {
     let embed = em[1];
     if (embed.startsWith('//')) embed = 'https:' + embed;
+    // F4 系走 Worker /f4（host 502 时仍回该地址，host 恢复即播，不另寻腿）
+    if (isF4Host(hostOf(embed))) {
+      const result = { parse: 0, url: workerUrl(embed, durl), header: { 'User-Agent': UA, 'Referer': durl } };
+      if (subs && subs.length) result.subs = subs;
+      return result;
+    }
+    // 其他宿主（DD/US 等 XFS 系）：先蜘蛛侧直解（手机出口取嵌页解包，
+    // hls3 > hls2 验播单；验不过回直链原地址），无链可解才回 Worker /v
+    // （CF 出口常 502，见 2026-11-21 实测）
+    const direct = await resolveXfsDirect(embed, durl);
+    if (direct) {
+      const result = { parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': embed } };
+      if (subs && subs.length) result.subs = subs;
+      return result;
+    }
     const result = { parse: 0, url: workerUrl(embed, durl), header: { 'User-Agent': UA, 'Referer': durl } };
     if (subs && subs.length) result.subs = subs;
     return result;
@@ -548,6 +675,7 @@ async function play(reqIn) {
   }
   return { parse: 0, url: '' };
 }
+
 
 // ---------- 字幕聚合（与猫源 27 源同款芯；番号只从片名取，不从播放地址取） ----------
 // 三槽：迅雷（键序 [番号， 紧凑番号]）> 迅雷看看（完整键序）> SubtitleCat；

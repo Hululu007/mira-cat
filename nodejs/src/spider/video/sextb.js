@@ -10,6 +10,11 @@ import req from '../../util/req.js';
 // 卡片: div.tray-item > a[href="/{code}"] > img.tray-item-thumbnail (封面取 data-src，src 是 default-cover 占位图)
 // 详情: GET /{code}  filmId + 服务器列表 (button.btn-player.episode[data-source][data-id]，如 F4/SW/PM/DD/FL/US)
 // 播放 (v4): 逐个 embed 宿主在蜘蛛侧解析直链 (parse:0)，嗅探只做最后兜底。
+// 2026-11-21 v11（本轮）：(1) 线路顺序 SW 置顶、F4 垫底（f4splay.vip 全网
+//   502，host 恢复前播不了）；(2) 嗅探线改走蜘蛛侧 XFS 直解（hls3 > hls2，
+//   hls4 永不取），直解失败才回嗅探兜底；(3) 按钮解析放宽（属性任意顺序）；
+//   (4) SW 经 /v 回的播单是真 TS（2026-11-21 probe5 全段验过，
+//   旧“PNG 诱饵”结论是 Range 探首字节的误判，已作废）。
 //       三轮全嗅探真机仍全灭（本站 embed 页在 MiraPlayer 嗅探里起不了播）。
 //       线路按宿主分流（优先级 SW > PM > F4 > FL > DD > US > ST > PP）:
 //         SW (hglink.to, StreamHG 系): 同代码在 trailerhg.xyz 有 XFS 明文页,
@@ -376,25 +381,39 @@ async function category(reqIn) {
 }
 
 // 从详情页提取 filmId 和服务器 (episode) 列表
+// （2026-11-21 v11：放宽匹配——class 只认 btn-player、data-source/data-id
+// 各自取、名字从去标签后的按钮文本取首个 [A-Z0-9]{2,} 词；VIP 按钮跳过）
 function extractPlayerInfo(html) {
   let filmId = '';
   const fm = html.match(/filmId\s*=\s*["']?(\d+)/);
   if (fm) filmId = fm[1];
   const episodes = [];
-  const re = /<button[^>]*class="[^"]*btn-player episode[^"]*"[^>]*data-source="(\d+)"[^>]*data-id="(\d+)"[^>]*>(?:<i[^>]*><\/i>)?\s*([A-Z0-9]+)</g;
+  const re = /<button[^>]*class="[^"]*btn-player[^"]*"[^>]*>([\s\S]{0,200}?)<\/button>/gi;
   let m;
   while ((m = re.exec(html)) !== null) {
-    episodes.push({ filmId: m[1], episode: m[2], name: m[3] });
+    const tag = m[0];
+    // VIP 按钮跳过：class 可能是 btn-player-vip（连字符）或 btn-player vip（空格）
+    const cm = tag.match(/class="([^"]*)"/i);
+    if (cm && /\bvip\b/i.test(cm[1])) continue;
+    const sm = tag.match(/data-source="(\d+)"/i);
+    const dm = tag.match(/data-id="(\d+)"/i);
+    if (!sm || !dm) continue;
+    const inner = clean(m[1]);
+    const nm = (inner.match(/[A-Z0-9]{2,}/) || [])[0] || '';
+    if (!nm || nm === 'VIP') continue;
+    episodes.push({ filmId: sm[1], episode: dm[1], name: nm });
   }
   return { filmId, episodes };
 }
 
 // 线路多集：详情页按钮已含 F4/SW/DD/FL/US 等线路名，按优先级出集
-// （F4 > SW > PM > FL > DD > US > ST > PP，其余最后）；无按钮时回落正片。
+// （2026-11-21 v11：SW 置顶——用户真机确认只有 SW 能播；F4 垫底——
+// f4splay.vip host 全网 502，host 恢复前播不了，恢复后不需再推即可播；
+// 其余按 FL/DD/ST/PP/US/PM。无按钮时回落正片。）
 // 集 id 形如 F4$<durl>@F4，play 剥离 @ 后缀作优先线路提示。
 function lineEpisodes(html, durl) {
   const { episodes } = extractPlayerInfo(html);
-  const ORDER = { F4: 0, SW: 1, PM: 2, FL: 3, DD: 4, US: 5, ST: 6, PP: 7 };
+  const ORDER = { SW: 0, FL: 1, DD: 2, ST: 3, PP: 4, US: 5, PM: 6, F4: 7 };
   const seen = new Set();
   const names = [];
   for (const ep of episodes) {
@@ -407,6 +426,7 @@ function lineEpisodes(html, durl) {
   if (!names.length) return `正片$${durl}`;
   return names.map(nm => `${nm}$${durl}@${nm}`).join('#');
 }
+
 
 async function detail(reqIn) {
   const body = reqIn?.body || {};
@@ -453,6 +473,92 @@ async function detail(reqIn) {
 // /resolve 回包：{ok:true, url, host:'f4'|'sw'|'other', line, sniff?}
 //   F4/SW → Worker 播放地址；其他宿主 → 原 embed + sniff:true。
 // 失败回包：{ok:false, error:'BAD_U'|'FETCH_FAIL'|'NO_PT'|'NO_LINE'|'NO_EMBED'|...}。
+// ===== shared XFS helpers (spider-side, req-based; Worker /v 同款逻辑) =====
+// Worker /v 从 CF 出口取某些 XFS 嵌页播单会 502（hls3 525 / hls2 403 ASN 绑定 /
+// embed 页 403）：失败是出口问题，不是嵌页死了。手机住宅出口直接取嵌页、
+// 解包取 hls3（无 token）优先、hls2 其次，优先验播单含 #EXTM3U；
+// 验不过回直链原地址（/v 已实测 502）；hls4 永不取
+// （诱饵播单，见 2026-11-15 定论）。解包是纯字符串操作，不用 eval。
+// 注意：不用 Range 探首字节——StreamHG 分片常带 70 字节假 PNG 头再接真 TS，
+// Range 取首字节必看成 PNG；整取播单文本验 #EXTM3U 才是有效探活。
+function jsUnescapeSingle(s) {
+  return s.replace(/\\(.)/g, (m, c) => {
+    if (c === 'n') return '\n';
+    if (c === 'r') return '\r';
+    if (c === 't') return '\t';
+    return c;
+  });
+}
+function unpackDeanEdwards(html) {
+  const m = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\}\s*\(\s*'((?:[^'\\]|\\.)*)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'((?:[^'\\]|\\.)*)'\.split\('\|'\)/);
+  if (!m) return '';
+  let p = jsUnescapeSingle(m[1]);
+  const a = parseInt(m[2], 10);
+  const c = parseInt(m[3], 10);
+  const k = jsUnescapeSingle(m[4]).split('|');
+  const enc = (n) => (n < a ? '' : enc(Math.floor(n / a))) + ((n % a) > 35 ? String.fromCharCode((n % a) + 29) : (n % a).toString(36));
+  let i = c;
+  while (i--) {
+    if (k[i]) {
+      const word = k[i];
+      p = p.replace(new RegExp('\\b' + enc(i) + '\\b', 'g'), () => word);
+    }
+  }
+  return p;
+}
+function extractXfsLinks(text) {
+  const links = {};
+  for (const m of text.matchAll(/"hls(\d+)"\s*:\s*"([^"]+)"/g)) {
+    links['hls' + m[1]] = m[2];
+  }
+  if (!Object.keys(links).length) {
+    const f = text.match(/"file"\s*:\s*"(https?:[^"]+?\.m3u8[^"]*)"/) || text.match(/(https?:\/\/[^\s"'\\]+\.m3u8[^\s"'\\]*)/);
+    if (f) links.hls2 = f[1];
+  }
+  return links;
+}
+// 取 XFS 嵌页直链：hls3 > hls2（hls4 永不取）；优先验播单含 #EXTM3U。
+// 验播单失败时回 hls2（dramiyos 稳定 CDN）/ hls3 原地址，不回 Worker /v：
+//   /v 对这类嵌页已实测 502（CF 出口取播单 hls3 525 / hls2 403），回 /v 必死；
+//   直链在手机稳定 IP 下仍有机会（验播单失败可能是瞬时网络问题）。
+//   注意：VM 出口按连接轮换 IP，token 恒对不上，验播单在 VM 侧恒败
+//   （2026-11-21 实测：同进程背靠背取 embed→hls2 仍 403），属 VM 局限，
+//   直解腿只能真机定性。
+async function resolveXfsDirect(embedUrl, referer) {
+  let eu = embedUrl;
+  try {
+    const uu = new URL(eu);
+    if (/(^|\.)hglink\.to$/i.test(uu.hostname)) { uu.hostname = 'trailerhg.xyz'; eu = uu.href; }
+  } catch (e) { /* ignore */ }
+  let page = '';
+  try {
+    const r = await req.get(eu, { headers: { 'User-Agent': UA, 'Referer': referer || '', 'Accept': 'text/html,*/*' }, timeout: 10000, responseType: 'text', transformResponse: [(d) => d] });
+    if (r.status === 200 && typeof r.data === 'string') page = r.data;
+  } catch (e) { return ''; }
+  if (!page) return '';
+  const unpacked = unpackDeanEdwards(page);
+  const links = extractXfsLinks(unpacked || page);
+  for (const key of ['hls3', 'hls2']) {
+    const raw = links[key];
+    if (!raw) continue;
+    let abs = '';
+    try { abs = new URL(raw, eu).href; } catch (e) { continue; }
+    try {
+      const r = await req.get(abs, { headers: { 'User-Agent': UA, 'Referer': eu, 'Accept': '*/*' }, timeout: 8000, responseType: 'text', transformResponse: [(d) => d] });
+      if (r.status === 200 && typeof r.data === 'string' && r.data.includes('#EXTM3U')) {
+        return abs;
+      }
+    } catch (e) { /* 下一条 */ }
+  }
+  // 无一腿验过：回直链原地址（见上注），不回 /v
+  for (const key of ['hls2', 'hls3']) {
+    if (!links[key]) continue;
+    try { return new URL(links[key], eu).href; } catch (e) { /* 下一条 */ }
+  }
+  return '';
+}
+
+
 async function resolveViaWorker(durl, ep) {
   const u = SEXTB_WORKER + '/resolve?u=' + encodeURIComponent(durl) + '&ep=' + encodeURIComponent(ep || '0');
   const headers = { 'User-Agent': UA, 'Accept': 'application/json' };
@@ -501,10 +607,18 @@ async function play(reqIn) {
     const r = await resolveViaWorker(durl, ep);
     if (!r || !r.ok || !r.url) return null;
     if (r.sniff) {
+      // 嗅探线改走蜘蛛侧 XFS 直解（手机出口取嵌页解包，hls3 > hls2，不取 hls4）；
+      // 本站 embed 页在 MiraPlayer 嗅探里起不了播（v4 三轮真机实测），
+      // 直解无链可解时才回嗅探兜底。
+      const direct = await resolveXfsDirect(r.url, durl);
+      if (direct) {
+        return subAttach({ parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': r.url } }, subsP);
+      }
       return subAttach({ parse: 1, jx: 0, url: r.url, header: { 'User-Agent': UA, 'Referer': durl } }, subsP);
     }
     return subAttach({ parse: 0, url: r.url, header: uaHead }, subsP);
   }
+
   const ep0 = hint || '0';
   let out = await tryResolve(ep0);
   if (out) return out;
