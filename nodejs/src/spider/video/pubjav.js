@@ -2,19 +2,27 @@
 // 站点：https://pubjav.com（Watch JAV Streaming Online, Free Japanese Porn）
 // 列表：/movies（最新）、/movies?genre=censored|uncensored|amateur、
 //   /genre/<slug>、/actor/<slug>、/studio/<slug>、/label/<slug>；详情 /play/<slug>。
-// 播放链（VM 全链实测通）：详情页 filmId/__pt/__pk + F4 data-id
-//   → POST /ajax/player（pt 必填，缺/错均 403 E_TOK_LEN/E_TOK_MISS）
-//   → player_enc 用 __pk 做 base64+XOR 解密 → iframe f4scdn.com/e/<code>
-//   → data-api → GET /api/play/<vid>?ab=0&n=1 → src（签名 master m3u8，300 秒有效）。
+// 播放链（VM 全链实测通）：详情页 filmId/__pt/__pk + F4/SW data-id
+//   → POST /ajax/player（pt 必填，缺/错均 403 E_TOK_LEN/E_TOK_MISS；同会话 Cookie 回显）
+//   → player_enc 用 __pk 做 base64+XOR 解密 → iframe embed
+//   → F4：f4scdn.com/e/<code> → data-api → src（签名 master m3u8，300 秒有效），
+//     走 sextb-hls Worker /f4 全链代理；SW：hglink.to 系 xfs embed，走 Worker /v。
 //   master 与分片均强制 Origin: https://f4scdn.com 才能 200（无 Origin 403；
 //   播放器不把 play header 转发给分片请求，直出 m3u8 在真机上必死，sextb v1-v3 已证实）。
-//   故播放走已部署的 sextb-hls Worker /f4 全链代理（Worker 内取 src + 注入 Origin 改写），
+//   故播放走已部署的 sextb-hls Worker 全链代理（Worker 内取 src + 注入 Origin 改写），
 //   蜘蛛只返回 Worker 地址，不直接碰视频流；复用已部署 Worker，无需新部署。
+// 2026-11-21 诊断：F4 上游已死——f4scdn.com / f4splay.vip 的 embed 源站回 502 Bad Gateway，
+//   新鲜现铸的 embed（Worker /resolve 当场铸出）取 embed 页也 502，/f4 路由因此全灭，
+//   详情只剩 F4 懒行、点播转圈。修法：加 SW 第二线（站内真实按钮）；F4 保留首位，
+//   f4scdn 恢复即能播。注意：sextb 侧 SW 实测 /v 回的播单分片全是 PNG 广告图（诱饵播单），
+//   SW 能否真播须真机定性；若 SW 亦播不了则 PubJav 暂无可播线、只等 f4scdn 恢复。
+//   另补两处缺陷：POST 补同会话 Cookie 回显（huadu.js 同款读 res.headers['set-cookie']）
+//   + Origin 头（浏览器 POST 自带，站方可能校验）。
 // 分辨率：F4 编码实测均为单档 720p（3 部片 master 均只含 1280x720 一个变体），
 //   详情按 master 实测档位出线，有多档就多线、单档就一线，绝不硬编。
 // 封面：列表 cdn001.imggle.net webp 直读 200；详情 pics.dmm.co.jp 直读；均无需代理。
-// 其他服务器：SW 为 JS 混淆加载页、DD 为 Turnstile 真人验证墙、
-//   ST get_video 在 VM 上 500（IP 绑定，VM 无法验证），三者均未纳入播放线；只出已验通的 F4 线。
+// 其他服务器：DD 为 Turnstile 真人验证墙、US 未验（新按钮），均未纳入播放线；
+//   ST get_video 在 VM 上 500（IP 绑定，VM 无法验证），未纳入。
 // 字幕：接定版 subcore.js（2026-11-02），按片名登记番号，后台预热，play 有命中才带 subs。
 //   注意：播放地址每次现取签名不同，故字幕统一以详情页地址为键登记与查询。
 import req from '../../util/req.js';
@@ -160,6 +168,7 @@ async function postForm(url, fields, headers, timeoutMs) {
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Accept': 'application/json, text/javascript, */*; q=0.01',
         'X-Requested-With': 'XMLHttpRequest',
+        'Origin': HOST,
       }, headers || {}),
       timeout: timeoutMs || 10000,
       responseType: 'text',
@@ -171,6 +180,39 @@ async function postForm(url, fields, headers, timeoutMs) {
     return '';
   } catch (e) {
     return '';
+  }
+}
+
+// Set-Cookie -> Cookie 头（huadu.js 同款：读 res.headers['set-cookie']，只取各条名值对）。
+// 蜘蛛侧 axios 会回传响应头；无 Set-Cookie 时返回 ''，调用方不发 Cookie 头。
+function cookieFromHeaders(headers) {
+  if (!headers) return '';
+  const sc = headers['set-cookie'] || headers['Set-Cookie'] || [];
+  const list = Array.isArray(sc) ? sc : [sc];
+  const out = [];
+  for (const c of list) {
+    const kv = t(String(c).split(';')[0]);
+    if (kv && kv.indexOf('=') > 0) out.push(kv);
+  }
+  return out.join('; ');
+}
+
+// 取页并回传响应头里的 Cookie（详情页会话 Cookie，供 ajax/player POST 回显）。
+async function fetchPage(url, headers, timeoutMs) {
+  try {
+    const r = await req.get(url, {
+      headers: Object.assign({ 'User-Agent': UA, 'Referer': HOST + '/' }, headers || {}),
+      timeout: timeoutMs || 15000,
+      responseType: 'text',
+      transformResponse: [(d) => d],
+    });
+    const data = r && r.data;
+    const body = typeof data === 'string' ? data : (data ? JSON.stringify(data) : '');
+    let cookie = '';
+    try { cookie = cookieFromHeaders(r && r.headers); } catch (e) { cookie = ''; }
+    return { body, cookie };
+  } catch (e) {
+    return { body: '', cookie: '' };
   }
 }
 
@@ -271,9 +313,9 @@ async function search(reqIn) {
   };
 }
 
-// 从详情页提取：filmId、__pt、__pk、F4 服务器的 data-id。
+// 从详情页提取：filmId、__pt、__pk、F4 与 SW 服务器的 data-id。
 function extractPlayerInfo(html) {
-  const out = { filmId: '', pt: '', pk: '', f4ep: '' };
+  const out = { filmId: '', pt: '', pk: '', f4ep: '', swep: '' };
   if (!html) return out;
   let m = html.match(/filmId\s*=\s*(\d+)/);
   if (m) out.filmId = m[1];
@@ -287,21 +329,29 @@ function extractPlayerInfo(html) {
   let bm;
   while ((bm = re.exec(html)) !== null) {
     const name = t(decodeHtml(bm[3]).replace(/<[^>]*>/g, ' '));
-    if (name === 'F4' && bm[2] && bm[2][0] !== '-') {
-      out.f4ep = bm[2];
-      if (!out.filmId) out.filmId = bm[1];
-      break;
+    if (bm[2] && bm[2][0] !== '-') {
+      if (name === 'F4' && !out.f4ep) {
+        out.f4ep = bm[2];
+        if (!out.filmId) out.filmId = bm[1];
+      } else if (name === 'SW' && !out.swep) {
+        out.swep = bm[2];
+        if (!out.filmId) out.filmId = bm[1];
+      }
     }
+    if (out.f4ep && out.swep) break;
   }
   return out;
 }
 
-// POST /ajax/player 拿 F4 embed 地址（player_enc XOR 解密）。
-async function resolveF4Embed(durl, info) {
-  if (!info || !info.filmId || !info.f4ep || !info.pt || !info.pk) return '';
+// POST /ajax/player 拿 embed 地址（player_enc XOR 解密）；episodeId 为 F4/SW 的 data-id；
+// cookie 为详情页同会话 Cookie（回显；无则不发）。
+async function resolveEmbed(durl, info, episodeId, cookie) {
+  if (!info || !info.filmId || !episodeId || !info.pt || !info.pk) return '';
+  const headers = { 'Referer': durl };
+  if (cookie) headers['Cookie'] = cookie;
   const resp = await postForm(HOST + '/ajax/player',
-    { episode: info.f4ep, filmId: info.filmId, pt: info.pt },
-    { 'Referer': durl }, 10000);
+    { episode: episodeId, filmId: info.filmId, pt: info.pt },
+    headers, 10000);
   if (!resp) return '';
   let playerEnc = '';
   try {
@@ -315,12 +365,37 @@ async function resolveF4Embed(durl, info) {
   return m[1];
 }
 
-// Worker /f4 取 master 播单（Worker 内现取签名 src 并注入 Origin 改写）。
-async function workerF4Master(embedUrl, durl) {
-  const u = WORKER + '/f4?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
+// Worker 取 master 播单：F4 走 /f4（f4scdn embed），SW 走 /v（xfs embed）。
+// Worker 内现取签名 src 并注入 Origin 改写。无 #EXTM3U 即失败（上游 502 时亦如此）。
+async function workerMaster(embedUrl, durl, line) {
+  const route = line === 'SW' ? '/v' : '/f4';
+  const u = WORKER + route + '?u=' + encodeURIComponent(embedUrl) + '&r=' + encodeURIComponent(durl);
   const txt = await getHtml(u, { 'Accept': 'application/vnd.apple.mpegurl,*/*' }, 20000);
   if (!txt || txt.indexOf('#EXTM3U') < 0) return '';
   return txt;
+}
+
+// 某条线的 Worker 主播单地址。
+function workerLineUrl(line, embed, durl) {
+  const route = line === 'SW' ? '/v' : '/f4';
+  return WORKER + route + '?u=' + encodeURIComponent(embed) + '&r=' + encodeURIComponent(durl);
+}
+
+// 整链现解：详情页（取会话 Cookie）-> ajax/player（Cookie 回显）-> embed
+// -> Worker /f4 或 /v 取 master -> 变体。返回 { line, variants, embed, durl }；失败 null。
+// preloaded：detail() 已取过的 { body, cookie }，复用它（F4 用详情页当次 pt；
+// SW 另取新页——__pt 疑似一次性，两线不用同一 pt）。
+async function resolveLine(slug, line, preloaded) {
+  const durl = HOST + '/play/' + slug;
+  const page = preloaded || (await fetchPage(durl));
+  if (!page.body) return null;
+  const info = extractPlayerInfo(page.body);
+  const episodeId = line === 'SW' ? info.swep : info.f4ep;
+  const embed = await resolveEmbed(durl, info, episodeId, page.cookie);
+  if (!embed) return null;
+  const master = await workerMaster(embed, durl, line);
+  if (!master) return null;
+  return { line, variants: parseVariants(master), embed, durl };
 }
 
 // 解析 master 里的变体：#EXT-X-STREAM-INF(RESOLUTION=WxH) 下一行是变体地址。
@@ -379,25 +454,26 @@ async function detail(reqIn) {
   if (!durl) return { list: [] };
   if (!/^https?:\/\//i.test(durl)) durl = absUrl(durl);
   const slug = slugOf(durl);
-  const html = await getHtml(durl);
+  const page = await fetchPage(durl);
+  const html = page.body;
   if (!html) return { list: [] };
 
   const name = extractTitle(html, slug);
   const pic = extractCover(html);
 
-  // F4 链：详情页 → ajax/player → embed → Worker /f4 取 master → 按实测档位出线。
+  // 双线现解：F4 首位（f4scdn 恢复即能播），SW 次位（站内真实第二线）。
+  // 哪条解出 master 就出哪条的档位；两条都死则各留一条懒线，play() 里现解。
   let lines = [];
-  const info = extractPlayerInfo(html);
-  const embed = await resolveF4Embed(durl, info);
-  if (embed) {
-    const master = await workerF4Master(embed, durl);
-    const variants = parseVariants(master);
-    if (variants.length) {
-      lines = variants.map((v) => v.label + '$f4:' + slug + ':' + v.label);
-    }
+  const rsF4 = await resolveLine(slug, 'F4', page);
+  if (rsF4 && rsF4.variants.length) {
+    lines = lines.concat(rsF4.variants.map((v) => 'F4·' + v.label + '$f4:' + slug + ':' + v.label));
   }
-  // 兜底：链路当时没跑通也留一条 F4 线，play() 里现解（签名现取，不依赖详情时效）。
-  if (!lines.length) lines = ['F4$f4:' + slug + ':auto'];
+  const rsSW = await resolveLine(slug, 'SW');
+  if (rsSW && rsSW.variants.length) {
+    lines = lines.concat(rsSW.variants.map((v) => 'SW·' + v.label + '$sw:' + slug + ':' + v.label));
+  }
+  // 兜底：链路当时没跑通也各留一条线，play() 里现解（签名现取，不依赖详情时效）。
+  if (!lines.length) lines = ['F4$f4:' + slug + ':auto', 'SW$sw:' + slug + ':auto'];
 
   const playUrl = lines.join('#');
   // 字幕：以详情页地址为键登记片名（播放地址每次现取签名不同，不能作键），后台预热。
@@ -420,28 +496,23 @@ async function play(reqIn) {
   const body = reqIn?.body || {};
   let id = t(body.id);
   if (!id) return { parse: 0, url: '' };
-  // id 可能是 "720p$f4:<slug>:720p" 或 "F4$f4:<slug>:auto"，取 $ 后面的 token。
+  // id 可能是 "720p$f4:<slug>:720p"、"F4$f4:<slug>:auto"、"SW$sw:<slug>:auto"，取 $ 后面的 token。
   if (id.indexOf('$') >= 0) id = id.split('$').pop().trim();
-  const m = id.match(/^f4:([^:]+):(.+)$/);
+  const m = id.match(/^(f4|sw):([^:]+):(.+)$/);
   if (!m) return { parse: 0, url: '' };
-  const slug = m[1];
-  const want = m[2];
+  const line = m[1].toUpperCase();
+  const slug = m[2];
+  const want = m[3];
   const durl = HOST + '/play/' + slug;
 
-  // 现取：详情页（新鲜 __pt/__pk）→ ajax/player → embed → Worker /f4 取 master。
-  const html = await getHtml(durl);
-  if (!html) return { parse: 0, url: '' };
-  const info = extractPlayerInfo(html);
-  const embed = await resolveF4Embed(durl, info);
-  if (!embed) return { parse: 0, url: '' };
-  const master = await workerF4Master(embed, durl);
-  if (!master) return { parse: 0, url: '' };
+  // 现取：详情页（新鲜 __pt/__pk + 会话 Cookie）→ ajax/player → embed → Worker 取 master。
+  const rs = await resolveLine(slug, line);
+  if (!rs) return { parse: 0, url: '' };
 
-  let url = WORKER + '/f4?u=' + encodeURIComponent(embed) + '&r=' + encodeURIComponent(durl);
+  let url = workerLineUrl(line, rs.embed, rs.durl);
   if (want && want !== 'auto') {
-    const variants = parseVariants(master);
-    const hit = variants.filter((v) => v.label === want)[0]
-      || variants.filter((v) => String(v.height) === want.replace(/p$/i, ''))[0];
+    const hit = rs.variants.filter((v) => v.label === want)[0]
+      || rs.variants.filter((v) => String(v.height) === want.replace(/p$/i, ''))[0];
     if (hit && hit.url) url = hit.url;
   }
   // 字幕：与 detail 同键（详情页地址），detail 预热过则命中缓存/在途；无命中不带 subs 键。
