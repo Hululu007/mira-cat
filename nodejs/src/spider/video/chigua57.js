@@ -1,6 +1,17 @@
 // 57吃瓜 (https://57cg4.com) -> CatPawOpen spider
 // 2026-11-11 取页加固：主域 req 重试 + 备用域 9527heiliao.top + fetch 兜底，
 // 分类名容错；解析逻辑未动（站方 HTML 与解析实测均正常）。
+// 2026-11-22 根因坐实：上游 57cg4.com 详情页 TTFB 恶化到 4–26 秒以上
+//   （VM 实测 4.6/15.9/23.0/26.3 秒 + 一次 30 秒超时；13306 详情主域 26.3 秒、
+//   备用域 14.6 秒），而 getHtml 顺序重试 5 腿 ×20 秒最坏 102 秒仍拿不到页，
+//   详情回空列表、播放无线路（即用户报的“一直加载 / 解析不出来线路地址”）。
+//   修法：① 主域 req + 备用域 req + 主域 fetch + 备用域 fetch 并行竞速，
+//   先拿到可用页的腿获胜，单腿超时放宽到 30 秒，最坏约 30 秒、典型 4–6 秒；
+//   ② 详情页不再要求正文含 /events/（列表/搜索仍要求），只要非空非质询页
+//   即接受；③ 多集合集事件（如 13619“1-6”）按 <video data-hls-src> 顺序出
+//   各集线路（第1集$…#第2集$…），不再全叫“HLS”；单集事件仍为“正片”。
+//   播单/分片链本身健康（m3u8 200 + 分片 Range 206 首字节 0x47 真 TS，
+//   须带 Referer，play() 已随地址带头），封面 Worker 正常。
 // 转换自 REX Forward Widget: forward.57cg.tut v1.1.0 (作者: 宝宝巴士)
 // 列表 /events/{id}/ 结构, 详情页提取 m3u8 / mp4 直链
 // 封面在 s.chigua.media CDN, 需 Referer -> 走服务器代理透传
@@ -45,7 +56,7 @@ function headers() {
 
 async function getHtmlOnce(url) {
   try {
-    const { data } = await req.get(url, { headers: headers(), timeout: 20000 });
+    const { data } = await req.get(url, { headers: headers(), timeout: 30000 });
     const s = String(data || '');
     // Cloudflare 验证页 / 空页一律视为未取到（交给备用域重试）
     if (s && !/Just a moment|Attention Required|cf-browser-verification|cf-challenge/i.test(s)) return s;
@@ -59,7 +70,7 @@ async function getHtmlFetch(url) {
   try {
     if (typeof fetch === 'undefined') return '';
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 22000);
+    const timer = setTimeout(() => ctrl.abort(), 30000);
     const r = await fetch(url, { headers: headers(), signal: ctrl.signal });
     clearTimeout(timer);
     if (!r.ok) return '';
@@ -71,25 +82,40 @@ async function getHtmlFetch(url) {
   }
 }
 
-// 2026-11-11：分类能出、内容全空（暂无数据）。蜘蛛逻辑与站方 HTML 实测均正常，
-// 失败在 App 内取页环节（直连偶发被拒/空回）。改法：同一地址 req 重试一次，
-// 再换备用域 9527heiliao.top 重试，仍空才走 fetch 兜底；任一通道拿到含
-// /events/ 的页面即返回。
-async function getHtml(url) {
-  let html = await getHtmlOnce(url);
-  if (html && html.indexOf('/events/') >= 0) return html;
-  html = await getHtmlOnce(url);
-  if (html && html.indexOf('/events/') >= 0) return html;
-  // 换备用域（同路径）
-  if (url.indexOf(HOST) === 0) {
-    const altUrl = ALT_HOST + url.slice(HOST.length);
-    html = await getHtmlOnce(altUrl);
-    if (html && html.indexOf('/events/') >= 0) return html;
-    html = await getHtmlOnce(altUrl);
-    if (html && html.indexOf('/events/') >= 0) return html;
+// 并行竞速：主域 req、备用域 req、主域 fetch、备用域 fetch 同时发，
+// 先拿到可用页面的腿获胜；失败的腿不提前结束竞速。
+// 上游详情页 TTFB 已恶化到 4–26 秒以上（2026-11-22 实测），顺序重试 5 腿
+// 最坏 102 秒；竞速把最坏情况压到单腿 30 秒，典型 4–6 秒。
+// wantEvents 为真时只接受含 /events/ 的页面（列表/搜索）；详情页为假，
+// 只要非空非质询页即接受（详情页不一定含其它 /events/ 链接，旧逻辑会白烧全部重试）。
+function raceHtml(jobs, wantEvents) {
+  return new Promise((resolve) => {
+    let remaining = jobs.length;
+    let last = '';
+    if (!remaining) { resolve(''); return; }
+    jobs.forEach((job) => {
+      job().then((html) => {
+        if (html) last = html;
+        if (html && (!wantEvents || html.indexOf('/events/') >= 0)) { resolve(html); return; }
+        remaining--;
+        if (remaining <= 0) resolve(last);
+      }).catch(() => {
+        remaining--;
+        if (remaining <= 0) resolve(last);
+      });
+    });
+  });
+}
+
+async function getHtml(url, wantEvents = true) {
+  const altUrl = url.indexOf(HOST) === 0 ? ALT_HOST + url.slice(HOST.length) : '';
+  const jobs = [() => getHtmlOnce(url)];
+  if (altUrl) jobs.push(() => getHtmlOnce(altUrl));
+  if (typeof fetch !== 'undefined') {
+    jobs.push(() => getHtmlFetch(url));
+    if (altUrl) jobs.push(() => getHtmlFetch(altUrl));
   }
-  html = await getHtmlFetch(url);
-  if (html && html.indexOf('/events/') >= 0) return html;
+  const html = await raceHtml(jobs, wantEvents);
   return html || '';
 }
 
@@ -219,6 +245,25 @@ function extractPlay(html) {
   return sources;
 }
 
+// 详情页 <video data-hls-src + data-fallback-src> 按顺序即各集（多集合集事件如
+// “1-6”一页含 6 个 <video>，与 JSON-LD VideoObject、m3u8 正则顺序一致）；
+// 无 <video> 标签时退回 m3u8/mp4 正则（文档顺序）。返回 [{hls, mp4}]。
+function extractEpisodes(html) {
+  const eps = [];
+  const re = /<video[^>]+data-hls-src=["']([^"']+)["'][^>]*>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const fb = m[0].match(/data-fallback-src=["']([^"']+)["']/i);
+    eps.push({ hls: t(m[1]), mp4: fb ? t(fb[1]) : '' });
+  }
+  if (!eps.length) {
+    const srcs = extractPlay(html);
+    for (const u of srcs) if (/\.m3u8/i.test(u)) eps.push({ hls: u, mp4: '' });
+    if (!eps.length) for (const u of srcs) if (/\.mp4/i.test(u)) eps.push({ hls: '', mp4: u });
+  }
+  return eps;
+}
+
 function extractTitle(html, fallback) {
   let m = html.match(/property=["']og:title["'][^>]*content=["']([^"']+)/i)
     || html.match(/content=["']([^"']+)["'][^>]*property=["']og:title["']/i);
@@ -271,7 +316,7 @@ async function detail(reqIn) {
   if (!vid) return { list: [] };
 
   const pageUrl = `${HOST}/events/${vid}/`;
-  const html = await getHtml(pageUrl);
+  const html = await getHtml(pageUrl, false);
   if (!html) return { list: [] };
 
   const name = extractTitle(html, vid);
@@ -280,14 +325,15 @@ async function detail(reqIn) {
   if (dm) content = decodeHtml(dm[1]);
 
   const pic = extractCover(html);
-  const sources = extractPlay(html);
+  const eps = extractEpisodes(html);
   const seen = new Set();
-  const eps = [];
-  for (const s of sources) {
-    if (seen.has(s.url)) continue;
-    seen.add(s.url);
-    const epName = String(s.name || '正片').replace(/[$#]/g, '_');
-    eps.push(`${epName}$${s.url}`);
+  const lines = [];
+  for (let i = 0; i < eps.length; i++) {
+    const u = eps[i].hls || eps[i].mp4;
+    if (!u || seen.has(u)) continue;
+    seen.add(u);
+    const epName = (eps.length > 1 ? '第' + (i + 1) + '集' : '正片').replace(/[$#]/g, '_');
+    lines.push(`${epName}$${u}`);
   }
 
   return {
@@ -297,7 +343,7 @@ async function detail(reqIn) {
       vod_pic: proxyImgUrl(reqIn, pic),
       vod_content: content,
       vod_play_from: NAME,
-      vod_play_url: eps.join('#'),
+      vod_play_url: lines.join('#'),
     }],
   };
 }
