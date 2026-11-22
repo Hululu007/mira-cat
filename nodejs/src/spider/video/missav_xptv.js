@@ -263,16 +263,25 @@ async function getTracks(detailUrl) {
   const tracks = [];
   // XPTV 正则 /surrit\.com\\\/(.+)\\\/seek\\\/_0\.jpg/
   // 实测站点已换成 surrit.mrstcdn.store,这里同时兼容新旧域名
-  const match = html.match(/surrit(?:\.com|\.mrstcdn\.store)\\\/([^"\\]+)\\\/seek\\\/_0\.jpg/);
+  let match = html.match(/surrit(?:\.com|\.mrstcdn\.store)\\\/([^"\\]+)\\\/seek\\\/_0\.jpg/);
+  // 兜底 (2026-11-23): 个别详情页无 seek 缩略图时,退回任意 UUID
+  // (实测详情页内仅视频自身一个 UUID)。
+  if (!match) {
+    const anyUuid = html.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+    if (anyUuid) match = [anyUuid[0], anyUuid[0]];
+  }
   if (match && match[1]) {
     const uuid = match[1];
+    let discovered = false;
     for (const prefix of M3U8_PREFIXES) {
       try {
         const { data } = await req.get(prefix + uuid + M3U8_SUFFIX, {
           headers: headers(detailUrl),
           timeout: 20000,
         });
-        const lines = String(data || '').split('\n');
+        const body = String(data || '');
+        if (!body.includes('#EXTM3U')) continue;
+        const lines = body.split('\n');
         // 每个清晰度一行,形如 720p/video.m3u8;名称取 720p 部分
         lines
           .filter((line) => line.includes('/video.m3u8'))
@@ -281,8 +290,15 @@ async function getTracks(detailUrl) {
             tracks.unshift({ name, url: `${prefix}${uuid}/${line.trim()}` });
           });
         tracks.push({ name: '自动', url: prefix + uuid + M3U8_SUFFIX });
-        if (tracks.length) break;
+        discovered = true;
+        break;
       } catch (e) { /* 换下一个域名重试 */ }
+    }
+    // 兜底 (2026-11-23): 清单直取失败时仍给主清单直链。主清单地址由
+    // UUID 确定、无需拉取；播放器直取主清单 (系统播放器网络栈与蜘蛛
+    // req 不同)，避免"解析不出线路地址"。
+    if (!discovered) {
+      tracks.push({ name: '自动', url: M3U8_PREFIXES[0] + uuid + M3U8_SUFFIX });
     }
   }
   return { info, tracks };
