@@ -11,6 +11,17 @@ import req from '../../util/req.js';
 // 字幕：与模板同一套 Layer A（见下 sub core，逐字复制，仅 subSlugTitle 保持原样；番号取自标题/slug，JUL-788 类均可命中），按条目接（仅含番号的条目接芯）
 const HOST = 'https://javhey.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+// 封面代理：javorb.com/javmod.com 直链 TTFB 约 1.6-1.8s，列表 24 张逐张慢、
+// 有的超时不出；改走自建 Worker 代取 + CF 缓存（javhey-img-proxy v1.0）
+const IMG_PROXY = 'https://javhey-img-proxy.li768435813.workers.dev/img?url=';
+function proxyCover(u) {
+  const s = String(u || '');
+  if (!s) return s;
+  if (/^(https?:)?\/\/(javorb\.com|javmod\.com)\//i.test(s)) {
+    return IMG_PROXY + encodeURIComponent(s.startsWith('//') ? 'https:' + s : s);
+  }
+  return s;
+}
 
 // 分类：全部取自站内 /categories 实测（id/slug/名均原文）；中文名为用户点名近义项的诚实映射，见 NOTES.md
 // 无码流出/无码破解/减码类：Uncensored(76)/Decensored(31)/Sensor Dihapus(222，印尼语“去码”)为站内真实存在的去码类；
@@ -118,7 +129,7 @@ function parseCards(html, host) {
     let it = byUrl.get(vUrl);
     if (!it) { it = { vod_id: vUrl, vod_name: '', vod_pic: '', vod_remarks: '' }; byUrl.set(vUrl, it); }
     const imgM = inner.match(/<img[^>]+src=["']([^"']+)["'][^>]*>/i);
-    if (imgM && !it.vod_pic) it.vod_pic = normUrl(absUrl(imgM[1].trim(), host));
+    if (imgM && !it.vod_pic) it.vod_pic = proxyCover(normUrl(absUrl(imgM[1].trim(), host)));
     const altM = inner.match(/alt=["']([^"']+)["']/i);
     const txt = cleanLabel(altM ? altM[1] : inner);
     if (txt && !it.vod_name) it.vod_name = txt.replace(/^JAV Subtitle Indonesia\s*-\s*/i, '');
@@ -579,7 +590,7 @@ async function detail(reqIn) {
   let posterPic = '';
   for (const m of html.matchAll(/<img[^>]+src=["']([^"']+)["'][^>]*>/gi)) {
     const src = m[0].includes('AjaxLoader') ? '' : m[1].trim();
-    if (src && /^https?:\/\//.test(src) || src.startsWith('//')) { posterPic = normUrl(absUrl(src, HOST)); break; }
+    if (src && /^https?:\/\//.test(src) || src.startsWith('//')) { posterPic = proxyCover(normUrl(absUrl(src, HOST))); break; }
   }
   const embeds = extractEmbeds(html);
   const options = [];
