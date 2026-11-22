@@ -26,7 +26,6 @@ import jinguo from './spider/video/jinguo.js';
 import chengguo from './spider/video/chengguo.js';
 import yeguo from './spider/video/yeguo.js';
 import mrds from './spider/video/mrds.js';
-import bianfu from './spider/video/bianfu.js';
 import xnxx from './spider/video/xnxx.js';
 import sanjipian from './spider/video/sanjipian.js';
 import juheduanju from './spider/video/juheduanju.js';
@@ -150,7 +149,6 @@ const spiders = [
     avporn,
     hyjx0817,
     beeg,
-    bianfu,
     bigbuttshub,
     brazz,
     cableav,
