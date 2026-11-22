@@ -32,7 +32,11 @@ const CLASSES = [
   { type_id: 'uncensored-leaked', type_name: '無修正流出' },
   { type_id: 'chinese-av', type_name: '國產AV' },
   { type_id: 'aiav', type_name: 'AI 短劇' },
-  { type_id: 'hot-issue', type_name: '熱門事件' },
+  // 2026-11-23：删“熱門事件”分类（用户令硬删）；加 realhshorts（真人情色短劇，
+  // 站上真实分类，/category/realhshorts/ 200、12 条独有内容、标题“真人情色短劇 - JAVDAY”）。
+  // 注意：站上另 4 个 /category/ slug（jvid/luolisheus/txvlog/uncensored）与任意编造的
+  // slug 一样，都只回同一份 fallback 列表（md5 相同、标题为空），是死分类，绝不加。
+  { type_id: 'realhshorts', type_name: '真人情色短劇' },
 ];
 
 function t(v) {
