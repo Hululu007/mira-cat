@@ -102,6 +102,12 @@ function parsePagecount(html) {
 const CATS = [
   { type_id: 'latest', type_name: '最新', path: '/videos' },
   { type_id: 'rm', type_name: 'Reducing Mosaic', path: '/search?q=reducing-mosaic' },
+  // 2026-11-23 加 5 个分类：均为站内 /search?q= 真实可验（各 25 条/页，&page=2 已验通，仅 1 条重叠）
+  { type_id: 'uncensored', type_name: 'Uncensored', path: '/search?q=uncensored' },
+  { type_id: 'censored', type_name: 'Censored', path: '/search?q=censored' },
+  { type_id: 'fc2', type_name: 'FC2', path: '/search?q=fc2' },
+  { type_id: 'amateur', type_name: 'Amateur', path: '/search?q=amateur' },
+  { type_id: '4k', type_name: '4K', path: '/search?q=4k' },
 ];
 const PATH_BY_ID = {};
 for (const c of CATS) PATH_BY_ID[c.type_id] = c.path;
