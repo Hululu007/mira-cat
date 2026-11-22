@@ -414,15 +414,143 @@ function tokensOf(html) {
   return { pt, pk };
 }
 
-// v11（2026-11-23）：/resolve 已死（Worker 取详情页被站方 403 封 CF 出口）。
-// 改走 Worker /ajax：蜘蛛现取详情页提 pt/pk/filmId/episode（手机住宅出口可直取），
-// Worker 只做 POST /ajax/player + XOR 解密出嵌页（已实测：新鲜 pt 一次即通，
-// 无 Cookie 也可；pt 一次一用，报错即重取详情页换新 pt 再试一次）。
+// ---------- 设备侧 ajax（2026-11-23 v12）：Worker /ajax 已死 ----------
+// 根因：站方现 403 封 Cloudflare 出口——Worker /diag 回 FETCH_FAIL 403，
+// Worker /ajax（POST /ajax/player）回 HTTP_403（新鲜 pt/pk 实测）；
+// 蜘蛛取详情页提 pt 再调 Worker /ajax 必然空手，play 回 parse:0 空 url
+// → 全线路无限转圈。修复：POST /ajax/player 改由设备（手机住宅出口，
+// 站方不拦）直发；Worker 只剩 /f4（f4scdn 不拦 CF，实测可取）继续用。
+// Cookie：pt 与 PHPSESSID 同会话绑定（无 Cookie/错 Cookie 发 ajax 恒
+// E_SID）；详情页直取时顺带从响应头取 set-cookie，POST 时原样带回。
+// 响应头取不到时也照发（11-23 Worker 无 Cookie 曾一次通），E_SID/E_TOK
+// 时重取详情页换新 pt 再试一轮。
+function cookieOf(headers) {
+  try {
+    if (!headers) return '';
+    let raw = '';
+    if (typeof headers.getSetCookie === 'function') {
+      const arr = headers.getSetCookie();
+      if (arr && arr.length) raw = arr.join(', ');
+    }
+    if (!raw) raw = headers['set-cookie'] || headers['Set-Cookie'] || '';
+    if (Array.isArray(raw)) raw = raw.join(', ');
+    if (typeof raw !== 'string' || !raw) return '';
+    const attrs = { expires: 1, path: 1, domain: 1, 'max-age': 1, samesite: 1, secure: 1, httponly: 1 };
+    const pairs = [];
+    const seen = {};
+    const re = /([A-Za-z0-9_-]+)=([^;,]+)/g;
+    let m;
+    while ((m = re.exec(raw)) !== null) {
+      const name = m[1];
+      if (attrs[name.toLowerCase()]) continue;
+      if (seen[name]) continue;
+      seen[name] = 1;
+      pairs.push(name + '=' + m[2]);
+    }
+    return pairs.join('; ');
+  } catch (e) { return ''; }
+}
+
+// 直取详情页，同时拿 Cookie（与 pt 同会话；jina 腿无 Cookie，不走这路）
+async function fetchDetailDirect(url) {
+  let origin = '';
+  try { origin = new URL(url).origin; } catch (e) { origin = REFERER; }
+  try {
+    const r = await req.get(url, { headers: pageHeaders(origin + '/'), timeout: 10000 });
+    if (r && r.status === 200 && typeof r.data === 'string' && !isBlockedPage(r.data)) {
+      return { html: r.data, cookie: cookieOf(r.headers) };
+    }
+  } catch (e) { /* 回落 getHtml */ }
+  return { html: '', cookie: '' };
+}
+
+const B64TAB = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+function b64ToBytes(b64) {
+  let clean = String(b64 || '').replace(/[^A-Za-z0-9+/=]/g, '');
+  while (clean.length % 4) clean += '=';
+  const rev = {};
+  for (let i = 0; i < B64TAB.length; i++) rev[B64TAB[i]] = i;
+  const out = [];
+  for (let i = 0; i + 4 <= clean.length; i += 4) {
+    const c0 = rev[clean[i]];
+    const c1 = rev[clean[i + 1]];
+    const c2 = clean[i + 2] === '=' ? 0 : rev[clean[i + 2]];
+    const c3 = clean[i + 3] === '=' ? 0 : rev[clean[i + 3]];
+    if (c0 == null || c1 == null || c2 == null || c3 == null) return null;
+    out.push((c0 << 2) | (c1 >> 4));
+    if (clean[i + 2] !== '=') out.push(((c1 & 15) << 4) | (c2 >> 2));
+    if (clean[i + 3] !== '=') out.push(((c2 & 3) << 6) | c3);
+  }
+  return out;
+}
+// XOR 解密 player_enc（Worker xorDecryptPlayer 同款，纯字符串操作）
+function xorDecryptPlayer(enc, key) {
+  if (!enc || !key) return '';
+  const bytes = b64ToBytes(enc);
+  if (!bytes || !bytes.length) return '';
+  let out = '';
+  for (let i = 0; i < bytes.length; i++) out += String.fromCharCode(bytes[i] ^ key.charCodeAt(i % key.length));
+  return out;
+}
+function iframeSrc(playerHtml) {
+  const html = String(playerHtml || '');
+  const em = html.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/) || html.match(/<iframe[^>]+src="(\/\/[^"]+)"/);
+  if (!em) return '';
+  return em[1].startsWith('//') ? 'https:' + em[1] : em[1];
+}
+function embedFromAjaxJson(j, pk) {
+  if (!j || j.error) return '';
+  if (j.player) return iframeSrc(j.player);
+  if (j.player_enc && pk) return iframeSrc(xorDecryptPlayer(j.player_enc, pk));
+  return '';
+}
+
+// 设备侧 POST /ajax/player（Worker v4Ajax 同款请求体与请求头）
+async function postAjaxPlayer(origin, filmId, episode, pt, pk, cookie) {
+  const body = 'episode=' + encodeURIComponent(episode) + '&filmId=' + encodeURIComponent(filmId) + '&pt=' + encodeURIComponent(pt);
+  const headers = {
+    'User-Agent': UA,
+    'Referer': origin + '/',
+    'Origin': origin,
+    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'X-Requested-With': 'XMLHttpRequest',
+  };
+  if (cookie) headers['Cookie'] = cookie;
+  // 通道1: req.post（axios，可带 Cookie 头）
+  try {
+    const r = await req.post(origin + '/ajax/player', body, { headers, timeout: 12000 });
+    const j = (typeof r.data === 'string') ? JSON.parse(r.data) : r.data;
+    const em = embedFromAjaxJson(j, pk);
+    if (em) return em;
+  } catch (e) { /* 换 fetch 通道 */ }
+  // 通道2: 原生 fetch POST
+  try {
+    const ctl = new AbortController();
+    const to = setTimeout(() => ctl.abort(), 12000);
+    try {
+      const r = await fetch(origin + '/ajax/player', { method: 'POST', headers, body, signal: ctl.signal });
+      if (r.ok) {
+        const j = await r.json().catch(() => null);
+        const em = embedFromAjaxJson(j, pk);
+        if (em) return em;
+      }
+    } finally { clearTimeout(to); }
+  } catch (e) { /* 失败 */ }
+  return '';
+}
+
+// v12（2026-11-23）：设备侧 ajax 为主（见上注）；Worker /ajax 仅作回落。
 async function ajaxEmbed(durl, epName) {
   let origin = '';
   try { origin = new URL(durl).origin; } catch (e) { return ''; }
   for (let round = 0; round < 2; round++) {
-    const html = await getHtml(durl);
+    // 直取详情页 + Cookie（同会话）；直取失败回落 getHtml（jina，无 Cookie）
+    let html = '';
+    let cookie = '';
+    const det = await fetchDetailDirect(durl);
+    if (det.html) { html = det.html; cookie = det.cookie; }
+    else html = await getHtml(durl);
     if (!html) return '';
     const { pt, pk } = tokensOf(html);
     const { filmId, episodes } = extractPlayerInfo(html);
@@ -433,6 +561,10 @@ async function ajaxEmbed(durl, epName) {
     }
     if (!ep) ep = episodes[0];
     if (!ep) return '';
+    // 主：设备侧 POST
+    const em = await postAjaxPlayer(origin, ep.filmId || filmId, ep.episode, pt, pk, cookie);
+    if (em) return em;
+    // 回落：Worker /ajax（站方 403 封 CF，基本已死，留作兜底）
     const u = SEXTB_WORKER + '/ajax?o=' + encodeURIComponent(origin)
       + '&filmId=' + encodeURIComponent(ep.filmId || filmId)
       + '&episode=' + encodeURIComponent(ep.episode)
@@ -441,7 +573,7 @@ async function ajaxEmbed(durl, epName) {
       const { data, status } = await req.get(u, { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, timeout: 12000 });
       const j = (typeof data === 'string') ? JSON.parse(data) : data;
       if (status === 200 && j && j.ok && j.embed) return j.embed;
-    } catch (e) { /* retry with fresh pt */ }
+    } catch (e) { /* 下一轮换新 pt */ }
   }
   return '';
 }
