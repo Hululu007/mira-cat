@@ -49,8 +49,14 @@ function proxyCover(url) {
   if (!url) return '';
   if (url.indexOf('data:') === 0) return url;
   if (url.indexOf('51chigua.li768435813.workers.dev') >= 0 || url.indexOf('bagua-img-proxy') >= 0) return url;
-  if (/^https?:\/\/pic\.[^\/]*\.cn\//i.test(url)) return IMG_PROXY_51 + encodeURIComponent(url);
-  return IMG_PROXY_BAGUA + encodeURIComponent(url);
+  // 2026-11-23 对齐 REX 1.0.5（修封面有的出有的不出）：bagua 白名单仅
+  // pic.jtzatly/drleao 加密图床；pic.*.cn 走 51chigua；其余（站内图、明文图）
+  // 直连——旧代码把非 pic 图一律送 bagua，bagua 回 400 封面全灭。
+  var hm = url.match(/^https?:\/\/([^\/]+)/i);
+  var host = hm ? hm[1].toLowerCase() : '';
+  if (/^pic\.(jtzatly|drleao)\.cn$/i.test(host)) return IMG_PROXY_BAGUA + encodeURIComponent(url);
+  if (/^pic\.[^\/]*\.cn$/i.test(host)) return IMG_PROXY_51 + encodeURIComponent(url);
+  return url;
 }
 
 function H() {
@@ -249,8 +255,11 @@ async function category(reqIn) {
   const url = page === 1 ? (base + '/') : (base + '/' + page + '/');
   const html = await getText(url);
   const videos = parseArticles(html);
+  // 2026-11-23 修“热门大瓜加载不出更多”：站方每页实测 30 条（末页 20），
+  // 旧 limit:90 让播放器见 30<90 误判为末页、p1 后不再翻页；空页时
+  // pagecount 收回本页（p3 为 404、无更多），不再谎报 9999 空转。
   return {
-    page, pagecount: 9999, limit: 90,
+    page, pagecount: videos.length ? 9999 : page, limit: 30,
     total: videos.length ? 999999 : 0,
     list: videos,
   };
@@ -364,13 +373,13 @@ async function search(reqIn) {
   const body = reqIn?.body || {};
   const wd = String(body.wd || '').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  if (!wd) return { page, pagecount: page, limit: 90, total: 0, list: [] };
+  if (!wd) return { page, pagecount: page, limit: 30, total: 0, list: [] };
   const url = page === 1
     ? (HOST + 'search/' + encodeURIComponent(wd) + '/')
     : (HOST + 'search/' + encodeURIComponent(wd) + '/' + page + '/');
   const html = await getText(url);
   const list = parseArticles(html);
-  return { page, pagecount: 9999, limit: 90, total: list.length, list };
+  return { page, pagecount: list.length ? 9999 : page, limit: 30, total: list.length ? 999999 : 0, list };
 }
 
 // ---------- 播单改写代理（2026-11-04 重修：播单/分片/密钥全部走蜘蛛本地代理，
