@@ -175,6 +175,14 @@ function pl3wrap(u) {
   return PL3 + u;
 }
 
+// 清单改写 Worker（av77-hls v1，已部署）：手机到 Worker 稳定，Worker 服务端取 pl3。
+// 出线一律走 Worker，手机不再直连 pl3（部分网络下直连失败是无法播放的主因）。
+const AV77_HLS = 'https://av77-hls.li768435813.workers.dev';
+function hlsWrap(pl3Url) {
+  if (String(pl3Url || '').indexOf(AV77_HLS) === 0) return pl3Url;
+  return AV77_HLS + '/m3u8?u=' + encodeURIComponent(pl3Url);
+}
+
 // ---------- Dean Edwards packer 反混淆（无 eval，纯字符串替换） ----------
 // 站内两种方言：
 //   v1：eval(function(p,a,c,k,e,d){while(c--)...}('PAYLOAD',BASE,COUNT,'k...'.split('|')))
@@ -285,8 +293,21 @@ function parseMaster(text, base) {
   return out;
 }
 
-// 取主播单（走 pl3 代理；pl3 偶发 500，重试一次）。
+// 取主播单：Worker 腿优先（手机到 Worker 稳定，Worker 服务端取 pl3），
+// 直连 pl3 只作回落。Worker 回主播单（变体地址已是 Worker /m3u8）或媒体播单（单档已展平）。
 async function fetchMasterVariants(master, durl) {
+  const wurl = hlsWrap(pl3wrap(master));
+  try {
+    const wtxt = await getHtml(wurl, { Referer: durl }, 20000);
+    if (wtxt && wtxt.indexOf('#EXTM3U') >= 0) {
+      if (wtxt.indexOf('#EXT-X-STREAM-INF') >= 0) {
+        const wv = parseMaster(wtxt, wurl);
+        if (wv.length) return wv;
+      } else if (wtxt.indexOf('#EXTINF') >= 0) {
+        return [{ label: '原画', url: wurl }];
+      }
+    }
+  } catch (e) {}
   for (let attempt = 0; attempt < 2; attempt++) {
     const txt = await getHtml(pl3wrap(master), { Referer: durl }, 20000);
     if (txt && txt.indexOf('#EXTM3U') >= 0) return parseMaster(txt, master);
@@ -471,13 +492,13 @@ async function detail(reqIn) {
       // surrit / slv / krevonix 主播单：走 pl3 取一次，按实测档位出线。
       const variants = await fetchMasterVariants(srcs.master, durl);
       if (variants.length) {
-        for (const v of variants) lines.push(v.label + '$' + v.url + '@' + durl);
+        for (const v of variants) lines.push(v.label + '$' + hlsWrap(v.url) + '@' + durl);
       } else {
         const single = srcs.v1280 || srcs.v842 || '';
         if (single) {
           if (isMp4(single)) lines.push(mp4Label(single) + '$' + single + '@' + durl);
-          else lines.push(variantLabelFromPath(single) + '$' + pl3wrap(single) + '@' + durl);
-        } else lines.push('原画$' + pl3wrap(srcs.master) + '@' + durl);
+          else lines.push(variantLabelFromPath(single) + '$' + hlsWrap(pl3wrap(single)) + '@' + durl);
+        } else lines.push('原画$' + hlsWrap(pl3wrap(srcs.master)) + '@' + durl);
       }
     }
   }

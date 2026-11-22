@@ -547,7 +547,23 @@ async function detail(reqIn) {
 // F4/DD 两线皆通），直连 POST 从机房出口 403/超时。pt 疑似一次一用：中转
 // 拿到站方错误回包即视为 pt 已烧，不再用同一 pt 试直连，直接重抓详情换新 pt。
 // 重试取详情必须拿到含 __pt 的页：jina 加工页会剥掉 script，__pt 取不到，重试必败。
-async function ajaxPlayer(filmId, episode, pt, durl) {
+async function ajaxPlayer(filmId, episode, pt, durl, pk) {
+  // ⓪ Worker /ajax（2026-11-23 新增，已实测新鲜 pt 一次即通）：Worker 只做
+  // POST /ajax/player + XOR 解密，蜘蛛/模块只提供令牌。site-fetch POST 已被拒
+  // （E_XHR 403），直连 POST 仅手机住宅出口可能通，两者皆作回落。
+  if (pk) {
+    try {
+      let origin = '';
+      try { origin = new URL(durl).origin; } catch (e) { return null; }
+      const wu = WORKER + '/ajax?o=' + encodeURIComponent(origin)
+        + '&filmId=' + encodeURIComponent(filmId) + '&episode=' + encodeURIComponent(episode)
+        + '&pt=' + encodeURIComponent(pt) + '&pk=' + encodeURIComponent(pk);
+      const r = await req.get(wu, { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, timeout: 12000 });
+      const j = (typeof r.data === 'string') ? JSON.parse(r.data) : r.data;
+      if (j && j.ok && j.embed) return { player_embed: j.embed };
+      if (j && !j.ok) return { __stationError: true };
+    } catch (e) { /* 落到 POST 腿 */ }
+  }
   let ajaxUrl = '';
   try { ajaxUrl = new URL(durl).origin + '/ajax/player'; } catch (e) { return null; }
   const body = 'episode=' + encodeURIComponent(episode) + '&filmId=' + encodeURIComponent(filmId) + '&pt=' + encodeURIComponent(pt);
@@ -623,31 +639,38 @@ async function play(reqIn) {
   const durl = parts.slice(4).join('|');
   // 字幕与 ajax 并行发起（不串行叠加延迟）
   const subsP = subSearchAll(id).catch(() => []);
-  let json = await ajaxPlayer(filmId, episode, pt, durl);
+  let json = await ajaxPlayer(filmId, episode, pt, durl, pk);
   if (!json || json.__stationError) {
     // pt 可能已轮换过期/烧掉：重抓详情取新 pt/pk 与同服务器 episode，重试一次
     const fresh = await freshDetail(durl, episode);
     if (fresh && fresh.filmId) {
       pt = fresh.pt;
       pk = fresh.pk || pk;
-      json = await ajaxPlayer(fresh.filmId, fresh.episode, fresh.pt, durl);
+      json = await ajaxPlayer(fresh.filmId, fresh.episode, fresh.pt, durl, fresh.pk || pk);
       if (!json || json.__stationError) json = null;
     } else {
       json = null;
     }
   }
   if (!json || json.error) return { parse: 0, url: '' };
+  let embed = '';
   let playerHtml = '';
-  const usePk = pk || '';
-  if (json.player_enc) playerHtml = xorDecrypt(json.player_enc, usePk);
-  else if (json.player) playerHtml = String(json.player);
-  if (!playerHtml) return { parse: 0, url: '' };
-  const em = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i)
-    || playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/i);
+  if (json.player_embed) {
+    embed = String(json.player_embed);
+  } else {
+    const usePk = pk || '';
+    if (json.player_enc) playerHtml = xorDecrypt(json.player_enc, usePk);
+    else if (json.player) playerHtml = String(json.player);
+    if (!playerHtml) return { parse: 0, url: '' };
+    const em = playerHtml.match(/<iframe[^>]+src="(https?:\/\/[^"]+)"/i)
+      || playerHtml.match(/<iframe[^>]+src="(\/\/[^"]+)"/i);
+    if (em) {
+      embed = em[1];
+      if (embed.startsWith('//')) embed = 'https:' + embed;
+    }
+  }
   const subs = await subsP;
-  if (em) {
-    let embed = em[1];
-    if (embed.startsWith('//')) embed = 'https:' + embed;
+  if (embed) {
     // F4 系走 Worker /f4（host 502 时仍回该地址，host 恢复即播，不另寻腿）
     if (isF4Host(hostOf(embed))) {
       const result = { parse: 0, url: workerUrl(embed, durl), header: { 'User-Agent': UA, 'Referer': durl } };

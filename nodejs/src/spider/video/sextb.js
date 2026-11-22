@@ -406,6 +406,46 @@ function extractPlayerInfo(html) {
   return { filmId, episodes };
 }
 
+// 令牌提取：详情页 window.__pt/__pk（32 hex）。
+function tokensOf(html) {
+  const h = String(html || '');
+  const pt = (h.match(/window\.__pt\s*=\s*"([0-9a-fA-F]{32})"/) || [])[1] || '';
+  const pk = (h.match(/window\.__pk\s*=\s*"([0-9a-fA-F]{32})"/) || [])[1] || '';
+  return { pt, pk };
+}
+
+// v11（2026-11-23）：/resolve 已死（Worker 取详情页被站方 403 封 CF 出口）。
+// 改走 Worker /ajax：蜘蛛现取详情页提 pt/pk/filmId/episode（手机住宅出口可直取），
+// Worker 只做 POST /ajax/player + XOR 解密出嵌页（已实测：新鲜 pt 一次即通，
+// 无 Cookie 也可；pt 一次一用，报错即重取详情页换新 pt 再试一次）。
+async function ajaxEmbed(durl, epName) {
+  let origin = '';
+  try { origin = new URL(durl).origin; } catch (e) { return ''; }
+  for (let round = 0; round < 2; round++) {
+    const html = await getHtml(durl);
+    if (!html) return '';
+    const { pt, pk } = tokensOf(html);
+    const { filmId, episodes } = extractPlayerInfo(html);
+    if (!pt || !filmId || !episodes.length) return '';
+    let ep = null;
+    if (epName && epName !== '0') {
+      ep = episodes.find((x) => t(x.name).toUpperCase() === String(epName).toUpperCase()) || null;
+    }
+    if (!ep) ep = episodes[0];
+    if (!ep) return '';
+    const u = SEXTB_WORKER + '/ajax?o=' + encodeURIComponent(origin)
+      + '&filmId=' + encodeURIComponent(ep.filmId || filmId)
+      + '&episode=' + encodeURIComponent(ep.episode)
+      + '&pt=' + encodeURIComponent(pt) + '&pk=' + encodeURIComponent(pk);
+    try {
+      const { data, status } = await req.get(u, { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, timeout: 12000 });
+      const j = (typeof data === 'string') ? JSON.parse(data) : data;
+      if (status === 200 && j && j.ok && j.embed) return j.embed;
+    } catch (e) { /* retry with fresh pt */ }
+  }
+  return '';
+}
+
 // 线路多集：详情页按钮已含 F4/SW/DD/FL/US 等线路名，按优先级出集
 // （2026-11-21 v11：SW 置顶——用户真机确认只有 SW 能播；F4 垫底——
 // f4splay.vip host 全网 502，host 恢复前播不了，恢复后不需再推即可播；
@@ -597,26 +637,28 @@ async function play(reqIn) {
   const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
   const uaHead = { 'User-Agent': UA };
 
-  // v10: 令牌流整个搬到 Worker 侧（/resolve）：蜘蛛只传详情页地址 +
-  // 线路名，不再自己取详情页、不做 ajax、不碰 pt/pk/Cookie——App 不把
-  // set-cookie 回吐给蜘蛛，蜘蛛侧令牌流在手机上无解（v8/v9 实测坐实）。
-  // /resolve 在 Worker 侧完成：取详情页 → ajax → XOR 解密 → 按宿主出线。
-  // F4/SW 回 Worker 播放地址（parse:0 直返）；其他宿主回原 embed +
-  // sniff:true（parse:1 交播放器嗅探）。
+  function isF4Host(u) {
+  let host = '';
+  try { host = new URL(u).hostname; } catch (e) { /* ignore */ }
+  return /f4scdn\.com|f4jav\.xyz|f4splay\.vip/i.test(host || '');
+}
+
+// v11（2026-11-23）：/resolve 已死，改走 Worker /ajax（见 ajaxEmbed）。
+  // F4 嵌页 → Worker /f4（已修 sb=1 + embed Origin，全链 200）；
+  // 其他宿主 → 蜘蛛侧 XFS 直解（手机出口取嵌页解包，hls3 > hls2，不取 hls4）；
+  // 直解无链可解时回嗅探兜底（parse:1）。
   async function tryResolve(ep) {
-    const r = await resolveViaWorker(durl, ep);
-    if (!r || !r.ok || !r.url) return null;
-    if (r.sniff) {
-      // 嗅探线改走蜘蛛侧 XFS 直解（手机出口取嵌页解包，hls3 > hls2，不取 hls4）；
-      // 本站 embed 页在 MiraPlayer 嗅探里起不了播（v4 三轮真机实测），
-      // 直解无链可解时才回嗅探兜底。
-      const direct = await resolveXfsDirect(r.url, durl);
-      if (direct) {
-        return subAttach({ parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': r.url } }, subsP);
-      }
-      return subAttach({ parse: 1, jx: 0, url: r.url, header: { 'User-Agent': UA, 'Referer': durl } }, subsP);
+    const embed = await ajaxEmbed(durl, ep);
+    if (!embed) return null;
+    if (isF4Host(embed)) {
+      const wu = SEXTB_WORKER + '/f4?u=' + encodeURIComponent(embed) + '&r=' + encodeURIComponent(durl);
+      return subAttach({ parse: 0, url: wu, header: uaHead }, subsP);
     }
-    return subAttach({ parse: 0, url: r.url, header: uaHead }, subsP);
+    const direct = await resolveXfsDirect(embed, durl);
+    if (direct) {
+      return subAttach({ parse: 0, url: direct, header: { 'User-Agent': UA, 'Referer': embed } }, subsP);
+    }
+    return subAttach({ parse: 1, jx: 0, url: embed, header: { 'User-Agent': UA, 'Referer': durl } }, subsP);
   }
 
   const ep0 = hint || '0';
