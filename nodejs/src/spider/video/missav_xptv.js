@@ -555,7 +555,14 @@ async function detail(reqIn) {
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  const url = String(body.id || '').trim();
+  // 根因 (2026-11-23)：App 传进来的 body.id 是 vod_play_url 里的
+  // "线路名$地址" 全串（如 1080p$https://...），必须先剥掉 "$" 前的
+  // 线路名再返回，否则播放器拿到的是非法地址、转圈几秒后加载失败。
+  // 之前六轮全在修代理/网络，没查 play() 返回的 url 本身——
+  // 能播的源（py_mogu/py_siguaspw）都在 play() 开头剥 "$"，这里漏了。
+  let url = String(Array.isArray(body.id) ? body.id[0] : body.id || '').trim();
+  if (url.includes('$')) url = url.split('$').pop();
+  if (!url) return { parse: 0, url: '' };
   const subsP = subSearchAll(subNormKey(url)).catch(() => []);
   // XPTV getPlayinfo 直接返回直链 + 请求头;此处返回给客户端
   return subAttach({
