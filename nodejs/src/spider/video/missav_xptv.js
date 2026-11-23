@@ -567,51 +567,20 @@ async function detail(reqIn) {
   const detailUrl = absUrl(vid);
   const { info, tracks } = await getTracks(detailUrl);
   if (!info.vod_name && !tracks.length) return { list: [] };
-  // 诊断探针 (2026-11-23 第十一轮，临时)：本地代理成败取决于设备侧蜘蛛
-  // req.get 能否直达 surrit 主机。用首条播单实测一次（8 秒超时，只读
-  // 前 2KB 判清单），结果写进 vod_remarks，待用户回报后即删。
-  let probe = '';
-  try {
-    if (tracks.length) {
-      const r = await req.get(tracks[0].url, {
-        headers: headers(detailUrl), timeout: 8000,
-        responseType: 'text', transformResponse: [(d) => d],
-        validateStatus: () => true,
-      });
-      const s = String(r && r.data || '');
-      probe = (r && r.status >= 200 && r.status < 300 && s.includes('#EXTM3U'))
-        ? '【代理探测：通】' : `【代理探测：不通(${r ? r.status : '无响应'})】`;
-    }
-  } catch (e) { probe = '【代理探测：不通(异常)】'; }
-  // 播放地址 (2026-11-23 第十轮)：py_mogu 同款多线路 + 详情页 Referer。
-  // 每档分辨率同时给两组（$$$ 分隔）：
-  //   ① 代理线：子域走本地 /proxy/m3u8、基域走 Worker v3（分片改 .ts）；
-  //   ② 直连线：原始 surrit 直链。
-  // 每段地址按 py_mogu 格式带详情页：`名字$详情页@@播单地址`，play() 用
-  // 详情页当 Referer（REX 送的就是详情页 Referer；之前只送站首页，
-  // 可能是清单请求就被拦的原因之一）。用户可在播放器里换线。
-  const groups = [];
-  const groupUrls = [];
-  const proxyLine = tracks.map((t) => `${t.name}$${detailUrl}@@${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#');
-  const directLine = tracks.map((t) => `${t.name}$${detailUrl}@@${t.url}`).join('#');
-  const isSub = tracks.length && (() => {
-    const hm = String(tracks[0].url || '').match(/^https?:\/\/([^\/]+)/i);
-    const host = hm ? hm[1].toLowerCase() : '';
-    return host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
-      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0);
-  })();
-  groups.push(isSub ? '本地代理' : 'Worker');
-  groupUrls.push(proxyLine);
-  groups.push('直连');
-  groupUrls.push(directLine);
+  // 播放地址 (2026-11-24 第十二轮，用户令)：拆掉多线路分组，回到单线
+  // 正常播放——每档分辨率只给一个地址，不再分“本地代理/直连”两组。
+  // 地址直接用详情页 packed JS 的 surrit 直链（REX 同款直链，站方未换
+  // 址：missav.fans + c.surrit.mrstcdn.store 已复核）；play() 按
+  // py_mogu 格式 `名字$详情页@@播单地址` 拆出详情页当 Referer。
+  // 探针已删（用户反馈详情页小字被挡、看不到）。
   const vod = {
     vod_id: detailUrl,
     vod_name: info.vod_name || detailUrl,
     vod_pic: info.vod_pic,
-    vod_remarks: (info.vod_remarks || '') + probe,
+    vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
-    vod_play_from: groups.join('$$$'),
-    vod_play_url: groupUrls.join('$$$'),
+    vod_play_from: NAME,
+    vod_play_url: tracks.map((t) => `${t.name}$${detailUrl}@@${t.url}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
@@ -1132,11 +1101,9 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // m3u8 代理 (GET): 清单与分片共用同一入口 (同 py_mogu/py_siguaspw
-      // 已验证写法)：查询串 /proxy/m3u8?u=&r= 走清单，分片走路径段
-      // /proxy/<b64url>/<b64url>.ts (末尾 .ts 过 ffmpeg 白名单)
-      fastify.get('/proxy/*', m3u8Proxy);
-      fastify.get('/proxy/m3u8', m3u8Proxy);
+      // (2026-11-24 第十二轮，用户令拆代理)：本地 /proxy/* 代理路由已摘，
+      // 不再走本地代理；m3u8Proxy/fetchBytes/rewriteMissavM3u8 等函数留
+      // 在文件内备查，不再被调用。
     },
   };
 }
