@@ -156,6 +156,59 @@ function parseVariantHeights(masterText) {
   return [...new Set(heights)].filter((h) => h > 0).sort((a, b) => b - a);
 }
 
+// Dean Edwards packer 解包：详情页的 eval(function(p,a,c,k,e,d)...) 块内含
+// 直链 (source=主清单、source842=720p、source1280=1080p)，解包即得，
+// 无需拉主清单，解析快且主机随片正确。
+function unpackPacker(packed) {
+  if (!packed) return '';
+  const m = String(packed).match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\),0,\{\}\)\)/);
+  if (!m) return '';
+  const p = m[1].replace(/\\'/g, "'");
+  const a = parseInt(m[2], 10) || 36;
+  const k = m[4].split('|');
+  return p.replace(/\b[0-9a-z]+\b/g, (w) => {
+    const idx = parseInt(w, a);
+    if (!isNaN(idx) && idx >= 0 && idx < k.length && k[idx]) return k[idx];
+    return w;
+  });
+}
+
+// 从详情 HTML 的 packed JS 解出 surrit 直链，返回 [{name:'1080p',url},...]。
+// name 由 URL path 取 (/1080p/ /720p/ /480p/ /360p/)，master 为 playlist.m3u8。
+// source1280 实际指 720p 时 (无 1080p 的片) 按 path 归 720p 并去重。
+function extractPackedUrls(html) {
+  const out = [];
+  if (!html) return out;
+  const blocks = String(html).match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('[\s\S]*?',\d+,\d+,'[\s\S]*?'\.split\('\|'\),0,\{\}\)\)/g) || [];
+  const seen = new Set();
+  for (const block of blocks) {
+    let unpacked = '';
+    try { unpacked = unpackPacker(block); } catch (e) { continue; }
+    if (!unpacked) continue;
+    const urls = unpacked.match(/https?:\/\/[^\s'"<>]+\.m3u8/g) || [];
+    for (const raw of urls) {
+      const url = String(raw).replace(/\\+$/g, '');
+      if (!/surrit/i.test(url)) continue;
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const rm = url.match(/\/(1080p|720p|480p|360p)\/video\.m3u8/i);
+      const name = rm ? rm[1].toLowerCase() : (url.includes('playlist.m3u8') ? 'master' : '');
+      if (!name) continue;
+      out.push({ name, url });
+    }
+  }
+  return out;
+}
+
+// 从详情 HTML 取 surrit 主机 (随片变化：surrit.mrstcdn.store /
+// c.surrit.mrstcdn.store ...)，构造直链时用此主机，勿写死。
+// HTML 里链接常为转义形式 (https:\\/\\/c.surrit...)，故不锚定 scheme，
+// 直接匹配主机名。
+function surritHostFromHtml(html) {
+  const m = String(html || '').match(/([a-z0-9.-]*surrit\.[a-z0-9.-]+)/i);
+  return m ? m[1].replace(/\.+$/, '') : '';
+}
+
 // 改写清单正文: selfBase 为代理自身地址 (由进来的请求 Host 拼出,
 // 清单正文里必须是真实 http 地址, 不能嵌 js2p)。
 // - 主清单 (含 EXT-X-STREAM-INF): variant 行 -> 指回代理;
@@ -319,37 +372,51 @@ async function getTracks(detailUrl) {
 
   const tracks = [];
   // XPTV 正则 /surrit\.com\\\/(.+)\\\/seek\\\/_0\.jpg/
-  // 实测站点已换成 surrit.mrstcdn.store,这里同时兼容新旧域名
-  let match = html.match(/surrit(?:\.com|\.mrstcdn\.store)\\\/([^"\\]+)\\\/seek\\\/_0\.jpg/);
+  // 实测站点已换成 surrit.mrstcdn.store，这里同时兼容新旧域名与随片子域
+  // (c.surrit.mrstcdn.store 等，SNOS-524 的根因：写死主机拿不到 UUID)。
+  let match = html.match(/(?:[a-z0-9.-]*\.)?surrit(?:\.com|\.mrstcdn\.store)\\\/([^"\\]+)\\\/seek\\\/_0\.jpg/);
   // 兜底 (2026-11-23): 个别详情页无 seek 缩略图时,退回任意 UUID
   // (实测详情页内仅视频自身一个 UUID)。
   if (!match) {
     const anyUuid = html.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
     if (anyUuid) match = [anyUuid[0], anyUuid[0]];
   }
+  // 主机随片变化 (surrit.mrstcdn.store / c.surrit.mrstcdn.store ...)，从
+  // seek 链接取，勿写死；写死主机是 SNOS-524 拿不到分档的根因。
+  const host = surritHostFromHtml(html) || 'surrit.mrstcdn.store';
+  const prefix = `https://${host}/`;
   if (match && match[1]) {
     const uuid = match[1];
-    let discovered = false;
-    for (const prefix of M3U8_PREFIXES) {
+    // ① 快路径 (2026-11-23)：详情页 packed JS 自带 1080p/720p 直链
+    // (source1280/source842)，解包即得，无需拉主清单，解析快。
+    // 只出真实分档，不出“自动”。
+    const packed = extractPackedUrls(html).filter((t) => t.name !== 'master');
+    const seenNames = new Set();
+    for (const t of packed) {
+      if (seenNames.has(t.name)) continue;
+      seenNames.add(t.name);
+      tracks.push(t);
+    }
+    // ② packed JS 无分档时：用正确主机拉主清单发现分档 (Worker 优先)。
+    if (!tracks.length) {
       const masterUrl = prefix + uuid + M3U8_SUFFIX;
       const body = await fetchMasterPlaylist(masterUrl, detailUrl);
-      if (!body) continue;
-      // 分档位由主清单的 RESOLUTION 定 (Worker 改写后亦然)；直链地址
-      // 按 surrit 固定形态现拼，detail 再统一包进 missav-hls 代理。
-      const heights = parseVariantHeights(body);
-      for (const h of heights) {
+      if (body) {
+        const heights = parseVariantHeights(body);
+        for (const h of heights) {
+          tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
+        }
+      }
+    }
+    // ③ 仍无分档时：按标准档位现拼 (1080p/720p/480p/360p)，只出真实
+    // 分档、不出“自动”；播放器点不存在的档会失败，但总比只有“自动”强，
+    // 且多数片至少有 720p/480p/360p。
+    if (!tracks.length) {
+      for (const h of [1080, 720, 480, 360]) {
         tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
       }
-      tracks.push({ name: '自动', url: masterUrl });
-      discovered = true;
-      break;
     }
-    // 兜底 (2026-11-23): 清单直取失败时仍给主清单直链。主清单地址由
-    // UUID 确定、无需拉取；detail 会包进 missav-hls 代理由播放器直取，
-    // 避免"解析不出线路地址"。
-    if (!discovered) {
-      tracks.push({ name: '自动', url: M3U8_PREFIXES[0] + uuid + M3U8_SUFFIX });
-    }
+    tracks.sort((a, b) => parseInt(b.name, 10) - parseInt(a.name, 10));
   }
   return { info, tracks };
 }
@@ -392,10 +459,11 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    // 播放地址改走 missav-hls Worker 代理 (2026-11-23)：Worker 拉清单并
-    // 改写 .jpeg 分片后缀 (?x=.ts)，绕设备侧 CF 指纹拦截；本地
-    // /proxy/m3u8 仍注册保留作备用。代理地址构造失败时降级回原始直链。
-    vod_play_url: tracks.map((t) => `${t.name}$${workerProxyUrl(t.url, detailUrl) || t.url}`).join('#'),
+    // 播放地址走本地 /proxy/m3u8 代理 (2026-11-23 改回)：代理在设备本机，
+    // 经设备网络 (VPN) 拉清单并改写 .jpeg 分片后缀 (?x=.ts)；missav-hls
+    // Worker 拉不到 c.surrit 等随片主机 (Cloudflare 出口被拦)，改走它
+    // 只会 302 回直链、播不了。代理地址构造失败时降级回原始直链。
+    vod_play_url: tracks.map((t) => `${t.name}$${proxyUrl(reqIn, '/proxy/m3u8', t.url, detailUrl) || t.url}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
