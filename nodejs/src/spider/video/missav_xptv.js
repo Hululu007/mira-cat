@@ -560,15 +560,17 @@ async function detail(reqIn) {
   const detailUrl = absUrl(vid);
   const { info, tracks } = await getTracks(detailUrl);
   if (!info.vod_name && !tracks.length) return { list: [] };
-  // 播放地址 (2026-11-23 第九轮)：改成 py_mogu 同款多线路——每档分辨率
-  // 同时给两条线（$$$ 分组），让播放器侧逐条试、用户可换线：
+  // 播放地址 (2026-11-23 第十轮)：py_mogu 同款多线路 + 详情页 Referer。
+  // 每档分辨率同时给两组（$$$ 分隔）：
   //   ① 代理线：子域走本地 /proxy/m3u8、基域走 Worker v3（分片改 .ts）；
-  //   ② 直连线：原始 surrit 直链（REX 能播、MiraPlayer 待验）。
-  // 之前每档只给一条线，线一断整档全灭、也无从定位是哪条腿断的。
+  //   ② 直连线：原始 surrit 直链。
+  // 每段地址按 py_mogu 格式带详情页：`名字$详情页@@播单地址`，play() 用
+  // 详情页当 Referer（REX 送的就是详情页 Referer；之前只送站首页，
+  // 可能是清单请求就被拦的原因之一）。用户可在播放器里换线。
   const groups = [];
   const groupUrls = [];
-  const proxyLine = tracks.map((t) => `${t.name}$${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#');
-  const directLine = tracks.map((t) => `${t.name}$${t.url}`).join('#');
+  const proxyLine = tracks.map((t) => `${t.name}$${detailUrl}@@${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#');
+  const directLine = tracks.map((t) => `${t.name}$${detailUrl}@@${t.url}`).join('#');
   const isSub = tracks.length && (() => {
     const hm = String(tracks[0].url || '').match(/^https?:\/\/([^\/]+)/i);
     const host = hm ? hm[1].toLowerCase() : '';
@@ -597,10 +599,16 @@ async function play(reqIn) {
   // 根因 (2026-11-23)：App 传进来的 body.id 是 vod_play_url 里的
   // "线路名$地址" 全串（如 1080p$https://...），必须先剥掉 "$" 前的
   // 线路名再返回，否则播放器拿到的是非法地址、转圈几秒后加载失败。
-  // 之前六轮全在修代理/网络，没查 play() 返回的 url 本身——
   // 能播的源（py_mogu/py_siguaspw）都在 play() 开头剥 "$"，这里漏了。
-  let url = String(Array.isArray(body.id) ? body.id[0] : body.id || '').trim();
-  if (url.includes('$')) url = url.split('$').pop();
+  // 第十轮：地址按 py_mogu 格式带详情页 `名字$详情页@@播单地址`，
+  // 剥 "$" 后再按 "@@" 拆出详情页当 Referer（REX 送详情页 Referer）。
+  let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '').trim();
+  if (id.includes('$')) id = id.split('$').pop();
+  if (!id) return { parse: 0, url: '' };
+  let durl = '';
+  let url = id;
+  const at = id.indexOf('@@');
+  if (at >= 0) { durl = id.slice(0, at); url = id.slice(at + 2); }
   if (!url) return { parse: 0, url: '' };
   const subsP = subSearchAll(subNormKey(url)).catch(() => []);
   // XPTV getPlayinfo 直接返回直链 + 请求头;此处返回给客户端
@@ -609,7 +617,7 @@ async function play(reqIn) {
     url,
     header: {
       'User-Agent': UA,
-      'Referer': HOST + '/',
+      'Referer': durl || HOST + '/',
     },
   }, subsP);
 }
