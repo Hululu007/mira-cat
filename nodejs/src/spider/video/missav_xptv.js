@@ -209,10 +209,30 @@ function surritHostFromHtml(html) {
   return m ? m[1].replace(/\.+$/, '') : '';
 }
 
+// 取字节（清单/分片通用）：30s 超时、2 次尝试；失败返回 null，走 302 降级。
+// （同 py_mogu/py_siguaspw 已验证的写法：responseType arraybuffer，
+// 不加 transformResponse，Buffer.from(r.data)。）
+async function fetchBytes(url, referer) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await req.get(url, {
+        headers: headers(referer),
+        timeout: 30000,
+        responseType: 'arraybuffer',
+        validateStatus: () => true,
+      });
+      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
+    } catch (e) { /* 重试，落空走 302 降级 */ }
+  }
+  return null;
+}
+
 // 改写清单正文: selfBase 为代理自身地址 (由进来的请求 Host 拼出,
 // 清单正文里必须是真实 http 地址, 不能嵌 js2p)。
 // - 主清单 (含 EXT-X-STREAM-INF): variant 行 -> 指回代理;
-// - 媒体清单: 分片行 -> CDN 绝对地址 + ?x=.ts 后缀;
+// - 媒体清单: 分片行 -> 路径段形式 /proxy/<b64url>/<b64url>.ts
+//   (末尾加 .ts 后缀过 ffmpeg 分片后缀白名单；b64url 字母表无 '.',
+//   代理入口先剥后缀再解码，无歧义；同 py_mogu/py_siguaspw 已验证);
 // - # 行 URI="..." 属性 absolutize (surrit 无密钥, 仅兜底)。
 function rewriteMissavM3u8(raw, playlistUrl, selfBase, referer) {
   const isMaster = raw.includes('#EXT-X-STREAM-INF');
@@ -233,79 +253,84 @@ function rewriteMissavM3u8(raw, playlistUrl, selfBase, referer) {
     if (isMaster) {
       return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
     }
-    // 媒体清单: 分片不走 CDN 直链, 改走本地 /proxy/seg.ts 代理。
+    // 媒体清单: 分片不走 CDN 直链, 改走本地代理路径段形式。
     // 播放器直取 CDN 分片会失败 (随片主机 c.surrit 等在播放器网络侧
     // 不可达, 且 .jpeg 后缀会被 ffmpeg 白名单拒); 代理经设备 req.get
-    // 取分片 (与清单同一网络路径, 带 Referer/UA), URL 以 .ts 结尾，
-    // 播放器只认代理地址、无需再拼 ?x=.ts。
-    return `${selfBase}/proxy/seg.ts?u=${b64url(abs)}&r=${b64url(referer || '')}`;
+    // 取分片 (与清单同一网络路径, 带 Referer/UA), URL 以 .ts 结尾。
+    return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}.ts`;
   });
   return out.join('\n');
 }
 
-// GET /proxy/seg.ts?u={b64url 分片地址}&r={b64url referer}
-// 经设备 req.get 取 surrit 分片 (带 Referer/UA), 原样回字节流;
-// 支持 Range (转发上游、回 206 + Content-Range), 供快进/拖进度用。
-// 上游拉不到时 502, 不 302 回直链 (直链 .jpeg 播不了)。
-async function segProxy(request, reply) {
-  const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
-  let target = '';
-  let referer = HOST + '/';
-  try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
-  } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const range = request?.headers?.range || '';
-  const hdrs = headers(referer);
-  if (range) hdrs['Range'] = range;
-  try {
-    const resp = await req.get(target, {
-      headers: hdrs,
-      timeout: 20000,
-      responseType: 'arraybuffer',
-      transformResponse: [(d) => d],
-      validateStatus: () => true,
-    });
-    const status = resp?.status || 0;
-    if (status !== 200 && status !== 206) { reply.code(502).send('seg fetch failed'); return; }
-    const buf = resp.data;
-    const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || []);
-    reply.header('Content-Type', 'video/MP2T');
-    reply.header('Accept-Ranges', 'bytes');
-    if (status === 206) {
-      reply.code(206);
-      const cr = resp.headers && (resp.headers['content-range'] || resp.headers['Content-Range']);
-      if (cr) reply.header('Content-Range', cr);
-    }
-    reply.header('Content-Length', String(bytes.length));
-    reply.send(bytes);
-  } catch (e) {
-    reply.code(502).send('seg fetch error');
-  }
-}
-
-// GET /proxy/m3u8?u={b64url 清单地址}&r={b64url referer}
+// 代理入口（两种地址格式都接受，同 py_mogu/py_siguaspw 已验证）：
+// 主格式（detail/play 发出）：/proxy/m3u8?u={b64url}&r={b64url}；
+// 分片格式（改写后的媒体清单分片行）：/proxy/{b64url 目标}/{b64url referer}.ts。
+// 取回的文本是 #EXTM3U 即按清单改写；否则按字节透传：路径段形式来的是
+// 分片回 video/mp2t（支持 Range，便于拖动），查询串形式来的是密钥回
+// application/octet-stream。取不到时 302 回原地址。
 async function m3u8Proxy(request, reply) {
   const q = request?.query || {};
-  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let uEnc = q.u || '';
+  let rEnc = q.r || '';
+  let viaPath = false;
+  if (!uEnc) {
+    const wild = request?.params && request.params['*'];
+    let segs = [];
+    if (wild) segs = String(wild).split('/').filter(Boolean);
+    else {
+      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
+      const pi = rawPath.indexOf('/proxy/');
+      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
+    }
+    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
+      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
+    }
+    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; viaPath = true; }
+  }
+  if (!uEnc) { reply.code(400).send('missing u'); return; }
   let target = '';
   let referer = HOST + '/';
   try {
-    target = unb64url(q.u);
-    if (q.r) referer = unb64url(q.r) || referer;
+    target = unb64url(uEnc);
+    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
   } catch (e) { reply.code(400).send('bad u'); return; }
   if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const raw = await fetchPlaylistText(target, referer);
-  if (!raw || !raw.includes('#EXTM3U')) { reply.redirect(target); return; }
   const host = request.headers && request.headers.host;
   const selfBase = host
     ? `http://${host}/spider/${KEY}/3`
     : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
-  reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+  const buf = await fetchBytes(target, referer);
+  if (!buf || !buf.length) { reply.redirect(target); return; }
+  const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
+  if (head.trimStart().startsWith('#EXTM3U')) {
+    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
+    reply.header('Cache-Control', 'no-cache');
+    reply.send(rewriteMissavM3u8(buf.toString('utf8'), target, selfBase, referer));
+    return;
+  }
+  // 非清单内容：路径段形式来的是分片；查询串形式来的是密钥（16 字节）。
+  if (viaPath) {
+    const range = request?.headers && request.headers.range;
+    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
+    reply.header('Content-Type', 'video/mp2t');
+    reply.header('Cache-Control', 'no-cache');
+    reply.header('Accept-Ranges', 'bytes');
+    if (m) {
+      const start = parseInt(m[1], 10);
+      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
+      if (start < buf.length && start <= end) {
+        reply.code(206);
+        reply.header('Content-Range', `bytes ${start}-${end}/${buf.length}`);
+        reply.send(buf.subarray(start, end + 1));
+        return;
+      }
+    }
+    reply.send(buf);
+    return;
+  }
+  reply.header('Content-Type', 'application/octet-stream');
   reply.header('Cache-Control', 'no-cache');
-  reply.send(rewriteMissavM3u8(raw, target, selfBase, referer));
+  reply.send(buf);
 }
 
 function headers(referer) {
@@ -508,9 +533,10 @@ async function detail(reqIn) {
     vod_content: info.vod_content,
     vod_play_from: NAME,
     // 播放地址走本地代理 (2026-11-23)：清单走 /proxy/m3u8、分片走
-    // /proxy/seg.ts, 均在设备本机经设备网络 (VPN) 拉取；missav-hls
-    // Worker 拉不到 c.surrit 等随片主机 (Cloudflare 出口被拦)，改走它
-    // 只会 302 回直链、播不了。代理地址构造失败时降级回原始直链。
+    // /proxy/<b64url>/<b64url>.ts, 均在设备本机经设备网络 (VPN) 拉取；
+    // missav-hls Worker 拉不到 c.surrit 等随片主机 (Cloudflare 出口
+    // SSL 525)，改走它只会 302 回直链、播不了。代理地址构造失败时
+    // 降级回原始直链。
     vod_play_url: tracks.map((t) => `${t.name}$${proxyUrl(reqIn, '/proxy/m3u8', t.url, detailUrl) || t.url}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
@@ -1017,11 +1043,11 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // m3u8 代理 (GET): 播放时实时改写 surrit 清单的分片后缀
+      // m3u8 代理 (GET): 清单与分片共用同一入口 (同 py_mogu/py_siguaspw
+      // 已验证写法)：查询串 /proxy/m3u8?u=&r= 走清单，分片走路径段
+      // /proxy/<b64url>/<b64url>.ts (末尾 .ts 过 ffmpeg 白名单)
+      fastify.get('/proxy/*', m3u8Proxy);
       fastify.get('/proxy/m3u8', m3u8Proxy);
-      // 分片代理 (GET): 播放器经本地代理取 surrit 分片 (带 Referer/UA,
-      // URL 以 .ts 结尾), 绕过播放器直取 CDN 失败与 .jpeg 白名单问题
-      fastify.get('/proxy/seg.ts', segProxy);
     },
   };
 }
