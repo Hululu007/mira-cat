@@ -233,9 +233,57 @@ function rewriteMissavM3u8(raw, playlistUrl, selfBase, referer) {
     if (isMaster) {
       return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
     }
-    return abs + (abs.includes('?') ? '&' : '?') + 'x=.ts';
+    // 媒体清单: 分片不走 CDN 直链, 改走本地 /proxy/seg.ts 代理。
+    // 播放器直取 CDN 分片会失败 (随片主机 c.surrit 等在播放器网络侧
+    // 不可达, 且 .jpeg 后缀会被 ffmpeg 白名单拒); 代理经设备 req.get
+    // 取分片 (与清单同一网络路径, 带 Referer/UA), URL 以 .ts 结尾，
+    // 播放器只认代理地址、无需再拼 ?x=.ts。
+    return `${selfBase}/proxy/seg.ts?u=${b64url(abs)}&r=${b64url(referer || '')}`;
   });
   return out.join('\n');
+}
+
+// GET /proxy/seg.ts?u={b64url 分片地址}&r={b64url referer}
+// 经设备 req.get 取 surrit 分片 (带 Referer/UA), 原样回字节流;
+// 支持 Range (转发上游、回 206 + Content-Range), 供快进/拖进度用。
+// 上游拉不到时 502, 不 302 回直链 (直链 .jpeg 播不了)。
+async function segProxy(request, reply) {
+  const q = request?.query || {};
+  if (!q.u) { reply.code(400).send('missing u'); return; }
+  let target = '';
+  let referer = HOST + '/';
+  try {
+    target = unb64url(q.u);
+    if (q.r) referer = unb64url(q.r) || referer;
+  } catch (e) { reply.code(400).send('bad u'); return; }
+  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
+  const range = request?.headers?.range || '';
+  const hdrs = headers(referer);
+  if (range) hdrs['Range'] = range;
+  try {
+    const resp = await req.get(target, {
+      headers: hdrs,
+      timeout: 20000,
+      responseType: 'arraybuffer',
+      transformResponse: [(d) => d],
+      validateStatus: () => true,
+    });
+    const status = resp?.status || 0;
+    if (status !== 200 && status !== 206) { reply.code(502).send('seg fetch failed'); return; }
+    const buf = resp.data;
+    const bytes = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || []);
+    reply.header('Content-Type', 'video/MP2T');
+    reply.header('Accept-Ranges', 'bytes');
+    if (status === 206) {
+      reply.code(206);
+      const cr = resp.headers && (resp.headers['content-range'] || resp.headers['Content-Range']);
+      if (cr) reply.header('Content-Range', cr);
+    }
+    reply.header('Content-Length', String(bytes.length));
+    reply.send(bytes);
+  } catch (e) {
+    reply.code(502).send('seg fetch error');
+  }
 }
 
 // GET /proxy/m3u8?u={b64url 清单地址}&r={b64url referer}
@@ -459,8 +507,8 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    // 播放地址走本地 /proxy/m3u8 代理 (2026-11-23 改回)：代理在设备本机，
-    // 经设备网络 (VPN) 拉清单并改写 .jpeg 分片后缀 (?x=.ts)；missav-hls
+    // 播放地址走本地代理 (2026-11-23)：清单走 /proxy/m3u8、分片走
+    // /proxy/seg.ts, 均在设备本机经设备网络 (VPN) 拉取；missav-hls
     // Worker 拉不到 c.surrit 等随片主机 (Cloudflare 出口被拦)，改走它
     // 只会 302 回直链、播不了。代理地址构造失败时降级回原始直链。
     vod_play_url: tracks.map((t) => `${t.name}$${proxyUrl(reqIn, '/proxy/m3u8', t.url, detailUrl) || t.url}`).join('#'),
@@ -971,6 +1019,9 @@ export default function spider() {
       fastify.post('/search', search);
       // m3u8 代理 (GET): 播放时实时改写 surrit 清单的分片后缀
       fastify.get('/proxy/m3u8', m3u8Proxy);
+      // 分片代理 (GET): 播放器经本地代理取 surrit 分片 (带 Referer/UA,
+      // URL 以 .ts 结尾), 绕过播放器直取 CDN 失败与 .jpeg 白名单问题
+      fastify.get('/proxy/seg.ts', segProxy);
     },
   };
 }
