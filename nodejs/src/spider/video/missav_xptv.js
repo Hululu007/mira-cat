@@ -8,6 +8,11 @@ const NAME = 'MissAV';
 const HOST = 'https://missav.fans';
 // HTML 抓取走 missav-fetch Worker（绕设备侧 CF 指纹拦截），未部署时回落直连
 const MISSAV_FETCH = 'https://missav-fetch.li768435813.workers.dev';
+// 清单代理走 missav-hls Worker（2026-11-23 新建）：设备侧蜘蛛 req 直取
+// surrit 清单被 CF 指纹拦截，本地 /proxy/m3u8 拉不到清单、蜘蛛也发现
+// 不了分档位线路；Worker 在 Cloudflare 网络内拉清单并改写分片后缀
+// (?x=.ts，ffmpeg 拒 .jpeg 分片)，只转清单文本、不转视频分片。
+const MISSAV_HLS = 'https://missav-hls.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko)';
 
 // 源文件 appConfig.tabs 映射 (31 个分类)
@@ -97,6 +102,58 @@ async function fetchPlaylistText(url, referer) {
     if (status >= 200 && status < 300 && data) return String(data);
   } catch (e) { /* 落空走 302 降级 */ }
   return '';
+}
+
+// 清单代理地址 (missav-hls Worker)：u/r 为 b64url 编码。
+function workerProxyUrl(targetUrl, referer) {
+  try {
+    return `${MISSAV_HLS}/m3u8?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return ''; }
+}
+
+// 拉主清单：先走 missav-hls Worker（绕设备侧 CF 指纹拦截），再回落直连。
+// 返回清单正文（含 #EXTM3U 才算有效），拉不到返回 ''。
+async function fetchMasterPlaylist(masterUrl, referer) {
+  try {
+    const w = workerProxyUrl(masterUrl, referer);
+    if (w) {
+      const { data } = await req.get(w, { timeout: 20000 });
+      const s = String(data || '');
+      if (s.includes('#EXTM3U')) return s;
+    }
+  } catch (e) { /* 回落直连 */ }
+  try {
+    const { data } = await req.get(masterUrl, {
+      headers: headers(referer),
+      timeout: 20000,
+    });
+    const s = String(data || '');
+    if (s.includes('#EXTM3U')) return s;
+  } catch (e) { /* 拉不到 */ }
+  return '';
+}
+
+// 从主清单正文解析分档位高度：优先 STREAM-INF 的 RESOLUTION，
+// 回落直连清单的相对 variant 行 (720p/video.m3u8)。
+// Worker 改写后的主清单 variant 行已指回 Worker，但 STREAM-INF 的
+// RESOLUTION 不变，故两种格式通用；返回去重后降序高度数组。
+function parseVariantHeights(masterText) {
+  const heights = [];
+  const lines = String(masterText || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+    const m = line.match(/RESOLUTION=\d+x(\d+)/i);
+    if (m) heights.push(parseInt(m[1], 10));
+  }
+  if (!heights.length) {
+    for (const raw of lines) {
+      const t = raw.trim();
+      const m = t.match(/^(\d+)p\/video\.m3u8$/);
+      if (m) heights.push(parseInt(m[1], 10));
+    }
+  }
+  return [...new Set(heights)].filter((h) => h > 0).sort((a, b) => b - a);
 }
 
 // 改写清单正文: selfBase 为代理自身地址 (由进来的请求 Host 拼出,
@@ -274,29 +331,22 @@ async function getTracks(detailUrl) {
     const uuid = match[1];
     let discovered = false;
     for (const prefix of M3U8_PREFIXES) {
-      try {
-        const { data } = await req.get(prefix + uuid + M3U8_SUFFIX, {
-          headers: headers(detailUrl),
-          timeout: 20000,
-        });
-        const body = String(data || '');
-        if (!body.includes('#EXTM3U')) continue;
-        const lines = body.split('\n');
-        // 每个清晰度一行,形如 720p/video.m3u8;名称取 720p 部分
-        lines
-          .filter((line) => line.includes('/video.m3u8'))
-          .forEach((line) => {
-            const name = line.replace('/video.m3u8', '').trim() || '正片';
-            tracks.unshift({ name, url: `${prefix}${uuid}/${line.trim()}` });
-          });
-        tracks.push({ name: '自动', url: prefix + uuid + M3U8_SUFFIX });
-        discovered = true;
-        break;
-      } catch (e) { /* 换下一个域名重试 */ }
+      const masterUrl = prefix + uuid + M3U8_SUFFIX;
+      const body = await fetchMasterPlaylist(masterUrl, detailUrl);
+      if (!body) continue;
+      // 分档位由主清单的 RESOLUTION 定 (Worker 改写后亦然)；直链地址
+      // 按 surrit 固定形态现拼，detail 再统一包进 missav-hls 代理。
+      const heights = parseVariantHeights(body);
+      for (const h of heights) {
+        tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
+      }
+      tracks.push({ name: '自动', url: masterUrl });
+      discovered = true;
+      break;
     }
     // 兜底 (2026-11-23): 清单直取失败时仍给主清单直链。主清单地址由
-    // UUID 确定、无需拉取；播放器直取主清单 (系统播放器网络栈与蜘蛛
-    // req 不同)，避免"解析不出线路地址"。
+    // UUID 确定、无需拉取；detail 会包进 missav-hls 代理由播放器直取，
+    // 避免"解析不出线路地址"。
     if (!discovered) {
       tracks.push({ name: '自动', url: M3U8_PREFIXES[0] + uuid + M3U8_SUFFIX });
     }
@@ -342,9 +392,10 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    // 播放地址改走本地 /proxy/m3u8 代理 (改写 .jpeg 分片后缀, 见文件头
-    // 代理段注释); 代理地址构造失败时降级回原始直链 (旧行为)。
-    vod_play_url: tracks.map((t) => `${t.name}$${proxyUrl(reqIn, '/proxy/m3u8', t.url, detailUrl) || t.url}`).join('#'),
+    // 播放地址改走 missav-hls Worker 代理 (2026-11-23)：Worker 拉清单并
+    // 改写 .jpeg 分片后缀 (?x=.ts)，绕设备侧 CF 指纹拦截；本地
+    // /proxy/m3u8 仍注册保留作备用。代理地址构造失败时降级回原始直链。
+    vod_play_url: tracks.map((t) => `${t.name}$${workerProxyUrl(t.url, detailUrl) || t.url}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
