@@ -488,7 +488,14 @@ async function getTracks(detailUrl) {
   }
   // 主机随片变化 (surrit.mrstcdn.store / c.surrit.mrstcdn.store ...)，从
   // seek 链接取，勿写死；写死主机是 SNOS-524 拿不到分档的根因。
-  const host = surritHostFromHtml(html) || 'surrit.mrstcdn.store';
+  // (2026-11-23 第十一轮：packed 直链自带正确主机，优先用它，勿用
+  // surritHostFromHtml 首匹配——HTML 里可能先出现别的主机。)
+  let host = surritHostFromHtml(html) || 'surrit.mrstcdn.store';
+  const packedFirst = extractPackedUrls(html).filter((t) => t.name !== 'master')[0];
+  if (packedFirst) {
+    const hm = String(packedFirst.url || '').match(/^https?:\/\/([^\/]+)/i);
+    if (hm && hm[1]) host = hm[1].toLowerCase();
+  }
   const prefix = `https://${host}/`;
   if (match && match[1]) {
     const uuid = match[1];
@@ -560,6 +567,22 @@ async function detail(reqIn) {
   const detailUrl = absUrl(vid);
   const { info, tracks } = await getTracks(detailUrl);
   if (!info.vod_name && !tracks.length) return { list: [] };
+  // 诊断探针 (2026-11-23 第十一轮，临时)：本地代理成败取决于设备侧蜘蛛
+  // req.get 能否直达 surrit 主机。用首条播单实测一次（8 秒超时，只读
+  // 前 2KB 判清单），结果写进 vod_remarks，待用户回报后即删。
+  let probe = '';
+  try {
+    if (tracks.length) {
+      const r = await req.get(tracks[0].url, {
+        headers: headers(detailUrl), timeout: 8000,
+        responseType: 'text', transformResponse: [(d) => d],
+        validateStatus: () => true,
+      });
+      const s = String(r && r.data || '');
+      probe = (r && r.status >= 200 && r.status < 300 && s.includes('#EXTM3U'))
+        ? '【代理探测：通】' : `【代理探测：不通(${r ? r.status : '无响应'})】`;
+    }
+  } catch (e) { probe = '【代理探测：不通(异常)】'; }
   // 播放地址 (2026-11-23 第十轮)：py_mogu 同款多线路 + 详情页 Referer。
   // 每档分辨率同时给两组（$$$ 分隔）：
   //   ① 代理线：子域走本地 /proxy/m3u8、基域走 Worker v3（分片改 .ts）；
@@ -585,7 +608,7 @@ async function detail(reqIn) {
     vod_id: detailUrl,
     vod_name: info.vod_name || detailUrl,
     vod_pic: info.vod_pic,
-    vod_remarks: info.vod_remarks,
+    vod_remarks: (info.vod_remarks || '') + probe,
     vod_content: info.vod_content,
     vod_play_from: groups.join('$$$'),
     vod_play_url: groupUrls.join('$$$'),
@@ -612,12 +635,14 @@ async function play(reqIn) {
   if (!url) return { parse: 0, url: '' };
   const subsP = subSearchAll(subNormKey(url)).catch(() => []);
   // XPTV getPlayinfo 直接返回直链 + 请求头;此处返回给客户端
+  // (2026-11-23 第十一轮：补 Origin，REX 每集带 Referer+UA+Origin 三件套)。
   return subAttach({
     parse: 0,
     url,
     header: {
       'User-Agent': UA,
       'Referer': durl || HOST + '/',
+      'Origin': HOST,
     },
   }, subsP);
 }
