@@ -560,17 +560,33 @@ async function detail(reqIn) {
   const detailUrl = absUrl(vid);
   const { info, tracks } = await getTracks(detailUrl);
   if (!info.vod_name && !tracks.length) return { list: [] };
+  // 播放地址 (2026-11-23 第九轮)：改成 py_mogu 同款多线路——每档分辨率
+  // 同时给两条线（$$$ 分组），让播放器侧逐条试、用户可换线：
+  //   ① 代理线：子域走本地 /proxy/m3u8、基域走 Worker v3（分片改 .ts）；
+  //   ② 直连线：原始 surrit 直链（REX 能播、MiraPlayer 待验）。
+  // 之前每档只给一条线，线一断整档全灭、也无从定位是哪条腿断的。
+  const groups = [];
+  const groupUrls = [];
+  const proxyLine = tracks.map((t) => `${t.name}$${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#');
+  const directLine = tracks.map((t) => `${t.name}$${t.url}`).join('#');
+  const isSub = tracks.length && (() => {
+    const hm = String(tracks[0].url || '').match(/^https?:\/\/([^\/]+)/i);
+    const host = hm ? hm[1].toLowerCase() : '';
+    return host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
+      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0);
+  })();
+  groups.push(isSub ? '本地代理' : 'Worker');
+  groupUrls.push(proxyLine);
+  groups.push('直连');
+  groupUrls.push(directLine);
   const vod = {
     vod_id: detailUrl,
     vod_name: info.vod_name || detailUrl,
     vod_pic: info.vod_pic,
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
-    vod_play_from: NAME,
-    // 播放地址 (2026-11-23 第八轮)：见 playUrlForTrack——子域走本地代理、
-    // 基域走 Worker v3，全部改写分片为 .ts；直链 .jpeg 分片 MiraPlayer
-    // 播不了（只有中文字幕走 Worker 能播的教训）。
-    vod_play_url: tracks.map((t) => `${t.name}$${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#'),
+    vod_play_from: groups.join('$$$'),
+    vod_play_url: groupUrls.join('$$$'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
