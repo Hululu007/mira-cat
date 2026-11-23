@@ -104,9 +104,19 @@ async function fetchPlaylistText(url, referer) {
   return '';
 }
 
-// 清单代理地址 (missav-hls Worker)：u/r 为 b64url 编码。
+// 清单代理地址 (missav-hls Worker v3)：u/r 为 b64url 编码。
+// 子域主机 (如 c.surrit.mrstcdn.store) 在 Cloudflare 网络内 SSL 握手
+// 失败 (525)，Worker 取不到、只会 302 回直链；这类主机直接回直链，
+// 播放器经设备网络直取 (同 REX 3.6.6 已验证能播)。基域仍走 Worker
+// (v3 改写分片指回 Worker /seg.ts)。
 function workerProxyUrl(targetUrl, referer) {
   try {
+    const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
+    const host = hm ? hm[1].toLowerCase() : '';
+    if (host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
+      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0)) {
+      return targetUrl;
+    }
     return `${MISSAV_HLS}/m3u8?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
   } catch (e) { return ''; }
 }
@@ -532,12 +542,12 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    // 播放地址走本地代理 (2026-11-23)：清单走 /proxy/m3u8、分片走
-    // /proxy/<b64url>/<b64url>.ts, 均在设备本机经设备网络 (VPN) 拉取；
-    // missav-hls Worker 拉不到 c.surrit 等随片主机 (Cloudflare 出口
-    // SSL 525)，改走它只会 302 回直链、播不了。代理地址构造失败时
-    // 降级回原始直链。
-    vod_play_url: tracks.map((t) => `${t.name}$${proxyUrl(reqIn, '/proxy/m3u8', t.url, detailUrl) || t.url}`).join('#'),
+    // 播放地址 (2026-11-23)：不再走本地代理——REX 3.6.6 已证实播放器
+    // 直连随片 surrit 主机能播，猫源本地代理三轮均失败（原因未定位，
+    // 可能是蜘蛛 req 取不到 surrit 或路由不通）。改用与 REX 相同的
+    // workerProxyUrl：子域主机 (c.surrit 等) 回直链、基域走 Worker v3
+    // (/seg.ts 分片代理)。本地 /proxy/* 路由保留（其他逻辑备用）。
+    vod_play_url: tracks.map((t) => `${t.name}$${workerProxyUrl(t.url, detailUrl) || t.url}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
