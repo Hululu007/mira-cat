@@ -104,6 +104,28 @@ async function fetchPlaylistText(url, referer) {
   return '';
 }
 
+// 播放地址 (2026-11-23 第八轮)：分主机走不同的代理，全部改写分片为 .ts
+// ——MiraPlayer 的 ffmpeg 拒 .jpeg 分片，直接给它 .jpeg 直链播不了。
+//   ① 子域主机 (c.surrit 等)：Worker 拉不到 (SSL 525)，走猫源本地
+//      /proxy/m3u8（设备本机拉清单、分片改写为 /proxy/<b64>/<b64>.ts，
+//      第五轮已按 py_mogu 已验证写法落地）；
+//   ② 基域 (surrit.mrstcdn.store / surrit.com)：走 missav-hls Worker v3
+//      (/m3u8 改写分片指回 Worker /seg.ts)。
+// 之前第六轮给子域回直链是错的：REX 播放器吃 .jpeg，MiraPlayer 不吃，
+// 所以只有基域（走 Worker、已改 .ts）的中文字幕能播，其他分类全灭。
+function playUrlForTrack(reqIn, targetUrl, detailUrl) {
+  try {
+    const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
+    const host = hm ? hm[1].toLowerCase() : '';
+    const isSub = host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
+      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0);
+    if (isSub) {
+      return proxyUrl(reqIn, '/proxy/m3u8', targetUrl, detailUrl) || targetUrl;
+    }
+    return workerProxyUrl(targetUrl, detailUrl) || targetUrl;
+  } catch (e) { return targetUrl; }
+}
+
 // 清单代理地址 (missav-hls Worker v3)：u/r 为 b64url 编码。
 // 子域主机 (如 c.surrit.mrstcdn.store) 在 Cloudflare 网络内 SSL 握手
 // 失败 (525)，Worker 取不到、只会 302 回直链；这类主机直接回直链，
@@ -524,8 +546,11 @@ async function category(reqIn) {
   const id = String(body.id || CLASSES[0].type_id);
   const filters = body.filters || {};
   const { list } = await getCards(JSON.stringify({ id, page, filters }));
-  // 用固定 pagecount 保证"加载更多"按钮一直出现（照原版 MissAV 的做法）
-  return { page, pagecount: 999, limit: list.length || 12, total: 999 * 12, list: list || [] };
+  // 翻页 (2026-11-23)：改用包内已验证的动态 pagecount（py_siguaspw 同款）——
+  // 本页有内容就报 page+1（App 知道还有下一页）、空页才报 page（到底）。
+  // 之前固定 pagecount:999 + limit:list.length，加载更多不出新内容。
+  const items = list || [];
+  return { page, pagecount: items.length ? page + 1 : page, limit: items.length || 12, list: items };
 }
 
 async function detail(reqIn) {
@@ -542,12 +567,10 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    // 播放地址 (2026-11-23)：不再走本地代理——REX 3.6.6 已证实播放器
-    // 直连随片 surrit 主机能播，猫源本地代理三轮均失败（原因未定位，
-    // 可能是蜘蛛 req 取不到 surrit 或路由不通）。改用与 REX 相同的
-    // workerProxyUrl：子域主机 (c.surrit 等) 回直链、基域走 Worker v3
-    // (/seg.ts 分片代理)。本地 /proxy/* 路由保留（其他逻辑备用）。
-    vod_play_url: tracks.map((t) => `${t.name}$${workerProxyUrl(t.url, detailUrl) || t.url}`).join('#'),
+    // 播放地址 (2026-11-23 第八轮)：见 playUrlForTrack——子域走本地代理、
+    // 基域走 Worker v3，全部改写分片为 .ts；直链 .jpeg 分片 MiraPlayer
+    // 播不了（只有中文字幕走 Worker 能播的教训）。
+    vod_play_url: tracks.map((t) => `${t.name}$${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
