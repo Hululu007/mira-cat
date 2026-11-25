@@ -1,24 +1,37 @@
+// MissAV — 2026-11-26 全面重写（用户令：删了重写）。
+// 旧版问题：从头到尾多轮补丁叠加，取数/代理/路由互相纠缠；无码流出等
+// 分类全灭而浏览器任意内容都能播。重写只保留已验证的解析与字幕逻辑，
+// 其余全部重构为单一清晰链路。
+//
+// 链路（单线，不分组）：
+//   列表/详情/搜索：多域名容灾取 HTML（live 主，fans/ws/ai 备用）。
+//   播放：详情页 packed JS 解出真地址，按 host 分流——
+//     surrit 基域（surrit.mrstcdn.store / surrit.com）走 missav-hls Worker v3
+//       （改写 .jpeg 分片为 .ts，实测中文字幕可播）；
+//     其他 host（vz-*.b-cdn.net 新片、c.surrit.mrstcdn.store 等）一律直链，
+//       与浏览器行为一致（播放器在手机上直取，浏览器已证可达；
+//       Worker 白名单不放行 b-cdn、CF 网络内拉 c.surrit 会 SSL 525，
+//       故这两类都不走 Worker；本地 /proxy 已删，不再依赖它）。
+//   字幕：沿用已验证的字幕聚合（迅雷 > 迅雷看看 > SubtitleCat）。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
 
 const KEY = 'py_missav_xptv';
 const NAME = 'MissAV';
-// 多域名容灾 (2026-11-26 用户令)：missav.live 主（用户手机直进、无验证），
-// missav.fans / missav.ai / missav.ws 备用；任一域名返回验证页/403/空
-// 时自动换下一个。missav.ai 与 missav.ws 在用户手机上会出 Cloudflare
-// 验证页（ai 是自动验证、ws 是勾选验证），蜘蛛侧按验证页特征识别并跳过。
-const HOSTS = ['https://missav.live', 'https://missav.fans', 'https://missav.ai', 'https://missav.ws'];
+
+// 多域名容灾（用户令）：missav.live 主（用户手机直进、无验证），
+// missav.fans / missav.ws / missav.ai 备用；任一域名返回验证页、
+// 403 或空内容时自动换下一个。
+const HOSTS = ['https://missav.live', 'https://missav.fans', 'https://missav.ws', 'https://missav.ai'];
 let HOST = HOSTS[0];
-// HTML 抓取走 missav-fetch Worker（绕设备侧 CF 指纹拦截），未部署时回落直连
+
+// HTML 抓取走 missav-fetch Worker（绕设备侧 CF 指纹拦截），未部署时回落直连。
 const MISSAV_FETCH = 'https://missav-fetch.li768435813.workers.dev';
-// 清单代理走 missav-hls Worker（2026-11-23 新建）：设备侧蜘蛛 req 直取
-// surrit 清单被 CF 指纹拦截，本地 /proxy/m3u8 拉不到清单、蜘蛛也发现
-// 不了分档位线路；Worker 在 Cloudflare 网络内拉清单并改写分片后缀
-// (?x=.ts，ffmpeg 拒 .jpeg 分片)，只转清单文本、不转视频分片。
+// 清单代理走 missav-hls Worker v3（只放行 surrit 基域，改写 .jpeg 分片为 .ts）。
 const MISSAV_HLS = 'https://missav-hls.li768435813.workers.dev';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko)';
 
-// 源文件 appConfig.tabs 映射 (31 个分类)
+// 分类（31 个，与站方一致）
 const CLASSES = [
   { type_id: 'dm509/cn/release', type_name: '新作上市' },
   { type_id: 'dm561/cn/uncensored-leak', type_name: '无码流出' },
@@ -53,25 +66,8 @@ const CLASSES = [
   { type_id: 'dm15/cn/furuke', type_name: 'Furuke AV' },
 ];
 
-const M3U8_PREFIXES = [
-  'https://surrit.mrstcdn.store/', // 当前实际使用的 surrit 域名(2026-10 实测)
-  'https://surrit.com/',           // XPTV 源文件里的旧域名,保留兜底
-];
 const M3U8_SUFFIX = '/playlist.m3u8';
 
-// ---------- m3u8 本地代理 (修复分片 .jpeg 伪装导致的不可拖动) ----------
-// 病因 (2026-10-23 实证): surrit 的分片是 TS 内容却用 videoN.jpeg
-// 文件名 + image/jpeg 类型下发。严格 HLS 内核 (ffmpeg 系, 本地
-// ffprobe 实测) 按分片扩展名白名单直接拒绝 .jpeg 分片 ("not in
-// allowed_segment_extensions"), 建不起 VOD 时间轴: 播放器退化为
-// 不可拖动的流式播放、还可能从中间分片起播 (用户真机反馈: 不从
-// 头播 + 没办法快进后退)。实测给分片 URL 尾加 ?x=.ts 后 ffmpeg
-// 立刻能解析时长/拖动, 而 CDN 忽略查询串、字节不变。
-// 修法 (同 avhub /proxy/m3u8 先例): detail 的播放地址改为本地
-// 代理地址, 代理实时拉清单并改写——媒体清单的分片行改成 CDN
-// 绝对地址 + ?x=.ts 后缀 (分片仍直连 CDN, 不经代理); 主清单的
-// variant 行改指回代理 (让 variant 清单也被改写)。代理拉取失败
-// 时 302 回源清单, 不比旧行为更差。
 function b64url(s) {
   try {
     return Buffer.from(String(s), 'utf8').toString('base64')
@@ -79,294 +75,8 @@ function b64url(s) {
   } catch (e) { return ''; }
 }
 
-function unb64url(s) {
-  return Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-}
-
-// 构造本地代理地址 (js2p://_WEB_ 为 App 动态地址 scheme, 同 avhub 先例)
-function proxyUrl(reqIn, path, targetUrl, referer) {
-  try {
-    const server = reqIn?.server;
-    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
-    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
-  } catch (e) { return ''; }
-}
-
-async function fetchPlaylistText(url, referer) {
-  try {
-    const { data, status } = await req.get(url, {
-      headers: headers(referer),
-      timeout: 20000,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-      validateStatus: () => true,
-    });
-    if (status >= 200 && status < 300 && data) return String(data);
-  } catch (e) { /* 落空走 302 降级 */ }
-  return '';
-}
-
-// 播放地址 (2026-11-23 第八轮)：分主机走不同的代理，全部改写分片为 .ts
-// ——MiraPlayer 的 ffmpeg 拒 .jpeg 分片，直接给它 .jpeg 直链播不了。
-//   ① 子域主机 (c.surrit 等)：Worker 拉不到 (SSL 525)，走猫源本地
-//      /proxy/m3u8（设备本机拉清单、分片改写为 /proxy/<b64>/<b64>.ts，
-//      第五轮已按 py_mogu 已验证写法落地）；
-//   ② 基域 (surrit.mrstcdn.store / surrit.com)：走 missav-hls Worker v3
-//      (/m3u8 改写分片指回 Worker /seg.ts)。
-// 之前第六轮给子域回直链是错的：REX 播放器吃 .jpeg，MiraPlayer 不吃，
-// 所以只有基域（走 Worker、已改 .ts）的中文字幕能播，其他分类全灭。
-function playUrlForTrack(reqIn, targetUrl, detailUrl) {
-  try {
-    const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
-    const host = hm ? hm[1].toLowerCase() : '';
-    const isSub = host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
-      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0);
-    if (isSub) {
-      return proxyUrl(reqIn, '/proxy/m3u8', targetUrl, detailUrl) || targetUrl;
-    }
-    return workerProxyUrl(targetUrl, detailUrl) || targetUrl;
-  } catch (e) { return targetUrl; }
-}
-
-// 清单代理地址 (missav-hls Worker v3)：u/r 为 b64url 编码。
-// 只有 surrit 基域 (surrit.mrstcdn.store / surrit.com) 走 Worker
-// (v3 改写 .jpeg 分片指回 Worker /seg.ts，实测清单 200 + 分片 200
-// 真 TS)。子域主机 (如 c.surrit.mrstcdn.store) 在 Cloudflare 网络内
-// SSL 握手失败 (525)，Worker 取不到、只会 302 回直链；这类主机在
-// playUrlForTrack 里走本地 /proxy/m3u8。其他 host（如 vz-*.b-cdn.net，
-// 新片托管）分片已是 .ts、Worker 白名单也不放行（403），一律直链。
-function workerProxyUrl(targetUrl, referer) {
-  try {
-    const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
-    const host = hm ? hm[1].toLowerCase() : '';
-    if (host !== 'surrit.mrstcdn.store' && host !== 'surrit.com') return targetUrl;
-    return `${MISSAV_HLS}/m3u8?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
-  } catch (e) { return ''; }
-}
-
-// 拉主清单：先走 missav-hls Worker（绕设备侧 CF 指纹拦截），再回落直连。
-// 返回清单正文（含 #EXTM3U 才算有效），拉不到返回 ''。
-async function fetchMasterPlaylist(masterUrl, referer) {
-  try {
-    const w = workerProxyUrl(masterUrl, referer);
-    if (w) {
-      const { data } = await req.get(w, { timeout: 20000 });
-      const s = String(data || '');
-      if (s.includes('#EXTM3U')) return s;
-    }
-  } catch (e) { /* 回落直连 */ }
-  try {
-    const { data } = await req.get(masterUrl, {
-      headers: headers(referer),
-      timeout: 20000,
-    });
-    const s = String(data || '');
-    if (s.includes('#EXTM3U')) return s;
-  } catch (e) { /* 拉不到 */ }
-  return '';
-}
-
-// 从主清单正文解析分档位高度：优先 STREAM-INF 的 RESOLUTION，
-// 回落直连清单的相对 variant 行 (720p/video.m3u8)。
-// Worker 改写后的主清单 variant 行已指回 Worker，但 STREAM-INF 的
-// RESOLUTION 不变，故两种格式通用；返回去重后降序高度数组。
-function parseVariantHeights(masterText) {
-  const heights = [];
-  const lines = String(masterText || '').split(/\r?\n/);
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
-    const m = line.match(/RESOLUTION=\d+x(\d+)/i);
-    if (m) heights.push(parseInt(m[1], 10));
-  }
-  if (!heights.length) {
-    for (const raw of lines) {
-      const t = raw.trim();
-      const m = t.match(/^(\d+)p\/video\.m3u8$/);
-      if (m) heights.push(parseInt(m[1], 10));
-    }
-  }
-  return [...new Set(heights)].filter((h) => h > 0).sort((a, b) => b - a);
-}
-
-// Dean Edwards packer 解包：详情页的 eval(function(p,a,c,k,e,d)...) 块内含
-// 直链 (source=主清单、source842=720p、source1280=1080p)，解包即得，
-// 无需拉主清单，解析快且主机随片正确。
-function unpackPacker(packed) {
-  if (!packed) return '';
-  const m = String(packed).match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\),0,\{\}\)\)/);
-  if (!m) return '';
-  const p = m[1].replace(/\\'/g, "'");
-  const a = parseInt(m[2], 10) || 36;
-  const k = m[4].split('|');
-  return p.replace(/\b[0-9a-z]+\b/g, (w) => {
-    const idx = parseInt(w, a);
-    if (!isNaN(idx) && idx >= 0 && idx < k.length && k[idx]) return k[idx];
-    return w;
-  });
-}
-
-// 从详情 HTML 的 packed JS 解出视频直链，返回 [{name:'1080p',url},...]。
-// name 由 URL path 取 (/1080p/ /720p/ /480p/ /360p/)，master 为 playlist.m3u8。
-// source1280 实际指 720p 时 (无 1080p 的片) 按 path 归 720p 并去重。
-// 2026-11-26：host 不限 surrit——站方按片迁移，新片在 vz-*.b-cdn.net，
-// 部分片在 c.surrit.mrstcdn.store；旧写法只留 surrit 会把新片的直链
-// 全扔掉，getTracks 只能回落到写死 host 拼出的 403 地址，全部无法播放。
-function extractPackedUrls(html) {
-  const out = [];
-  if (!html) return out;
-  const blocks = String(html).match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('[\s\S]*?',\d+,\d+,'[\s\S]*?'\.split\('\|'\),0,\{\}\)\)/g) || [];
-  const seen = new Set();
-  for (const block of blocks) {
-    let unpacked = '';
-    try { unpacked = unpackPacker(block); } catch (e) { continue; }
-    if (!unpacked) continue;
-    const urls = unpacked.match(/https?:\/\/[^\s'"<>]+\.m3u8/g) || [];
-    for (const raw of urls) {
-      const url = String(raw).replace(/\\+$/g, '');
-      if (seen.has(url)) continue;
-      seen.add(url);
-      const rm = url.match(/\/(1080p|720p|480p|360p)\/video\.m3u8/i);
-      const name = rm ? rm[1].toLowerCase() : (url.includes('playlist.m3u8') ? 'master' : '');
-      if (!name) continue;
-      out.push({ name, url });
-    }
-  }
-  return out;
-}
-
-// 从详情 HTML 取 surrit 主机 (随片变化：surrit.mrstcdn.store /
-// c.surrit.mrstcdn.store ...)，构造直链时用此主机，勿写死。
-// HTML 里链接常为转义形式 (https:\\/\\/c.surrit...)，故不锚定 scheme，
-// 直接匹配主机名。
-function surritHostFromHtml(html) {
-  const m = String(html || '').match(/([a-z0-9.-]*surrit\.[a-z0-9.-]+)/i);
-  return m ? m[1].replace(/\.+$/, '') : '';
-}
-
-// 取字节（清单/分片通用）：30s 超时、2 次尝试；失败返回 null，走 302 降级。
-// （同 py_mogu/py_siguaspw 已验证的写法：responseType arraybuffer，
-// 不加 transformResponse，Buffer.from(r.data)。）
-async function fetchBytes(url, referer) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await req.get(url, {
-        headers: headers(referer),
-        timeout: 30000,
-        responseType: 'arraybuffer',
-        validateStatus: () => true,
-      });
-      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
-    } catch (e) { /* 重试，落空走 302 降级 */ }
-  }
-  return null;
-}
-
-// 改写清单正文: selfBase 为代理自身地址 (由进来的请求 Host 拼出,
-// 清单正文里必须是真实 http 地址, 不能嵌 js2p)。
-// - 主清单 (含 EXT-X-STREAM-INF): variant 行 -> 指回代理;
-// - 媒体清单: 分片行 -> 路径段形式 /proxy/<b64url>/<b64url>.ts
-//   (末尾加 .ts 后缀过 ffmpeg 分片后缀白名单；b64url 字母表无 '.',
-//   代理入口先剥后缀再解码，无歧义；同 py_mogu/py_siguaspw 已验证);
-// - # 行 URI="..." 属性 absolutize (surrit 无密钥, 仅兜底)。
-function rewriteMissavM3u8(raw, playlistUrl, selfBase, referer) {
-  const isMaster = raw.includes('#EXT-X-STREAM-INF');
-  const lines = String(raw).split(/\r?\n/);
-  const out = lines.map((line) => {
-    const s = line.trim();
-    if (!s) return line;
-    if (s.startsWith('#')) {
-      if (s.includes('URI="')) {
-        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
-          try { return `URI="${new URL(uri, playlistUrl).toString()}"`; } catch (e) { return all; }
-        });
-      }
-      return line;
-    }
-    let abs;
-    try { abs = new URL(s, playlistUrl).toString(); } catch (e) { return line; }
-    if (isMaster) {
-      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
-    }
-    // 媒体清单: 分片不走 CDN 直链, 改走本地代理路径段形式。
-    // 播放器直取 CDN 分片会失败 (随片主机 c.surrit 等在播放器网络侧
-    // 不可达, 且 .jpeg 后缀会被 ffmpeg 白名单拒); 代理经设备 req.get
-    // 取分片 (与清单同一网络路径, 带 Referer/UA), URL 以 .ts 结尾。
-    return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}.ts`;
-  });
-  return out.join('\n');
-}
-
-// 代理入口（两种地址格式都接受，同 py_mogu/py_siguaspw 已验证）：
-// 主格式（detail/play 发出）：/proxy/m3u8?u={b64url}&r={b64url}；
-// 分片格式（改写后的媒体清单分片行）：/proxy/{b64url 目标}/{b64url referer}.ts。
-// 取回的文本是 #EXTM3U 即按清单改写；否则按字节透传：路径段形式来的是
-// 分片回 video/mp2t（支持 Range，便于拖动），查询串形式来的是密钥回
-// application/octet-stream。取不到时 302 回原地址。
-async function m3u8Proxy(request, reply) {
-  const q = request?.query || {};
-  let uEnc = q.u || '';
-  let rEnc = q.r || '';
-  let viaPath = false;
-  if (!uEnc) {
-    const wild = request?.params && request.params['*'];
-    let segs = [];
-    if (wild) segs = String(wild).split('/').filter(Boolean);
-    else {
-      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
-      const pi = rawPath.indexOf('/proxy/');
-      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
-    }
-    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
-      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
-    }
-    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; viaPath = true; }
-  }
-  if (!uEnc) { reply.code(400).send('missing u'); return; }
-  let target = '';
-  let referer = HOST + '/';
-  try {
-    target = unb64url(uEnc);
-    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
-  } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const host = request.headers && request.headers.host;
-  const selfBase = host
-    ? `http://${host}/spider/${KEY}/3`
-    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
-  const buf = await fetchBytes(target, referer);
-  if (!buf || !buf.length) { reply.redirect(target); return; }
-  const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
-  if (head.trimStart().startsWith('#EXTM3U')) {
-    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
-    reply.header('Cache-Control', 'no-cache');
-    reply.send(rewriteMissavM3u8(buf.toString('utf8'), target, selfBase, referer));
-    return;
-  }
-  // 非清单内容：路径段形式来的是分片；查询串形式来的是密钥（16 字节）。
-  if (viaPath) {
-    const range = request?.headers && request.headers.range;
-    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
-    reply.header('Content-Type', 'video/mp2t');
-    reply.header('Cache-Control', 'no-cache');
-    reply.header('Accept-Ranges', 'bytes');
-    if (m) {
-      const start = parseInt(m[1], 10);
-      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
-      if (start < buf.length && start <= end) {
-        reply.code(206);
-        reply.header('Content-Range', `bytes ${start}-${end}/${buf.length}`);
-        reply.send(buf.subarray(start, end + 1));
-        return;
-      }
-    }
-    reply.send(buf);
-    return;
-  }
-  reply.header('Content-Type', 'application/octet-stream');
-  reply.header('Cache-Control', 'no-cache');
-  reply.send(buf);
+function cleanText(s) {
+  return String(s || '').replace(/\s+/g, ' ').trim();
 }
 
 function headers(referer) {
@@ -400,8 +110,9 @@ async function fetchOne(url, referer) {
   return '';
 }
 
+// 多域名容灾取 HTML：先试原 URL，无效时把同一路径换到其他域名逐个试，
+// 首个有效者胜出并记为当前 HOST；全部无效回 ''。
 async function getHtml(url, referer) {
-  // 先试原 URL；无效时把同一路径换到其他域名逐个试，首个有效者胜出并记为当前 HOST。
   const list = [];
   const seen = new Set();
   const push = (u) => { if (u && !seen.has(u)) { seen.add(u); list.push(u); } };
@@ -421,10 +132,6 @@ async function getHtml(url, referer) {
   return '';
 }
 
-function cleanText(s) {
-  return String(s || '').replace(/\s+/g, ' ').trim();
-}
-
 function absUrl(u) {
   u = String(u || '').trim();
   if (!u) return '';
@@ -433,7 +140,7 @@ function absUrl(u) {
   return HOST + (u.startsWith('/') ? u : '/' + u);
 }
 
-// 解析视频卡片列表 (.thumbnail),对应 XPTV getCards/search 的解析逻辑
+// 列表解析：thumbnail 卡片（封面 data-src、标题、链接、备注/时长）。
 function parseCards(html) {
   const cards = [];
   if (!html || html.includes('Just a moment...')) return cards;
@@ -456,7 +163,6 @@ function parseCards(html) {
   return cards;
 }
 
-// 从分页链接提取最大页码
 function parsePagecount(html, curPage) {
   let max = 0;
   const re = /[?&]page=(\d+)/g;
@@ -471,7 +177,6 @@ function parsePagecount(html, curPage) {
 function wrapPage(page, pagecount, list) {
   list = Array.isArray(list) ? list : [];
   const limit = list.length || 12;
-  // 确保 pagecount 至少为当前页，避免播放器认为没有更多页
   pagecount = Math.max(pagecount || 0, page);
   return {
     page,
@@ -482,7 +187,165 @@ function wrapPage(page, pagecount, list) {
   };
 }
 
-// 对应 XPTV getCards: ext = JSON 字符串 {id, page, filters?}
+// Dean Edwards packer 解包：详情页的 eval(function(p,a,c,k,e,d)...) 块内含
+// 直链 (source=主清单、source842=720p、source1280=1080p)，解包即得。
+function unpackPacker(packed) {
+  if (!packed) return '';
+  const m = String(packed).match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('([\s\S]*?)',(\d+),(\d+),'([\s\S]*?)'\.split\('\|'\),0,\{\}\)\)/);
+  if (!m) return '';
+  const p = m[1].replace(/\\'/g, "'");
+  const a = parseInt(m[2], 10) || 36;
+  const k = m[4].split('|');
+  return p.replace(/\b[0-9a-z]+\b/g, (w) => {
+    const idx = parseInt(w, a);
+    if (!isNaN(idx) && idx >= 0 && idx < k.length && k[idx]) return k[idx];
+    return w;
+  });
+}
+
+// 从详情 HTML 的 packed JS 解出视频直链，返回 [{name:'1080p',url},...]。
+// host 不限（b-cdn / surrit / c.surrit 均可），只出真实分档，不出“自动”。
+function extractPackedUrls(html) {
+  const out = [];
+  if (!html) return out;
+  const blocks = String(html).match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\('[\s\S]*?',\d+,\d+,'[\s\S]*?'\.split\('\|'\),0,\{\}\)\)/g) || [];
+  const seen = new Set();
+  for (const block of blocks) {
+    let unpacked = '';
+    try { unpacked = unpackPacker(block); } catch (e) { continue; }
+    if (!unpacked) continue;
+    const urls = unpacked.match(/https?:\/\/[^\s'"<>]+\.m3u8/g) || [];
+    for (const raw of urls) {
+      const url = String(raw).replace(/\\+$/g, '');
+      if (seen.has(url)) continue;
+      seen.add(url);
+      const rm = url.match(/\/(1080p|720p|480p|360p)\/video\.m3u8/i);
+      const name = rm ? rm[1].toLowerCase() : (url.includes('playlist.m3u8') ? 'master' : '');
+      if (!name) continue;
+      out.push({ name, url });
+    }
+  }
+  return out;
+}
+
+// 拉主清单：先走 missav-hls Worker，再回落直连。返回清单正文（含 #EXTM3U 才算有效）。
+async function fetchMasterPlaylist(masterUrl, referer) {
+  try {
+    const w = workerProxyUrl(masterUrl, referer);
+    if (w) {
+      const { data } = await req.get(w, { timeout: 20000 });
+      const s = String(data || '');
+      if (s.includes('#EXTM3U')) return s;
+    }
+  } catch (e) { /* 回落直连 */ }
+  try {
+    const { data } = await req.get(masterUrl, {
+      headers: headers(referer),
+      timeout: 20000,
+    });
+    const s = String(data || '');
+    if (s.includes('#EXTM3U')) return s;
+  } catch (e) { /* 拉不到 */ }
+  return '';
+}
+
+// 从主清单正文解析分档位高度。
+function parseVariantHeights(masterText) {
+  const heights = [];
+  const lines = String(masterText || '').split(/\r?\n/);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+    const m = line.match(/RESOLUTION=\d+x(\d+)/i);
+    if (m) heights.push(parseInt(m[1], 10));
+  }
+  if (!heights.length) {
+    for (const raw of lines) {
+      const t = raw.trim();
+      const m = t.match(/^(\d+)p\/video\.m3u8$/);
+      if (m) heights.push(parseInt(m[1], 10));
+    }
+  }
+  return [...new Set(heights)].filter((h) => h > 0).sort((a, b) => b - a);
+}
+
+// 播放地址分流：只有 surrit 基域走 missav-hls Worker v3（改写 .jpeg 分片为 .ts）；
+// 其他 host（b-cdn、c.surrit 等）一律直链，与浏览器行为一致。
+function workerProxyUrl(targetUrl, referer) {
+  try {
+    const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
+    const host = hm ? hm[1].toLowerCase() : '';
+    if (host !== 'surrit.mrstcdn.store' && host !== 'surrit.com') return targetUrl;
+    return `${MISSAV_HLS}/m3u8?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
+  } catch (e) { return targetUrl; }
+}
+
+function playUrlForTrack(targetUrl, detailUrl) {
+  return workerProxyUrl(targetUrl, detailUrl) || targetUrl;
+}
+
+// 详情 + 分档：packed JS 快路径优先，取不到时拉主清单发现分档，再取不到按标准档位现拼。
+// 只出真实分档，不出“自动”。
+async function getTracks(detailUrl) {
+  const html = await getHtml(detailUrl);
+  const info = { vod_id: detailUrl, vod_name: '', vod_pic: '', vod_content: '', vod_remarks: '' };
+  if (!html) return { info, tracks: [] };
+  const $ = cheerio.load(html);
+  info.vod_name = cleanText($('meta[property="og:title"]').attr('content')) || cleanText($('title').text());
+  info.vod_pic = absUrl($('meta[property="og:image"]').attr('content'));
+  info.vod_content = cleanText($('meta[property="og:description"]').attr('content'));
+  info.vod_remarks = cleanText($('meta[property="og:url"]').attr('content'));
+
+  const tracks = [];
+  // UUID：先从 seek 缩略图取，取不到退回任意 UUID（详情页内仅视频自身一个 UUID）。
+  let match = html.match(/(?:[a-z0-9.-]*\.)?surrit(?:\.com|\.mrstcdn\.store)\\\/([^"\\]+)\\\/seek\\\/_0\.jpg/);
+  if (!match) {
+    const anyUuid = html.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
+    if (anyUuid) match = [anyUuid[0], anyUuid[0]];
+  }
+  // 主机随片变化：优先用 packed 直链自带的主机，取不到才从 HTML 猜。
+  let host = 'surrit.mrstcdn.store';
+  const packedFirst = extractPackedUrls(html).filter((t) => t.name !== 'master')[0];
+  if (packedFirst) {
+    const hm = String(packedFirst.url || '').match(/^https?:\/\/([^\/]+)/i);
+    if (hm && hm[1]) host = hm[1].toLowerCase();
+  } else {
+    const hm = String(html || '').match(/([a-z0-9.-]*surrit\.[a-z0-9.-]+)/i);
+    if (hm && hm[1]) host = hm[1].replace(/\.+$/, '').toLowerCase();
+  }
+  const prefix = `https://${host}/`;
+  if (match && match[1]) {
+    const uuid = match[1];
+    // ① 快路径：详情页 packed JS 自带分档直链，解包即得。
+    const packed = extractPackedUrls(html).filter((t) => t.name !== 'master');
+    const seenNames = new Set();
+    for (const t of packed) {
+      if (seenNames.has(t.name)) continue;
+      seenNames.add(t.name);
+      tracks.push(t);
+    }
+    // ② packed JS 无分档时：拉主清单发现分档。
+    if (!tracks.length) {
+      const masterUrl = prefix + uuid + M3U8_SUFFIX;
+      const body = await fetchMasterPlaylist(masterUrl, detailUrl);
+      if (body) {
+        const heights = parseVariantHeights(body);
+        for (const h of heights) {
+          tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
+        }
+      }
+    }
+    // ③ 仍无分档时：按标准档位现拼。
+    if (!tracks.length) {
+      for (const h of [1080, 720, 480, 360]) {
+        tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
+      }
+    }
+    tracks.sort((a, b) => parseInt(b.name, 10) - parseInt(a.name, 10));
+  }
+  return { info, tracks };
+}
+
 async function getCards(ext) {
   ext = JSON.parse(ext || '{}');
   const { page = 1, id, filters = {} } = ext;
@@ -498,76 +361,6 @@ async function getCards(ext) {
   return { html, list: parseCards(html) };
 }
 
-// 对应 XPTV getTracks + 详情页信息解析
-// 返回: { info: {vod_id, vod_name, vod_pic, vod_content, vod_remarks}, tracks: [{name, url}] }
-async function getTracks(detailUrl) {
-  const html = await getHtml(detailUrl);
-  const info = { vod_id: detailUrl, vod_name: '', vod_pic: '', vod_content: '', vod_remarks: '' };
-  if (!html) return { info, tracks: [] };
-  const $ = cheerio.load(html);
-  info.vod_name = cleanText($('meta[property="og:title"]').attr('content')) || cleanText($('title').text());
-  info.vod_pic = absUrl($('meta[property="og:image"]').attr('content'));
-  info.vod_content = cleanText($('meta[property="og:description"]').attr('content'));
-  info.vod_remarks = cleanText($('meta[property="og:url"]').attr('content'));
-
-  const tracks = [];
-  // XPTV 正则 /surrit\.com\\\/(.+)\\\/seek\\\/_0\.jpg/
-  // 实测站点已换成 surrit.mrstcdn.store，这里同时兼容新旧域名与随片子域
-  // (c.surrit.mrstcdn.store 等，SNOS-524 的根因：写死主机拿不到 UUID)。
-  let match = html.match(/(?:[a-z0-9.-]*\.)?surrit(?:\.com|\.mrstcdn\.store)\\\/([^"\\]+)\\\/seek\\\/_0\.jpg/);
-  // 兜底 (2026-11-23): 个别详情页无 seek 缩略图时,退回任意 UUID
-  // (实测详情页内仅视频自身一个 UUID)。
-  if (!match) {
-    const anyUuid = html.match(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/);
-    if (anyUuid) match = [anyUuid[0], anyUuid[0]];
-  }
-  // 主机随片变化 (surrit.mrstcdn.store / c.surrit.mrstcdn.store ...)，从
-  // seek 链接取，勿写死；写死主机是 SNOS-524 拿不到分档的根因。
-  // (2026-11-23 第十一轮：packed 直链自带正确主机，优先用它，勿用
-  // surritHostFromHtml 首匹配——HTML 里可能先出现别的主机。)
-  let host = surritHostFromHtml(html) || 'surrit.mrstcdn.store';
-  const packedFirst = extractPackedUrls(html).filter((t) => t.name !== 'master')[0];
-  if (packedFirst) {
-    const hm = String(packedFirst.url || '').match(/^https?:\/\/([^\/]+)/i);
-    if (hm && hm[1]) host = hm[1].toLowerCase();
-  }
-  const prefix = `https://${host}/`;
-  if (match && match[1]) {
-    const uuid = match[1];
-    // ① 快路径 (2026-11-23)：详情页 packed JS 自带 1080p/720p 直链
-    // (source1280/source842)，解包即得，无需拉主清单，解析快。
-    // 只出真实分档，不出“自动”。
-    const packed = extractPackedUrls(html).filter((t) => t.name !== 'master');
-    const seenNames = new Set();
-    for (const t of packed) {
-      if (seenNames.has(t.name)) continue;
-      seenNames.add(t.name);
-      tracks.push(t);
-    }
-    // ② packed JS 无分档时：用正确主机拉主清单发现分档 (Worker 优先)。
-    if (!tracks.length) {
-      const masterUrl = prefix + uuid + M3U8_SUFFIX;
-      const body = await fetchMasterPlaylist(masterUrl, detailUrl);
-      if (body) {
-        const heights = parseVariantHeights(body);
-        for (const h of heights) {
-          tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
-        }
-      }
-    }
-    // ③ 仍无分档时：按标准档位现拼 (1080p/720p/480p/360p)，只出真实
-    // 分档、不出“自动”；播放器点不存在的档会失败，但总比只有“自动”强，
-    // 且多数片至少有 720p/480p/360p。
-    if (!tracks.length) {
-      for (const h of [1080, 720, 480, 360]) {
-        tracks.push({ name: `${h}p`, url: `${prefix}${uuid}/${h}p/video.m3u8` });
-      }
-    }
-    tracks.sort((a, b) => parseInt(b.name, 10) - parseInt(a.name, 10));
-  }
-  return { info, tracks };
-}
-
 async function init() {
   return {};
 }
@@ -577,7 +370,6 @@ async function home() {
 }
 
 async function homeVod() {
-  // 首页推荐改用"新作上市"第一页（2026-11-02 查实：新作上市与最近更新第 1、2 页内容连顺序全同，最近更新分类已删）
   const { list } = await getCards(JSON.stringify({ id: 'dm509/cn/release', page: 1 }));
   return { list: (list || []).slice(0, 20) };
 }
@@ -588,11 +380,8 @@ async function category(reqIn) {
   const id = String(body.id || CLASSES[0].type_id);
   const filters = body.filters || {};
   const { list } = await getCards(JSON.stringify({ id, page, filters }));
-  // 翻页 (2026-11-23)：改用包内已验证的动态 pagecount（py_siguaspw 同款）——
   // 本页有内容就报 page+1（App 知道还有下一页）、空页才报 page（到底）。
-  // 之前固定 pagecount:999 + limit:list.length，加载更多不出新内容。
-  const items = list || [];
-  return { page, pagecount: items.length ? page + 1 : page, limit: items.length || 12, list: items };
+  return { page, pagecount: list.length ? page + 1 : page, limit: list.length || 12, list };
 }
 
 async function detail(reqIn) {
@@ -602,17 +391,8 @@ async function detail(reqIn) {
   const detailUrl = absUrl(vid);
   const { info, tracks } = await getTracks(detailUrl);
   if (!info.vod_name && !tracks.length) return { list: [] };
-  // 播放地址 (2026-11-26 第十三轮)：仍是单线（用户 2026-11-24 令拆掉
-  // 多线路分组，不再分“本地代理/直连”两组），但单线地址必须按 host
-  // 走代理，不能直接给 packed JS 直链——surrit 分片是 TS 内容却用
-  // videoN.jpeg 文件名，MiraPlayer 的 ffmpeg 按扩展名白名单直接拒
-  // .jpeg 分片，致无码流出（全 c.surrit）与中文字幕（全 surrit 基域）
-  // 等分类全部无法播放；只有 b-cdn 新片（分片已是 .ts）能直连播。
-  // 故每档只给一个地址，按 playUrlForTrack 分流：子域走本地
-  // /proxy/m3u8（设备本机拉清单、分片改写为 .ts）、基域走 missav-hls
-  // Worker v3（改写分片指回 Worker /seg.ts，实测清单 200 + 分片
-  // 200 真 TS）、b-cdn 等其他 host 直链。play() 按 py_mogu 格式
-  // `名字$详情页@@播单地址` 拆出详情页当 Referer。
+  // 单线：每档分辨率只给一个地址，按 host 分流（见 playUrlForTrack）。
+  // 格式 `名字$详情页@@播单地址`，play() 拆出详情页当 Referer。
   const vod = {
     vod_id: detailUrl,
     vod_name: info.vod_name || detailUrl,
@@ -620,7 +400,7 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    vod_play_url: tracks.map((t) => `${t.name}$${detailUrl}@@${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#'),
+    vod_play_url: tracks.map((t) => `${t.name}$${detailUrl}@@${playUrlForTrack(t.url, detailUrl)}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
@@ -628,12 +408,8 @@ async function detail(reqIn) {
 
 async function play(reqIn) {
   const body = reqIn?.body || {};
-  // 根因 (2026-11-23)：App 传进来的 body.id 是 vod_play_url 里的
-  // "线路名$地址" 全串（如 1080p$https://...），必须先剥掉 "$" 前的
-  // 线路名再返回，否则播放器拿到的是非法地址、转圈几秒后加载失败。
-  // 能播的源（py_mogu/py_siguaspw）都在 play() 开头剥 "$"，这里漏了。
-  // 第十轮：地址按 py_mogu 格式带详情页 `名字$详情页@@播单地址`，
-  // 剥 "$" 后再按 "@@" 拆出详情页当 Referer（REX 送详情页 Referer）。
+  // App 传进来的 body.id 是 vod_play_url 里的 "线路名$地址" 全串，
+  // 必须先剥掉 "$" 前的线路名再返回，否则播放器拿到非法地址。
   let id = String(Array.isArray(body.id) ? body.id[0] : body.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop();
   if (!id) return { parse: 0, url: '' };
@@ -643,9 +419,7 @@ async function play(reqIn) {
   if (at >= 0) { durl = id.slice(0, at); url = id.slice(at + 2); }
   if (!url) return { parse: 0, url: '' };
   const subsP = subSearchAll(subNormKey(url)).catch(() => []);
-  // XPTV getPlayinfo 直接返回直链 + 请求头;此处返回给客户端
-  // (2026-11-23 第十一轮：补 Origin，REX 每集带 Referer+UA+Origin 三件套)。
-  // Origin 跟详情页同源（多域名容灾后详情页可能来自 live/fans/ai/ws 任一域名）。
+  // Origin 跟详情页同源（多域名容灾后详情页可能来自任一域名）。
   let origin = HOST;
   if (durl) { try { origin = new URL(durl).origin; } catch (e) {} }
   return subAttach({
@@ -670,19 +444,6 @@ async function search(reqIn) {
   const list = parseCards(html);
   return { page, pagecount: 999, limit: list.length || 12, total: 999 * 12, list };
 }
-
-// ---------------- 字幕聚合 (Layer A 铺开, 2026-10-23) ----------------
-// 与 bestjavporn 试点同一实现 (提交 9c339419, 用户真机确认
-// MiraPlayer 可加载并选择字幕): 点播时按片名/番号并行搜迅雷看看
-// oracle (首档; 「迅雷」与「迅雷看看」实为同一接口) + SubtitleCat
-// (第二档), 合并排序 = 来源档位 -> 语言 (简中>繁中>双语>英文>
-// 其他) -> 番号命中 -> 热度, 只收 .srt/.vtt/.ass/.ssa 直链, 上限
-// 10 条, 以 TVBox 标准 subs:[{name,url,format}] 挂到 play 结果。
-// 总预算 6s、单请求 4~5s、全程框架 req (NOFETCH 安全)、结果缓存
-// 10 分钟 (空结果不缓存); 无命中时不带 subs 键, play 返回与接入
-// 前逐字段一致。SubHD (下载被站方门控) 与射手 (源站 522) 不接入。
-const SUB_UA = (typeof UA !== 'undefined' && UA) ? UA : 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_2 like Mac OS X) AppleWebKit/604.1.14 (KHTML, like Gecko)';
-
 function subCleanText(s) {
   return String(s || '').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
 }
@@ -1133,6 +894,7 @@ function subWarm(durl) {
   subSearchAll(durl).catch(() => {});
 }
 
+
 export default function spider() {
   return {
     meta: { key: KEY, name: NAME, type: 3 },
@@ -1144,13 +906,6 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // m3u8 代理 (GET，2026-11-26 第十三轮恢复)：清单与分片共用同一
-      // 入口 (同 py_mogu/py_siguaspw 已验证写法)：查询串 /proxy/m3u8?u=&r=
-      // 走清单，分片走路径段 /proxy/<b64url>/<b64url>.ts (末尾 .ts 过
-      // ffmpeg 白名单)。2026-11-24 拆代理时摘掉路由致 c.surrit 片全灭，
-      // 本轮只恢复单线代理（仍是一条线，不分组），不恢复直连线。
-      fastify.get('/proxy/*', m3u8Proxy);
-      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
