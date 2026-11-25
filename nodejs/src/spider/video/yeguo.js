@@ -5,7 +5,7 @@ import crypto from 'crypto';
 
 const KEY = 'py_yeguo';
 const NAME = '野果短剧';
-const API_BASE = 'https://www.yeguodj.com/api.php';
+const API_BASE = 'https://yeguodj.com/api.php';
 const YG_FETCH = 'https://yeguo-fetch.li768435813.workers.dev/api.php';
 const SITE = 'https://yeguodj.com';
 const IMG_WORKER = 'https://bagua-img-proxy.li768435813.workers.dev';
@@ -64,9 +64,12 @@ async function apiPostOnce(base, path, body) {
   return d;
 }
 async function apiPost(path, body) {
-  // 双腿回落：先走 yeguo-fetch Worker 腿（设备侧到 yeguodj.com 不通），
-  // 失败再走直连腿；Worker 未部署时直连腿照常工作。
-  const bases = [YG_FETCH, API_BASE];
+  // 顺序回落（2026-11-26 根因修正）：直连优先，Worker 垫底。
+  // yeguo-fetch Worker 已死：站方拦 Cloudflare 出口，POST 一律 403
+  // "Request forbidden by administrative rules"；直连 POST 到
+  // yeguodj.com/api.php 实测 200 且 AES 解密有效。www 301 跳非 www，
+  // API_BASE 已改非 www  canonical 域。
+  const bases = [API_BASE, YG_FETCH];
   let lastErr = null;
   for (const base of bases) {
     try {
