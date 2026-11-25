@@ -139,6 +139,16 @@ function absUrl(u) {
   return HOST + (u.startsWith('/') ? u : '/' + u);
 }
 
+// 封面改写（2026-11-26 用户报封面时有时无）：站方新封面 host
+// d.surrit.mrstcdn.store 设备侧打不开（DNS 不可达），但同一张封面
+// 在 fourhoi.mrstcdn.store 上有同一份（同路径 cover-t.jpg，实测 200 真图），
+// 且 fourhoi 本就是旧封面 host、设备侧可达。故只改写封面 host，视频地址不动。
+function fixCover(u) {
+  u = String(u || '').trim();
+  if (!u) return '';
+  return u.replace(/^https:\/\/d\.surrit\.mrstcdn\.store\//i, 'https://fourhoi.mrstcdn.store/');
+}
+
 // 列表解析：thumbnail 卡片（封面 data-src、标题、链接、备注/时长）。
 function parseCards(html) {
   const cards = [];
@@ -149,7 +159,7 @@ function parseCards(html) {
     const href = el.find('.text-secondary').attr('href') || '';
     const title = cleanText(el.find('.text-secondary').text());
     if (!href || !title) return;
-    const cover = absUrl(el.find('.w-full').attr('data-src'));
+    const cover = fixCover(absUrl(el.find('.w-full').attr('data-src')));
     const remarks = cleanText(el.find('.left-1').text());
     const duration = cleanText(el.find('.right-1').text());
     cards.push({
@@ -301,7 +311,7 @@ async function getTracks(detailUrl) {
   if (!html) return { info, tracks: [] };
   const $ = cheerio.load(html);
   info.vod_name = cleanText($('meta[property="og:title"]').attr('content')) || cleanText($('title').text());
-  info.vod_pic = absUrl($('meta[property="og:image"]').attr('content'));
+  info.vod_pic = fixCover(absUrl($('meta[property="og:image"]').attr('content')));
   info.vod_content = cleanText($('meta[property="og:description"]').attr('content'));
   info.vod_remarks = cleanText($('meta[property="og:url"]').attr('content'));
 
