@@ -4,10 +4,10 @@
 // live/ws/ai 全是 403）。视频 host 随镜像固定：
 //   c.surrit.mrstcdn.store（无码流出等）/ surrit 基域（中文字幕等）/ b-cdn（新片）。
 //
-// 播放分流（单线，不分组）：
-//   c.surrit 子域：走猫源本地 /proxy/m3u8（设备本机拉清单、分片改写为 .ts；
-//     Worker 在 CF 网络内拉 c.surrit 会 SSL 525、只会 302，拉不到；
-//     直链分片是 .jpeg，播放器 ffmpeg 拒 .jpeg，所以必须本地代理改写）；
+// 播放分流（单线，不分组；2026-11-26 根因修正）：
+//   c.surrit 子域：直链（与 REX MissAV_ovo 3.6.6 同款，用户 2026-11-24 真机确认
+//     可播；此前猫源把子域经本地 /proxy/m3u8 是错的——代理内调未定义的
+//     unb64url，每次都回 400，设备侧无限转圈的根因就在此，/proxy 已整段删除）；
 //   surrit 基域：走 missav-hls Worker v3（改写 .jpeg 分片为 /seg.ts）；
 //   b-cdn：直链（分片已是 .ts）。
 //   字幕：沿用已验证的字幕聚合（迅雷 > 迅雷看看 > SubtitleCat）。
@@ -268,16 +268,6 @@ function parseVariantHeights(masterText) {
   return [...new Set(heights)].filter((h) => h > 0).sort((a, b) => b - a);
 }
 
-// 本地代理地址（js2p://_WEB_ 为 App 动态地址 scheme，同 py_mogu 已验证写法）。
-function proxyUrl(reqIn, path, targetUrl, referer) {
-  try {
-    const server = reqIn?.server;
-    const dynamic = server?.address?.()?.dynamic || 'js2p://_WEB_';
-    const prefix = server?.prefix || ('/spider/' + KEY + '/3');
-    return `${dynamic}${prefix}${path}?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
-  } catch (e) { return ''; }
-}
-
 // 清单代理地址（missav-hls Worker v3）：只有 surrit 基域走 Worker
 // （改写 .jpeg 分片指回 Worker /seg.ts）。子域（c.surrit.*）在 CF 网络内
 // SSL 握手失败（525），Worker 取不到、只会 302；b-cdn 分片已是 .ts、
@@ -291,142 +281,17 @@ function workerProxyUrl(targetUrl, referer) {
   } catch (e) { return targetUrl; }
 }
 
-// 播放地址分流：c.surrit 子域走本地 /proxy/m3u8（设备本机拉清单、
-// 分片改写为 .ts）；surrit 基域走 Worker；b-cdn 等其他 host 直链。
+// 播放地址分流（2026-11-26 根因修正）：c.surrit 子域一律直链，不再走本地 /proxy。
+// 证据：REX MissAV_ovo 3.6.6 同款分流（子域直链、基域走 Worker）用户 2026-11-24
+// 真机确认可播；TuT 的加密 REX MissAV 模块同样全分类可播。猫源此前把子域强制
+// 经 /proxy/m3u8（js2p  scheme + 本地改写），是唯一与可播的 REX 做法不同的腿，
+// 设备侧转圈的根因就在这条腿。surrit 基域仍走 Worker（改写 .jpeg 分片为 .ts）；
+// b-cdn 等其他 host 直链。
 function playUrlForTrack(reqIn, targetUrl, detailUrl) {
   try {
-    const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
-    const host = hm ? hm[1].toLowerCase() : '';
-    const isSub = host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
-      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0);
-    if (isSub) {
-      return proxyUrl(reqIn, '/proxy/m3u8', targetUrl, detailUrl) || targetUrl;
-    }
     return workerProxyUrl(targetUrl, detailUrl) || targetUrl;
   } catch (e) { return targetUrl; }
 }
-
-async function fetchBytes(url, referer) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const r = await req.get(url, {
-        headers: headers(referer),
-        timeout: 30000,
-        responseType: 'arraybuffer',
-        validateStatus: () => true,
-      });
-      if (r.status >= 200 && r.status < 300 && r.data) return Buffer.from(r.data);
-    } catch (e) { /* 重试，落空走 302 降级 */ }
-  }
-  return null;
-}
-
-// 改写清单正文: selfBase 为代理自身地址 (由进来的请求 Host 拼出,
-// 清单正文里必须是真实 http 地址, 不能嵌 js2p)。
-// - 主清单 (含 EXT-X-STREAM-INF): variant 行 -> 指回代理;
-// - 媒体清单: 分片行 -> 路径段形式 /proxy/<b64url>/<b64url>.ts
-//   (末尾加 .ts 后缀过 ffmpeg 分片后缀白名单；b64url 字母表无 '.',
-//   代理入口先剥后缀再解码，无歧义；同 py_mogu/py_siguaspw 已验证);
-// - # 行 URI="..." 属性 absolutize (surrit 无密钥, 仅兜底)。
-function rewriteMissavM3u8(raw, playlistUrl, selfBase, referer) {
-  const isMaster = raw.includes('#EXT-X-STREAM-INF');
-  const lines = String(raw).split(/\r?\n/);
-  const out = lines.map((line) => {
-    const s = line.trim();
-    if (!s) return line;
-    if (s.startsWith('#')) {
-      if (s.includes('URI="')) {
-        return line.replace(/URI="([^"]+)"/g, (all, uri) => {
-          try { return `URI="${new URL(uri, playlistUrl).toString()}"`; } catch (e) { return all; }
-        });
-      }
-      return line;
-    }
-    let abs;
-    try { abs = new URL(s, playlistUrl).toString(); } catch (e) { return line; }
-    if (isMaster) {
-      return `${selfBase}/proxy/m3u8?u=${b64url(abs)}&r=${b64url(referer || '')}`;
-    }
-    // 媒体清单: 分片不走 CDN 直链, 改走本地代理路径段形式。
-    // 播放器直取 CDN 分片会失败 (随片主机 c.surrit 等在播放器网络侧
-    // 不可达, 且 .jpeg 后缀会被 ffmpeg 白名单拒); 代理经设备 req.get
-    // 取分片 (与清单同一网络路径, 带 Referer/UA), URL 以 .ts 结尾。
-    return `${selfBase}/proxy/${b64url(abs)}/${b64url(referer || '-')}.ts`;
-  });
-  return out.join('\n');
-}
-
-// 代理入口（两种地址格式都接受，同 py_mogu/py_siguaspw 已验证）：
-// 主格式（detail/play 发出）：/proxy/m3u8?u={b64url}&r={b64url}；
-// 分片格式（改写后的媒体清单分片行）：/proxy/{b64url 目标}/{b64url referer}.ts。
-// 取回的文本是 #EXTM3U 即按清单改写；否则按字节透传：路径段形式来的是
-// 分片回 video/mp2t（支持 Range，便于拖动），查询串形式来的是密钥回
-// application/octet-stream。取不到时 302 回原地址。
-async function m3u8Proxy(request, reply) {
-  const q = request?.query || {};
-  let uEnc = q.u || '';
-  let rEnc = q.r || '';
-  let viaPath = false;
-  if (!uEnc) {
-    const wild = request?.params && request.params['*'];
-    let segs = [];
-    if (wild) segs = String(wild).split('/').filter(Boolean);
-    else {
-      const rawPath = String((request?.raw && request.raw.url) || request?.url || '').split('?')[0];
-      const pi = rawPath.indexOf('/proxy/');
-      if (pi >= 0) segs = rawPath.slice(pi + 7).split('/').filter(Boolean);
-    }
-    if (segs.length && segs[segs.length - 1].endsWith('.ts')) {
-      segs[segs.length - 1] = segs[segs.length - 1].slice(0, -3);
-    }
-    if (segs.length) { uEnc = segs[0]; rEnc = segs[1] || ''; viaPath = true; }
-  }
-  if (!uEnc) { reply.code(400).send('missing u'); return; }
-  let target = '';
-  let referer = HOST + '/';
-  try {
-    target = unb64url(uEnc);
-    if (rEnc && rEnc !== '-') referer = unb64url(rEnc) || referer;
-  } catch (e) { reply.code(400).send('bad u'); return; }
-  if (!/^https?:\/\//.test(target)) { reply.code(400).send('bad u'); return; }
-  const host = request.headers && request.headers.host;
-  const selfBase = host
-    ? `http://${host}/spider/${KEY}/3`
-    : (proxyUrl(request, '', '', '').replace(/\?.*$/, '') || `/spider/${KEY}/3`);
-  const buf = await fetchBytes(target, referer);
-  if (!buf || !buf.length) { reply.redirect(target); return; }
-  const head = buf.subarray(0, Math.min(buf.length, 16)).toString('utf8');
-  if (head.trimStart().startsWith('#EXTM3U')) {
-    reply.header('Content-Type', 'application/vnd.apple.mpegurl');
-    reply.header('Cache-Control', 'no-cache');
-    reply.send(rewriteMissavM3u8(buf.toString('utf8'), target, selfBase, referer));
-    return;
-  }
-  // 非清单内容：路径段形式来的是分片；查询串形式来的是密钥（16 字节）。
-  if (viaPath) {
-    const range = request?.headers && request.headers.range;
-    const m = range ? String(range).match(/bytes=(\d+)-(\d*)/) : null;
-    reply.header('Content-Type', 'video/mp2t');
-    reply.header('Cache-Control', 'no-cache');
-    reply.header('Accept-Ranges', 'bytes');
-    if (m) {
-      const start = parseInt(m[1], 10);
-      const end = m[2] ? Math.min(parseInt(m[2], 10), buf.length - 1) : buf.length - 1;
-      if (start < buf.length && start <= end) {
-        reply.code(206);
-        reply.header('Content-Range', `bytes ${start}-${end}/${buf.length}`);
-        reply.send(buf.subarray(start, end + 1));
-        return;
-      }
-    }
-    reply.send(buf);
-    return;
-  }
-  reply.header('Content-Type', 'application/octet-stream');
-  reply.header('Cache-Control', 'no-cache');
-  reply.send(buf);
-}
-
 
 // 详情 + 分档：packed JS 快路径优先，取不到时拉主清单发现分档，再取不到按标准档位现拼。
 // 只出真实分档，不出“自动”。
@@ -1050,10 +915,6 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // 本地 m3u8 代理（c.surrit 子域用）：清单与分片共用同一入口
-      // （同 py_mogu 已验证写法）。
-      fastify.get('/proxy/*', m3u8Proxy);
-      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
