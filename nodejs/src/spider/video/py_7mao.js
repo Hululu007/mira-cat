@@ -1,16 +1,22 @@
 import req from '../../util/req.js';
 
-// 七猫短剧 https://7maoduanju.com —— JSON API 短剧站（由用户提供的 VIP.py 移植）
-// 2026-11-05 修复：代码与站方 API 在 VM 侧全通（列表/线路/专题/搜索/详情/播单均 200），
-// 手机侧内容仍空，属手机网络到站方 API 不通（非代码回归：本文件自 11-02 后未改动，
-// API 同期未变）。改动：取数改三腿（直连 → www 同源 → 7mao Worker /f/ 兜底），
-// 直连失败/超时即换腿；Worker 待用户部署，未部署前行为与现在一致。
-// 分类：4 个静态 + /categories 动态线路 + /topics 专题（2026-11-03 实测：线路 11 条、专题 4 个）
-// 详情 episodes 优先 seoContentUrl，否则由 mediaKey 组装 7cat-media 直链；播放直链 parse:0
+// 七猫短剧 https://7maoduanju.com —— Next.js 站（2026-11-26 重写）
+// 旧版用 /api/toc/v1（JSON API），2026-11-26 实测该路径已 404（站方改版，
+// /api/toc、/api/toc/v2、/api/drama/list 等均 404）。新版改解析站方 HTML：
+//   列表：首页 HTML 的 RSC payload 内嵌 182 部剧（id/title/coverUrl/
+//     episodeCount），直接解析，不走 API。
+//   详情：/drama/<id>/ HTML 内嵌 m3u8（7cat-media.bedfpk.cn/7cat/<key>/
+//     hls/epNN/epNN.m3u8）与 episodeId；mediaKey 从 m3u8/封面 URL 提，
+//     全集按 epUrl(key, n) 合成。实测第 3 集（站方标“需解锁”）的 m3u8
+//     也是 200 真播单，可直接播。
+//   播放：m3u8 直链 parse:0；7mao-media Worker 中转优先（媒体 host 疑似
+//     在用户网络侧被拦），Worker 不可用回落直链。
+//   搜索：站方搜索页是空壳（结果由 JS 另取，HTML 只剩“无相关结果”），
+//     改为首页 182 部剧按标题关键字过滤。
+// 分类：静态 4 类（热门/最新/全部/愿望榜）；站方分类页 308 跳到异域
+// （jw056.aws-yuanj.com），不跟跳，统一用首页数据分页。
 const HOST = 'https://7maoduanju.com';
-const API = HOST + '/api/toc/v1';
-// 取数三腿：主站直连 → www 同源（实测同后端、同数据）→ Worker 兜底。
-// Worker 待用户部署：https://7mao-fetch.li768435813.workers.dev（根回 7mao fetch ok），未部署前该腿失败即跳过。
+// 取数三腿：主站直连 → www 同源 → Worker 兜底（7mao-fetch /f/，b64url 编码目标 URL）。
 const API_HOSTS = [HOST, 'https://www.7maoduanju.com'];
 const FETCH_WORKER = 'https://7mao-fetch.li768435813.workers.dev';
 const B64T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
@@ -54,55 +60,67 @@ const SORT_FILTER = [{ key: 'sort', name: '排序', value: [{ n: '最热', v: 'h
 function hdr() {
   return {
     'User-Agent': UA,
-    'Accept': 'application/json,text/plain,*/*',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Referer': HOST + '/',
   };
 }
 
-// 拒收 CF/Worker 的 JSON 错误信封（如未部署 Worker 时的 404 {"type":"https://developers.cloudflare.com/...",
-// "title":"Error 1042: Cloudflare Error"}——它能 JSON.parse 成功，须按失败处理，否则详情会把错误标题当剧名。
-function apiJsonOk(d, status) {
-  if (typeof status === 'number' && (status < 200 || status >= 300)) return false;
-  if (d && typeof d === 'object' && typeof d.type === 'string' && d.type.indexOf('http') === 0) return false;
-  return true;
-}
-
-async function apiOnce(url, timeoutMs) {
+// 取 HTML：主站直连（8s）→ www 同源（8s）→ Worker 兜底（10s）。
+async function fetchHtmlOnce(url, timeoutMs) {
   try {
-    const r = await req.get(url, { headers: hdr(), timeout: timeoutMs || 8000 });
-    const d = r.data;
-    let out = null;
-    if (typeof d === 'string') {
-      try { out = JSON.parse(d); } catch (e) { return null; }
-    } else {
-      out = d;
-    }
-    if (!apiJsonOk(out, r.status)) return null;
-    return out;
-  } catch (e) { return null; }
+    const r = await req.get(url, { headers: hdr(), timeout: timeoutMs || 8000, responseType: 'text', transformResponse: [(d) => d] });
+    if (r && r.status === 200 && typeof r.data === 'string' && r.data.length > 1000) return r.data;
+  } catch (e) { /* 下一腿 */ }
+  return '';
 }
-
-// 三腿取数：主站直连（8s）→ www 同源（8s）→ Worker 兜底（10s）；
-// 任一腿返回合法 JSON 即停；全失败返回 null（上层按空列表处理，与现在一致）。
-async function api(path) {
+async function fetchHtml(path) {
   for (const h of API_HOSTS) {
-    const d = await apiOnce(h + '/api/toc/v1' + path, 8000);
-    if (d !== null && d !== undefined) return d;
+    const d = await fetchHtmlOnce(h + path, 8000);
+    if (d) return d;
   }
-  const w = await apiOnce(viaWorker(API + path), 10000);
-  if (w !== null && w !== undefined) return w;
-  return null;
+  const w = await fetchHtmlOnce(viaWorker(HOST + path), 10000);
+  if (w) return w;
+  return '';
 }
 
-// 2026-11-16：约 9% 的封面 URL 含 %XX 编码中文文件名（covers/<id>/<id>-<中文名>.jpg|png）。
-// App 侧图片加载器疑似对 %XX 再编码一次（%→%25）致 404，造成“有的出有的不出”。
-// 这里把 %XX 解回原文字符交 App 编码一次；decodeURI 不动 %2F/%3F 等保留字符，
-// 解失败回原串。非编码封面不受影响。
+function t(v) {
+  return String(v == null ? '' : v).trim();
+}
+
+// 2026-11-16：约 9% 的封面 URL 含 %XX 编码中文文件名。App 侧图片加载器
+// 疑似对 %XX 再编码一次（%→%25）致 404，造成“有的出有的不出”。
+// 这里把 %XX 解回原文字符交 App 编码一次；解失败回原串。
 function decodePic(u) {
   const s = String(u || '').trim();
   if (!s || s.indexOf('%') < 0) return s;
   try { return decodeURI(s); } catch (e) { return s; }
+}
+
+// 解析 RSC payload 里的剧条目：两种结构——
+//   精选横幅：{\"dramaId\":\"<uuid>\",\"title\":\"...\",\"coverUrl\":\"...\"}
+//   列表项：{\"id\":\"<uuid>\",\"title\":\"...\",\"coverUrl\":\"...\",\"episodeCount\":N}
+// 按 id/dramaId 定位，取 900 字符窗口，先反转义（\"→"）再用普通正则提
+// title/coverUrl/episodeCount（直接在转义文本上匹配标题会把 \" 当转义
+// 字符吞掉整个对象）。
+function parseDramas(html) {
+  const out = [];
+  const seen = {};
+  const h = String(html || '');
+  const re = /\\"(?:id|dramaId)\\":\\"([0-9a-f-]{36})\\"/g;
+  let m;
+  while ((m = re.exec(h)) !== null) {
+    const id = m[1];
+    if (seen[id]) continue;
+    const win = h.slice(m.index, m.index + 900).replace(/\\\"/g, '"').replace(/\\\\/g, '\\');
+    const tm = win.match(/"title":"([^"]*)"/);
+    const cm = win.match(/"coverUrl":"([^"]*)"/);
+    if (!tm || !cm) continue;
+    const em = win.match(/"episodeCount":(\d+)/);
+    seen[id] = 1;
+    out.push({ dramaId: id, title: tm[1], coverUrl: cm[1], episodeCount: em ? parseInt(em[1], 10) : 0 });
+  }
+  return out;
 }
 
 function vod(j) {
@@ -136,109 +154,39 @@ function pageOf(arr, page) {
   return { page, pagecount, limit: PAGE, total: list.length, list: vodList(slice) };
 }
 
+let homeCache = null;
+let homeCacheAt = 0;
+async function homeDramas() {
+  const now = Date.now();
+  if (homeCache && now - homeCacheAt < 10 * 60 * 1000) return homeCache;
+  const html = await fetchHtml('/');
+  const arr = parseDramas(html);
+  if (arr.length) { homeCache = arr; homeCacheAt = now; }
+  return arr;
+}
+
 async function home() {
   const classes = STATIC_CATS.slice();
   const filters = { all: SORT_FILTER, new: SORT_FILTER, rank: SORT_FILTER };
-  try {
-    const cats = await api('/categories');
-    const kept = (Array.isArray(cats) ? cats : [])
-      .filter((j) => j && j.status === 'active' && j.name)
-      .sort((a, b) => (parseInt(a.sortOrder || 99, 10) - parseInt(b.sortOrder || 99, 10)));
-    for (const ln of kept) {
-      classes.push({ type_id: 'line|' + ln.id, type_name: ln.name });
-      filters['line|' + ln.id] = SORT_FILTER;
-    }
-    const tp = await api('/topics');
-    const tarr = Array.isArray(tp) ? tp : [];
-    for (const t of tarr) {
-      if (t && t.id) classes.push({ type_id: 'topic|' + t.id, type_name: t.name || t.title || '专题' });
-    }
-  } catch (e) { /* 静态分类兜底 */ }
-  let list = [];
-  try {
-    const h = await api('/home');
-    const blocks = h && Array.isArray(h.blocks) ? h.blocks : [];
-    const seen = new Set();
-    for (const blk of blocks) {
-      if (!blk || !Array.isArray(blk.items)) continue;
-      for (const it of blk.items) {
-        if (list.length >= 20) break;
-        const id = it.id || it.dramaId;
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        const v = vod(it);
-        if (v) list.push(v);
-      }
-      if (list.length >= 20) break;
-    }
-  } catch (e) { list = []; }
-  return { class: classes, filters, list };
+  const list = vodList(await homeDramas());
+  return { class: classes, filters, list: list.slice(0, 20) };
 }
 
 async function category(reqIn) {
   const body = reqIn?.body || {};
-  const tid = String(Array.isArray(body.id) ? body.id[0] : body.id || body.tid || 'all');
   const page = Math.max(1, parseInt(body.page, 10) || 1);
-  const extend = body.filters || body.extend || {};
-  const sort = extend.sort || 'hot';
-  try {
-    if (tid === 'wish') {
-      const arr = await api('/ranks/wish');
-      return pageOf(arr, page);
-    }
-    if (tid.startsWith('topic|')) {
-      const tp = await api('/topics');
-      const tarr = Array.isArray(tp) ? tp : [];
-      const t = tarr.find((x) => x && x.id === tid.slice(6));
-      return pageOf(t && Array.isArray(t.dramas) ? t.dramas : [], page);
-    }
-    const sv = (sort === 'latest') ? 'latest' : 'hot';
-    let path = '/browse?offset=' + ((page - 1) * PAGE) + '&limit=' + PAGE;
-    if (tid === 'new') path += '&sort=latest';
-    else if (tid.startsWith('line|')) path += '&line=' + encodeURIComponent(tid.slice(5)) + '&sort=' + sv;
-    else path += '&sort=' + sv;
-    const obj = await api(path);
-    if (!obj) return { page, pagecount: page, limit: PAGE, total: 0, list: [] };
-    const items = Array.isArray(obj.items) ? obj.items : [];
-    const total = parseInt(obj.total || 0, 10) || 0;
-    const hasMore = !!obj.hasMore;
-    let pagecount = total > 0 ? Math.ceil(total / PAGE) : (hasMore ? page + 1 : page);
-    if (pagecount < page) pagecount = page;
-    return { page, pagecount, limit: PAGE, total: total > 0 ? total : page * PAGE, list: vodList(items) };
-  } catch (e) {
-    return { page, pagecount: page, limit: PAGE, total: 0, list: [] };
-  }
+  const arr = await homeDramas();
+  return pageOf(arr, page);
 }
 
-function mediaKey(eps) {
-  for (const ep of eps || []) {
-    const u = ep.seoContentUrl || '';
-    const m = u.match(/\/7cat\/([^/]+)\/hls\//);
-    if (m) return m[1];
-  }
-  // 2026-11-16：封面已换成哈希路径（7cat-pic.bedfpk.cn/cover-compression/
-  // variants/v1/cover/<sha256>.jpg），里面没有 key，旧 cover 兜底已死，删掉。
-  // 无 seo URL 的剧（抽查 2/10，多为单集锁定剧）没有公开的 key 来源：
-  // /dramas/{id}/episodes/{epId}/play 需登录（401），封面/列表均无 key。
-  // 这类剧暂时播不了，见报告；有 key 的剧按 key 合成全集地址（已实测 m3u8 200）。
-  return '';
-}
-
-// 2026-11-16：媒体 host 7cat-media.bedfpk.cn 疑似在用户网络侧被拦（与橙果/
-// 黄果同类；javsb-relay 白名单不含该 host，回 403 Host not allowed）。
-// 播放走 7mao-media Worker（duanju91-fetch 同款清单改写+分片代理）中转，
-// 验 #EXTM3U 后才用；Worker 未部署或不可用回落直连。
-// Worker 代码见 7mao-media-worker.js（用户部署）。
-const M7_MEDIA = 'https://7mao-media.li768435813.workers.dev/';
-async function relayM3u8(m3u8Url) {
-  if (!/\.m3u8/i.test(m3u8Url)) return '';
-  try {
-    const relayUrl = M7_MEDIA + 'playlist.m3u8?u=' + encodeURIComponent(m3u8Url);
-    const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 15000 });
-    const d = res && res.data;
-    const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
-    if (text.indexOf('#EXTM3U') >= 0) return relayUrl;
-  } catch (e) {}
+// 从详情页提 mediaKey：优先 m3u8 URL（/7cat/<key>/hls/），其次封面
+// （/7cat/<key>/cover.jpg）；哈希封面（cover-compression/...）里没有 key。
+function mediaKeyFromHtml(html) {
+  const h = String(html || '');
+  let m = h.match(/\/7cat\/([0-9a-f]{20,})\/hls\//);
+  if (m) return m[1];
+  m = h.match(/\/7cat\/([0-9a-f]{20,})\/cover\.jpg/);
+  if (m) return m[1];
   return '';
 }
 
@@ -252,29 +200,61 @@ async function detail(reqIn) {
   const body = reqIn?.body || {};
   const vid = String(Array.isArray(body.id) ? body.id[0] : body.id || '').replace('qmdj:', '').trim();
   if (!vid) return { list: [] };
-  const obj = await api('/dramas/' + encodeURIComponent(vid));
-  if (!obj) return { list: [] };
-  const cover = decodePic(obj.coverUrl || '');
-  const eps = Array.isArray(obj.episodes) ? obj.episodes : [];
-  const key = mediaKey(eps);
+  const html = await fetchHtml('/drama/' + encodeURIComponent(vid) + '/');
+  if (!html) return { list: [] };
+  // 标题：优先 RSC 里的干净标题（<title> 带“短剧剧情介绍与剧集观看”后缀）
+  let name = '';
+  const dm0 = parseDramas(html);
+  const hit0 = dm0.find((x) => x.dramaId === vid);
+  if (hit0 && hit0.title) name = hit0.title;
+  if (!name) {
+    const tm = html.match(/<title>([^<]*)<\/title>/);
+    if (tm) name = t(tm[1]).replace(/《/g, '').replace(/》/g, '').replace(/短剧剧情介绍与剧集观看.*$/i, '').replace(/ - 七猫短剧.*$/i, '').replace(/\s*\|.*$/, '').trim();
+  }
+  // 封面：优先 m3u8 旁的 cover，其次 RSC coverUrl
+  let cover = '';
+  const cm = html.match(/https:\/\/7cat-pic\.bedfpk\.cn\/7cat\/[0-9a-f]+\/cover\.jpg/);
+  if (cm) cover = cm[0];
+  if (!cover) {
+    const dm = parseDramas(html);
+    const hit = dm.find((x) => x.dramaId === vid) || dm[0];
+    if (hit) cover = hit.coverUrl || '';
+  }
+  // 集数：详情页 episodeId 去重个数；无则 episodeCount；再无则 m3u8 个数
+  const epIds = {};
+  const epRe = /episodeId=([0-9a-f-]{36})/g;
+  let em;
+  while ((em = epRe.exec(html)) !== null) epIds[em[1]] = 1;
+  let count = Object.keys(epIds).length;
+  if (!count) {
+    const ecm = html.match(/\\"episodeCount\\":(\d+)/);
+    if (ecm) count = parseInt(ecm[1], 10) || 0;
+  }
+  const key = mediaKeyFromHtml(html);
   const parts = [];
-  eps.forEach((ep, i) => {
-    const n = parseInt(ep.indexNo || (i + 1), 10) || (i + 1);
-    let url = ep.seoContentUrl || '';
-    if (!url) url = epUrl(key, n);
-    if (!url) return;
-    parts.push(((ep.title || ('第' + n + '集')) + '$' + url));
-  });
-  const tags = (Array.isArray(obj.tags) ? obj.tags : []).filter(Boolean);
-  const n2 = parseInt(obj.episodeCount || 0, 10) || 0;
+  // 详情页直接给出的 m3u8（免费集）优先用原地址
+  const directM3u8 = {};
+  const mmRe = /https:\/\/7cat-media\.bedfpk\.cn\/7cat\/[0-9a-f]+\/hls\/ep(\d+)\/ep\d+\.m3u8/g;
+  let mm;
+  while ((mm = mmRe.exec(html)) !== null) {
+    const n = parseInt(mm[1], 10);
+    if (n > 0 && !directM3u8[n]) directM3u8[n] = mm[0];
+  }
+  if (!count && Object.keys(directM3u8).length) count = Math.max.apply(null, Object.keys(directM3u8).map((x) => parseInt(x, 10)));
+  for (let n = 1; n <= count; n++) {
+    const url = directM3u8[n] || epUrl(key, n);
+    if (!url) continue;
+    parts.push('第' + n + '集$' + url);
+  }
+  if (!parts.length) return { list: [] };
   return {
     list: [{
       vod_id: vid,
-      vod_name: obj.title || '',
-      vod_pic: cover,
-      vod_remarks: n2 > 0 ? ('共' + n2 + '集') : '',
-      type_name: tags.length ? tags.join(' · ') : '短剧',
-      vod_content: (tags.length ? ('分类：' + tags.join(' · ') + '\n') : '') + (obj.description || ''),
+      vod_name: name || vid,
+      vod_pic: decodePic(cover),
+      vod_remarks: count > 0 ? ('共' + count + '集') : '',
+      type_name: '短剧',
+      vod_content: name || '',
       vod_play_from: '七猫短剧',
       vod_play_url: parts.join('#'),
     }],
@@ -286,8 +266,25 @@ async function search(reqIn) {
   const kw = String(body.wd || '').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!kw || page > 1) return { list: [] };
-  const arr = await api('/search?q=' + encodeURIComponent(kw) + '&limit=50');
-  return { list: vodList(arr) };
+  const arr = await homeDramas();
+  const hit = arr.filter((j) => (j.title || '').indexOf(kw) >= 0);
+  return { list: vodList(hit) };
+}
+
+// 2026-11-16：媒体 host 7cat-media.bedfpk.cn 疑似在用户网络侧被拦。
+// 播放走 7mao-media Worker（duanju91-fetch 同款清单改写+分片代理）中转，
+// 验 #EXTM3U 后才用；Worker 未部署或不可用回落直连。
+const M7_MEDIA = 'https://7mao-media.li768435813.workers.dev/';
+async function relayM3u8(m3u8Url) {
+  if (!/\.m3u8/i.test(m3u8Url)) return '';
+  try {
+    const relayUrl = M7_MEDIA + 'playlist.m3u8?u=' + encodeURIComponent(m3u8Url);
+    const res = await req.get(relayUrl, { headers: { 'User-Agent': UA }, timeout: 15000 });
+    const d = res && res.data;
+    const text = typeof d === 'string' ? d : (d == null ? '' : String(d));
+    if (text.indexOf('#EXTM3U') >= 0) return relayUrl;
+  } catch (e) {}
+  return '';
 }
 
 async function play(reqIn) {
