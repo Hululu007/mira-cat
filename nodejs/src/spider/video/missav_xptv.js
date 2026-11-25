@@ -3,9 +3,12 @@ import * as cheerio from 'cheerio';
 
 const KEY = 'py_missav_xptv';
 const NAME = 'MissAV';
-// 源文件(XPTV)里的 site 是 https://missav.ai，但实测该域名不通(超时)，
-// 用户此前已确认可用域名为 missav.fans，此处使用可用域名
-const HOST = 'https://missav.fans';
+// 多域名容灾 (2026-11-26 用户令)：missav.live 主（用户手机直进、无验证），
+// missav.fans / missav.ai / missav.ws 备用；任一域名返回验证页/403/空
+// 时自动换下一个。missav.ai 与 missav.ws 在用户手机上会出 Cloudflare
+// 验证页（ai 是自动验证、ws 是勾选验证），蜘蛛侧按验证页特征识别并跳过。
+const HOSTS = ['https://missav.live', 'https://missav.fans', 'https://missav.ai', 'https://missav.ws'];
+let HOST = HOSTS[0];
 // HTML 抓取走 missav-fetch Worker（绕设备侧 CF 指纹拦截），未部署时回落直连
 const MISSAV_FETCH = 'https://missav-fetch.li768435813.workers.dev';
 // 清单代理走 missav-hls Worker（2026-11-23 新建）：设备侧蜘蛛 req 直取
@@ -372,19 +375,50 @@ function headers(referer) {
   return h;
 }
 
-async function getHtml(url, referer) {
-  // 先走 Worker 腿（绕设备侧 CF 指纹拦截）；Worker 未部署或返回无效时回落直连
+// 验证页判定：Cloudflare 挑战页不是真实内容，必须换域名重试。
+function isValidMissavHtml(s) {
+  if (!s) return false;
+  if (s.includes('Just a moment...')) return false;
+  if (s.includes('正在进行安全验证')) return false;
+  if (s.includes('请验证您是真人')) return false;
+  if (s.includes('challenges.cloudflare.com')) return false;
+  return s.includes('thumbnail') || s.includes('og:title');
+}
+
+// 单个 URL 取数：先走 Worker 腿（绕设备侧 CF 指纹拦截），无效时回落直连。
+async function fetchOne(url, referer) {
   try {
     const { data } = await req.get(MISSAV_FETCH + '/?u=' + encodeURIComponent(url), { timeout: 20000 });
     const s = String(data || '');
-    if (s && !s.includes('Just a moment...') && (s.includes('thumbnail') || s.includes('og:title'))) return s;
+    if (isValidMissavHtml(s)) return s;
   } catch (e) {}
   try {
     const { data } = await req.get(url, { headers: headers(referer), timeout: 20000 });
-    return String(data || '');
-  } catch (e) {
-    return '';
+    const s = String(data || '');
+    if (isValidMissavHtml(s)) return s;
+  } catch (e) {}
+  return '';
+}
+
+async function getHtml(url, referer) {
+  // 先试原 URL；无效时把同一路径换到其他域名逐个试，首个有效者胜出并记为当前 HOST。
+  const list = [];
+  const seen = new Set();
+  const push = (u) => { if (u && !seen.has(u)) { seen.add(u); list.push(u); } };
+  push(url);
+  try {
+    const u = new URL(url);
+    const path = u.pathname + (u.search || '');
+    for (const h of HOSTS) push(h + path);
+  } catch (e) {}
+  for (const cand of list) {
+    const s = await fetchOne(cand, referer);
+    if (s) {
+      try { HOST = new URL(cand).origin; } catch (e) {}
+      return s;
+    }
   }
+  return '';
 }
 
 function cleanText(s) {
@@ -611,13 +645,16 @@ async function play(reqIn) {
   const subsP = subSearchAll(subNormKey(url)).catch(() => []);
   // XPTV getPlayinfo 直接返回直链 + 请求头;此处返回给客户端
   // (2026-11-23 第十一轮：补 Origin，REX 每集带 Referer+UA+Origin 三件套)。
+  // Origin 跟详情页同源（多域名容灾后详情页可能来自 live/fans/ai/ws 任一域名）。
+  let origin = HOST;
+  if (durl) { try { origin = new URL(durl).origin; } catch (e) {} }
   return subAttach({
     parse: 0,
     url,
     header: {
       'User-Agent': UA,
       'Referer': durl || HOST + '/',
-      'Origin': HOST,
+      'Origin': origin,
     },
   }, subsP);
 }
