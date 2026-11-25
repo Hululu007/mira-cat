@@ -4,8 +4,9 @@
 // - 列表卡：<li class="Xc_home_article-si"> 内 <a href="/archives/{id}/" title="...">，
 //   <img data-src="https://pic.hdhwqx.cn/upload_01/...jpeg"> 为封面，<h2 class="title"> 为标题；
 //   每页 20 条，分类分页 /category/{slug}/{n}/。
-// - 封面注意：pic.hdhwqx.cn 直取返回的是加密密文（非 jpeg），必须走 51chigua
+// - 封面注意：pic.biacea.cn 直取返回的是加密密文（非 jpeg），必须走 51chigua
 //   解密代理（51chigua.li768435813.workers.dev/img?url=），代理后实测为正常 jpeg。
+//   （2026-11-26 前为 pic.hdhwqx.cn，现已迁移且旧 host 已死。）
 // - 详情：<h1> 为标题；播放器为 <div class="dplayer" data-config="{...}">，
 //   data-config（&quot; 转义后 JSON）里 video.url 即 m3u8 直链
 //   （如 https://op.udhhzr.cn/videos5/.../....m3u8?auth_key=...，带时效 token，
@@ -102,23 +103,22 @@ function parseDetail(html, rawId) {
       const cfg = JSON.parse(dm[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
       if (cfg && cfg.video && cfg.video.pic) {
         const p = cfg.video.pic;
-        pic = proxyPic(p.startsWith('http') ? p : 'https://pic.hdhwqx.cn' + p);
+        pic = proxyPic(p.startsWith('http') ? p : 'https://pic.biacea.cn' + p);
       }
     } catch {}
   }
-  // V2 双集: 中转组只包 .m3u8, 直连组全直链; 假线路 (无视频) 保持单源原样。
+  // V2 单集 (2026-11-26 用户令: 两条线路合为一条, 只留中转线, 直连线删除)。
+  // 2026-11-26 根因: 视频 CDN 迁移 op.udhhzr.cn→op.micgqv.cn (清单)、分片/密钥→as.mkimfs.cn,
+  // javsb-relay v2.1 白名单不放行新 host, 中转 403; 直连在用户手机侧播不了 (2026-11-14 实测)。
+  // 修法: javsb-relay 升 v2.2 (白名单加 op.micgqv.cn + as.mkimfs.cn), 本蜘蛛只留中转线。
   let playUrl = '';
   let playFrom = '91大赛';
   const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
   if (eps.length === 1) {
     // 2026-11-10：单集也显示为明确的分集“正片”，而不是一个“播放”按钮
-    playUrl = ('正片$' + wrapEp(eps[0].url)) + '$$$' + ('正片$' + eps[0].url);
-    playFrom = '91大赛·中转$$$91大赛·直连';
+    playUrl = '正片$' + wrapEp(eps[0].url);
   } else if (eps.length > 1) {
-    const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
-    const direct = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
-    playUrl = relay + '$$$' + direct;
-    playFrom = '91大赛·中转$$$91大赛·直连';
+    playUrl = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
   } else playUrl = '未找到视频源$' + rawId;
   // 2026-11-10：补集数备注，否则 App 不显示集数
   return { vod_id: rawId, vod_name: title, vod_pic: pic, vod_remarks: eps.length ? '共' + eps.length + '集' : '', vod_play_from: playFrom, vod_play_url: playUrl };
@@ -172,17 +172,16 @@ async function detail(reqIn) {
   return { list };
 }
 
-// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
-// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
-// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
-// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+// 2026-11-01 流中转 V2 (单集): 清单域名在用户手机上被拦, 中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给单集 (中转集), play 对其原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级。2026-11-26 用户令两条线路合为一条, 直连线已删, 只留中转线。
 const RELAY_M3U8 = 'https://javsb-relay.li768435813.workers.dev/m3u8?u=';
 
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
   const isVideo = /\.(m3u8|mp4)/i.test(id);
-  // V2 双线: 中转集/直连集地址原样返回 (不再包壳); 假线路 parse:1 原样。
+  // V2 单线: 中转集地址原样返回 (不再包壳); 假线路 parse:1 原样。
   return { parse: isVideo ? 0 : 1, url: id, header: H(HOST) };
 }
 

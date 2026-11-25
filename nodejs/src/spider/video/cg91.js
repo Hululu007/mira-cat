@@ -7,7 +7,8 @@
 //   标题在 <h2 class="post-card-title"> 里（含内嵌 wrap 标签需先剔除）；
 //   分类分页 /category/{slug}/{n}/，搜索 /search/{kw}/（分页 /search/{kw}/{n}/，
 //   站内 JS 也把 ?s= 转写成 /search/{kw}/）。
-// - 封面注意：pic.hdhwqx.cn 直取返回的是加密密文（与 dycg66 同一图床家族），
+// - 封面注意：pic.biacea.cn 直取返回的是加密密文（与 dycg66 同一图床家族，
+//   2026-11-26 前为 pic.hdhwqx.cn，现已迁移且旧 host 已死），
 //   必须走 51chigua 解密代理（51chigua.li768435813.workers.dev/img?url=）。
 // - 详情：<h1> 为标题；播放器为 <div class="dplayer" data-config='...'>（单引号属性，
 //   JSON 内 \/ 转义），video.url 即 m3u8 直链（带 auth_key 时效 token，详情时现取），
@@ -98,18 +99,18 @@ function extractEps(html) {
   return eps;
 }
 
-// V2 双集 (中转组只包 .m3u8, 直连组全直链; 假线路无视频时保持单源原样)。
-// 2026-11-14（用户令）：中转放第一线，直连放第二线（直连留着不删，只换顺序）。
-// 用户真机：直连一个内容都播不了，只有中转能播。2026-11-10 直连在前的原因
-// （中转冷启动致播放器时间轴不可靠）现已让位于“直连播不了”这一实测结论。
+// V2 单集 (2026-11-26 用户令: 两条线路合为一条, 只留中转线, 直连线删除)。
+// 中转集只包 .m3u8; 假线路无视频时保持单源原样。
+// 2026-11-26 根因: 视频 CDN 迁移 op.udhhzr.cn→op.micgqv.cn (清单)、分片/密钥→as.mkimfs.cn,
+// javsb-relay v2.1 白名单不放行新 host, 中转 403; 直连在用户手机侧播不了 (2026-11-14 实测)。
+// 修法: javsb-relay 升 v2.2 (白名单加 op.micgqv.cn + as.mkimfs.cn), 本蜘蛛只留中转线。
 function buildPlayUrl(eps, rawId) {
   const wrapEp = (u) => (/\.m3u8/i.test(u) ? RELAY_M3U8 + encodeURIComponent(u) : u);
   if (eps.length === 1) {
-    return { playUrl: ('播放$' + wrapEp(eps[0].url)) + '$$$' + ('播放$' + eps[0].url), playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
+    return { playUrl: '播放$' + wrapEp(eps[0].url), playFrom: '91吃瓜' };
   } else if (eps.length > 1) {
-    const direct = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + e.url).join('#');
     const relay = eps.map((e, i) => (e.name || ('第' + (i + 1) + '集')) + '$' + wrapEp(e.url)).join('#');
-    return { playUrl: relay + '$$$' + direct, playFrom: '91吃瓜·中转$$$91吃瓜·直连' };
+    return { playUrl: relay, playFrom: '91吃瓜' };
   }
   return { playUrl: '未找到视频源$' + rawId, playFrom: '91吃瓜' };
 }
@@ -222,17 +223,16 @@ async function detail(reqIn) {
   return { list };
 }
 
-// 2026-11-01 流中转 V2 (双集 + 按域名分流): 清单域名在用户手机上被拦, 但 2026-11-01 18:12
-// 实测 oolrvd 分片/密钥直连可通, 故中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
-// detail 给双集 (中转集 + 直连集), play 对两者原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
-// 只用免费额度、绝不付费升级; 中转集失效时手动切直连集保底。
+// 2026-11-01 流中转 V2 (单集): 清单域名在用户手机上被拦, 中转只改写非直连 host 的分片/密钥 (省额度), 其余直连。
+// detail 给单集 (中转集), play 对其原样返回 (包壳已移到 detail 的中转集里, 不再双重包壳)。
+// 只用免费额度、绝不付费升级。2026-11-26 用户令两条线路合为一条, 直连线已删, 只留中转线。
 const RELAY_M3U8 = 'https://javsb-relay.li768435813.workers.dev/m3u8?u=';
 
 async function play(reqIn) {
   let id = String(reqIn?.body?.id || '').trim();
   if (id.includes('$')) id = id.split('$').pop().trim();
   const isVideo = /\.(m3u8|mp4)/i.test(id);
-  // V2 双线: 中转集/直连集地址原样返回 (不再包壳); 假线路 parse:1 原样。
+  // V2 单线: 中转集地址原样返回 (不再包壳); 假线路 parse:1 原样。
   return { parse: isVideo ? 0 : 1, url: id, header: H(HOST) };
 }
 
