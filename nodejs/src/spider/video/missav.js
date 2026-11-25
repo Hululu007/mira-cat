@@ -219,9 +219,9 @@ async function detail(reqIn) {
   const eps = [];
   for (const t of tracks) {
     const label = t.res.replace('p', 'P');
-    // 每档位两条线：直链 + 中转
-    eps.push(label + '$' + detailUrl + '@@' + toDirect(t.url));
-    eps.push(label + '·中转$' + detailUrl + '@@' + toWorker(t.url));
+    // 用户 2026-11-26 令：直连几乎全部不能播，合成一条、和以前一样。
+    // 只留 missav-hls Worker 中转这一条（直链已删）；档位名不带“·中转”。
+    eps.push(label + '$' + detailUrl + '@@' + toWorker(t.url));
   }
   const vod = {
     vod_id: detailUrl,
