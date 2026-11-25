@@ -1,4 +1,4 @@
-import missav_xptv from './spider/video/missav_xptv.js';
+import missav from './spider/video/missav.js';
 import chigua51 from './spider/video/chigua51.js';
 import avdb from './spider/video/avdb.js';
 import kanav from './spider/video/kanav.js';
@@ -116,7 +116,7 @@ import javlust from './spider/video/py_javlust.js';
 import javdo from './spider/video/py_javdo.js';
 
 const spiders = [
-    missav_xptv,
+    missav,
     av123,
     chigua51,
     av01,
