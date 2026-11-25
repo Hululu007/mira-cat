@@ -127,18 +127,17 @@ function playUrlForTrack(reqIn, targetUrl, detailUrl) {
 }
 
 // 清单代理地址 (missav-hls Worker v3)：u/r 为 b64url 编码。
-// 子域主机 (如 c.surrit.mrstcdn.store) 在 Cloudflare 网络内 SSL 握手
-// 失败 (525)，Worker 取不到、只会 302 回直链；这类主机直接回直链，
-// 播放器经设备网络直取 (同 REX 3.6.6 已验证能播)。基域仍走 Worker
-// (v3 改写分片指回 Worker /seg.ts)。
+// 只有 surrit 基域 (surrit.mrstcdn.store / surrit.com) 走 Worker
+// (v3 改写 .jpeg 分片指回 Worker /seg.ts，实测清单 200 + 分片 200
+// 真 TS)。子域主机 (如 c.surrit.mrstcdn.store) 在 Cloudflare 网络内
+// SSL 握手失败 (525)，Worker 取不到、只会 302 回直链；这类主机在
+// playUrlForTrack 里走本地 /proxy/m3u8。其他 host（如 vz-*.b-cdn.net，
+// 新片托管）分片已是 .ts、Worker 白名单也不放行（403），一律直链。
 function workerProxyUrl(targetUrl, referer) {
   try {
     const hm = String(targetUrl || '').match(/^https?:\/\/([^\/]+)/i);
     const host = hm ? hm[1].toLowerCase() : '';
-    if (host && host !== 'surrit.mrstcdn.store' && host !== 'surrit.com' &&
-      (host.indexOf('.surrit.mrstcdn.store') > 0 || host.indexOf('.surrit.com') > 0)) {
-      return targetUrl;
-    }
+    if (host !== 'surrit.mrstcdn.store' && host !== 'surrit.com') return targetUrl;
     return `${MISSAV_HLS}/m3u8?u=${b64url(targetUrl)}&r=${b64url(referer || '')}`;
   } catch (e) { return ''; }
 }
@@ -569,12 +568,17 @@ async function detail(reqIn) {
   const detailUrl = absUrl(vid);
   const { info, tracks } = await getTracks(detailUrl);
   if (!info.vod_name && !tracks.length) return { list: [] };
-  // 播放地址 (2026-11-24 第十二轮，用户令)：拆掉多线路分组，回到单线
-  // 正常播放——每档分辨率只给一个地址，不再分“本地代理/直连”两组。
-  // 地址直接用详情页 packed JS 的 surrit 直链（REX 同款直链，站方未换
-  // 址：missav.fans + c.surrit.mrstcdn.store 已复核）；play() 按
-  // py_mogu 格式 `名字$详情页@@播单地址` 拆出详情页当 Referer。
-  // 探针已删（用户反馈详情页小字被挡、看不到）。
+  // 播放地址 (2026-11-26 第十三轮)：仍是单线（用户 2026-11-24 令拆掉
+  // 多线路分组，不再分“本地代理/直连”两组），但单线地址必须按 host
+  // 走代理，不能直接给 packed JS 直链——surrit 分片是 TS 内容却用
+  // videoN.jpeg 文件名，MiraPlayer 的 ffmpeg 按扩展名白名单直接拒
+  // .jpeg 分片，致无码流出（全 c.surrit）与中文字幕（全 surrit 基域）
+  // 等分类全部无法播放；只有 b-cdn 新片（分片已是 .ts）能直连播。
+  // 故每档只给一个地址，按 playUrlForTrack 分流：子域走本地
+  // /proxy/m3u8（设备本机拉清单、分片改写为 .ts）、基域走 missav-hls
+  // Worker v3（改写分片指回 Worker /seg.ts，实测清单 200 + 分片
+  // 200 真 TS）、b-cdn 等其他 host 直链。play() 按 py_mogu 格式
+  // `名字$详情页@@播单地址` 拆出详情页当 Referer。
   const vod = {
     vod_id: detailUrl,
     vod_name: info.vod_name || detailUrl,
@@ -582,7 +586,7 @@ async function detail(reqIn) {
     vod_remarks: info.vod_remarks,
     vod_content: info.vod_content,
     vod_play_from: NAME,
-    vod_play_url: tracks.map((t) => `${t.name}$${detailUrl}@@${t.url}`).join('#'),
+    vod_play_url: tracks.map((t) => `${t.name}$${detailUrl}@@${playUrlForTrack(reqIn, t.url, detailUrl)}`).join('#'),
   };
   if (vod.vod_name && vod.vod_play_url) subRegister(ids, vod);
   return { list: [vod] };
@@ -1103,9 +1107,13 @@ export default function spider() {
       fastify.post('/detail', detail);
       fastify.post('/play', play);
       fastify.post('/search', search);
-      // (2026-11-24 第十二轮，用户令拆代理)：本地 /proxy/* 代理路由已摘，
-      // 不再走本地代理；m3u8Proxy/fetchBytes/rewriteMissavM3u8 等函数留
-      // 在文件内备查，不再被调用。
+      // m3u8 代理 (GET，2026-11-26 第十三轮恢复)：清单与分片共用同一
+      // 入口 (同 py_mogu/py_siguaspw 已验证写法)：查询串 /proxy/m3u8?u=&r=
+      // 走清单，分片走路径段 /proxy/<b64url>/<b64url>.ts (末尾 .ts 过
+      // ffmpeg 白名单)。2026-11-24 拆代理时摘掉路由致 c.surrit 片全灭，
+      // 本轮只恢复单线代理（仍是一条线，不分组），不恢复直连线。
+      fastify.get('/proxy/*', m3u8Proxy);
+      fastify.get('/proxy/m3u8', m3u8Proxy);
     },
   };
 }
