@@ -205,9 +205,12 @@ function unpackPacker(packed) {
   });
 }
 
-// 从详情 HTML 的 packed JS 解出 surrit 直链，返回 [{name:'1080p',url},...]。
+// 从详情 HTML 的 packed JS 解出视频直链，返回 [{name:'1080p',url},...]。
 // name 由 URL path 取 (/1080p/ /720p/ /480p/ /360p/)，master 为 playlist.m3u8。
 // source1280 实际指 720p 时 (无 1080p 的片) 按 path 归 720p 并去重。
+// 2026-11-26：host 不限 surrit——站方按片迁移，新片在 vz-*.b-cdn.net，
+// 部分片在 c.surrit.mrstcdn.store；旧写法只留 surrit 会把新片的直链
+// 全扔掉，getTracks 只能回落到写死 host 拼出的 403 地址，全部无法播放。
 function extractPackedUrls(html) {
   const out = [];
   if (!html) return out;
@@ -220,7 +223,6 @@ function extractPackedUrls(html) {
     const urls = unpacked.match(/https?:\/\/[^\s'"<>]+\.m3u8/g) || [];
     for (const raw of urls) {
       const url = String(raw).replace(/\\+$/g, '');
-      if (!/surrit/i.test(url)) continue;
       if (seen.has(url)) continue;
       seen.add(url);
       const rm = url.match(/\/(1080p|720p|480p|360p)\/video\.m3u8/i);
