@@ -90,13 +90,23 @@ function unwrap(d) {
 }
 
 const IMG_WORKER_51 = 'https://51chigua.li768435813.workers.dev';
+// 封面缩图：解密后的原图是 1280x521 PNG、约 722KB，一屏 12 张近 9MB、
+// 每张经代理约 2s，用户报“加载得很慢”。走 weserv 缩到 400px、
+// q75、转 JPG，实测 722KB -> 约 11KB（400x163），加载立刻变快。
+// （weserv 链已实测：51chigua(解密) -> weserv(缩图) 回 200 真 JPG；
+//  注意 weserv 的 url 参数必须是对整条代理 URL 做一次 encodeURIComponent，
+//  内层 pic URL 的 %3A/%2F 会被二次编码成 %253A/%252F，这是对的。）
+function shrinkCover(u) {
+  if (!u) return '';
+  return 'https://images.weserv.nl/?url=' + encodeURIComponent(u) + '&w=400&q=75&output=jpg';
+}
 function proxiedCover(url) {
   url = t(url);
   if (!url) return '';
   // pic.sugfew.cn 与 pic.jtzatly.cn 的图是 AES-128-CBC 加密存储
   // （与 818/91 同手法）：直连拿到的是密文、App 解不出图，必须走解密 Worker 出图。
   if (/pic\.sugfew\.cn|pic\.jtzatly\.cn/i.test(url)) {
-    return IMG_WORKER + '/img?url=' + encodeURIComponent(url);
+    return shrinkCover(IMG_WORKER + '/img?url=' + encodeURIComponent(url));
   }
   // 2026-10-29 诊断坐实：封面主力域名已迁到 pic.nihmcl.cn（分类 24/24），
   // 直连同样是加密密文（非 JPEG 魔数）；且现行 bagua 代理对该域回 400，
@@ -107,7 +117,7 @@ function proxiedCover(url) {
   // videoRank 24/24），直连是密文（首字节 dde28c47、1,381,632B），bagua 代理回 400，
   // 51chigua 代理实测出真 PNG（89504e47）；hdhwqx/nihmcl 保留（防回迁）。
   if (/pic\.nihmcl\.cn|pic\.hdhwqx\.cn|pic\.biacea\.cn/i.test(url)) {
-    return IMG_WORKER_51 + '/img?url=' + encodeURIComponent(url);
+    return shrinkCover(IMG_WORKER_51 + '/img?url=' + encodeURIComponent(url));
   }
   // 其余主机（如 imgpublic.ycomesc.live）是明文图，直连即可；
   // 原 wulii 出图代理已失效（实测 500），不再走它。

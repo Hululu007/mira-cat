@@ -97,6 +97,37 @@ function decodePic(u) {
   try { return decodeURI(s); } catch (e) { return s; }
 }
 
+// 封面修法（与 REX 1.0.9 同款，已在 REX 侧实测能出图）：
+//   ① 首页 RSC 的 coverUrl 是 /cover-compression/variants/v1/cover/<hash>
+//     （720x960、122KB），设备侧拉不到（站方 S3 对该路径回 403）；
+//      同图 /rank/ 路径（240x320、27KB）能出，改写过去；
+//   ② 再走 weserv 缩到 400px、q75、转 JPG，封面变小加载快。
+//   ③ /7cat/<key>/cover.jpg 直链不动，只包 weserv。
+function fixCover(u) {
+  let s = decodePic(u);
+  if (!s) return '';
+  s = s.replace(/\/cover-compression\/variants\/v1\/cover\//, '/cover-compression/variants/v1/rank/');
+  return 'https://images.weserv.nl/?url=' + encodeURIComponent(s) + '&w=400&q=75&output=jpg';
+}
+
+// 分类页映射（站方真有独立分类页，各 18 条/页、?page=N 翻页，
+//   标题互不相同——此前 category 忽略分类 id、一律回首页列表，
+//   致 4 个分类内容完全一样）：
+//   rank 热门榜 -> /category/热播短剧/ ；new 最新上线 -> /category/最新上线/ ；
+//   wish 魔改愿望榜 -> /category/魔改短剧/ ；all 全部短剧 -> 首页（182 部）。
+const CAT_PATH = {
+  rank: '/category/' + encodeURIComponent('热播短剧') + '/',
+  new: '/category/' + encodeURIComponent('最新上线') + '/',
+  wish: '/category/' + encodeURIComponent('魔改短剧') + '/',
+};
+async function catDramas(catId, page) {
+  const path = CAT_PATH[catId];
+  if (!path) return null;
+  const html = await fetchHtml(path + '?page=' + page);
+  if (!html) return [];
+  return parseDramas(html);
+}
+
 // 解析 RSC payload 里的剧条目：两种结构——
 //   精选横幅：{\"dramaId\":\"<uuid>\",\"title\":\"...\",\"coverUrl\":\"...\"}
 //   列表项：{\"id\":\"<uuid>\",\"title\":\"...\",\"coverUrl\":\"...\",\"episodeCount\":N}
@@ -129,7 +160,7 @@ function vod(j) {
   return {
     vod_id: j.dramaId || j.id || '',
     vod_name: j.title || '',
-    vod_pic: decodePic(j.coverUrl || ''),
+    vod_pic: fixCover(j.coverUrl || ''),
     vod_remarks: n > 0 ? ('共' + n + '集') : '',
     type_name: (Array.isArray(j.tags) && j.tags.length) ? j.tags.join(' · ') : '短剧',
   };
@@ -175,6 +206,16 @@ async function home() {
 async function category(reqIn) {
   const body = reqIn?.body || {};
   const page = Math.max(1, parseInt(body.page, 10) || 1);
+  const catId = String(body.id || body.type_id || '').trim();
+  // rank/new/wish 走各自的站方分类页（?page=N），不再回首页列表；
+  // all（或未指明）仍回首页 182 部。
+  if (CAT_PATH[catId]) {
+    const arr = await catDramas(catId, page);
+    if (!arr || !arr.length) return { page, pagecount: page, limit: PAGE, total: 0, list: [] };
+    // 分类页每页 18 条；满 18 条即假定还有下一页，否则本页就是末页。
+    const pagecount = arr.length >= 18 ? page + 1 : page;
+    return { page, pagecount, limit: PAGE, total: arr.length, list: vodList(arr) };
+  }
   const arr = await homeDramas();
   return pageOf(arr, page);
 }
@@ -251,7 +292,7 @@ async function detail(reqIn) {
     list: [{
       vod_id: vid,
       vod_name: name || vid,
-      vod_pic: decodePic(cover),
+      vod_pic: fixCover(cover),
       vod_remarks: count > 0 ? ('共' + count + '集') : '',
       type_name: '短剧',
       vod_content: name || '',
