@@ -21,6 +21,19 @@ import * as cheerio from 'cheerio';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const HOSTS = ['https://cn.pornhub.com', 'https://www.pornhub.com'];
 const PRIMARY = HOSTS[0];
+const WORKER = 'https://pornhub-fetch.li768435813.workers.dev';
+// 封面代理（2026-11-26 实测根因）：站方封面 CDN *.phncdn.com 要求 Referer，
+// 无 Referer 直接 403；App 拉封面不带 Referer，致大量封面加载不出。
+// pornhub-fetch Worker v2 已放行 *.phncdn.com 并代取时补 Referer，
+// 封面一律走 Worker 代理；非 phncdn 的图直出。
+function proxyCover(u) {
+  const s = String(u || '');
+  if (!s) return s;
+  if (/^https:\/\/[a-z0-9-]+\.phncdn\.com\//i.test(s)) {
+    return WORKER + '/?u=' + encodeURIComponent(s);
+  }
+  return s;
+}
 
 function t(v) { return String(v == null ? '' : v).trim(); }
 function clean(s) {
@@ -400,6 +413,8 @@ function subWarm(durl) {
 
 
 const CATEGORIES = [
+  { type_id: 'hm', type_name: '热门模特' },
+  { type_id: 'c4', type_name: '肥臀' },
   { type_id: 'sy', type_name: 'Home' },
   { type_id: 'cm', type_name: 'Newest' },
   { type_id: 'mv', type_name: 'Most Viewed' },
@@ -416,6 +431,16 @@ const CATEGORIES = [
   { type_id: 'c111', type_name: '日本人' },
   { type_id: 'c241', type_name: 'Cosplay' },
   { type_id: 'c105', type_name: '60帧' },
+];
+
+// 热门模特（2026-11-26 用户令：放列表第一位，必须有 Comatozze、candy love）
+// 模特页均为 /model/<slug>（实测 200 且有视频）；头像走 ei.phncdn.com，同样过 Worker 代理。
+// 点模特进详情：detail 识别 /model/ 路径，取该模特的视频列表当选集。
+const HOT_MODELS = [
+  { slug: 'comatozze', name: 'Comatozze', pic: 'https://ei.phncdn.com/pics/users/0024/5807/0141/avatar95302765/(m=ewILGCjadOf)(mh=n7tIeIoHniVFwhIe)200x200.jpg' },
+  { slug: 'candy-love', name: 'candy love', pic: 'https://ei.phncdn.com/pics/users/723/631/591/avatar1583837616/(m=ewILGCjadOf)(mh=Q6WMtzphnpbtDqca)200x200.jpg' },
+  { slug: 'sweetie-fox', name: 'Sweetie Fox', pic: 'https://ei.phncdn.com/(m=ewILGCjadOf)(mh=59qrk8LnBE3Z9kTL)43ca43da-b27e-42f2-b237-40c5c13261b1.jpg' },
+  { slug: 'luna-okko', name: 'Luna Okko', pic: 'https://ei.phncdn.com/(m=bLWsSeKlbyaT)(mh=NBdZQmk08L2jXYNt)3afe1458-bed9-4395-893e-2ee8d4bbe70f.jpg' },
 ];
 
 function categoryPath(id, page) {
@@ -476,7 +501,7 @@ function parseList(html) {
     const duration = $el.find('.duration').text().trim() || '';
     // vod_id 为空的卡片点开必失败，直接丢弃，不让它进列表
     if (href && (name || pic)) {
-      list.push({ vod_id: href, vod_name: name, vod_pic: pic, vod_remarks: remarks, vod_duration: duration });
+      list.push({ vod_id: href, vod_name: name, vod_pic: proxyCover(pic), vod_remarks: remarks, vod_duration: duration });
     }
   });
   return list;
@@ -563,6 +588,16 @@ async function category(e) {
   const id = String(e.body.id || 'sy');
   let page = parseInt(e.body.page, 10) || 1;
   if (page < 1) page = 1;
+  // 热门模特：固定模特列表（不翻页），点模特进详情看该模特的全部视频
+  if (id === 'hm') {
+    const list = HOT_MODELS.map((m) => ({
+      vod_id: '/model/' + m.slug,
+      vod_name: m.name,
+      vod_pic: proxyCover(m.pic),
+      vod_remarks: '模特',
+    }));
+    return { page: 1, pagecount: 1, list, filter: [] };
+  }
   const html = await fetchHtml(categoryPath(id, page), 'list');
   const list = html ? parseList(html) : [];
   return { page, pagecount: list.length < 20 ? page : page + 1, list, filter: [] };
@@ -585,6 +620,24 @@ async function detail(e) {
   const id = String(e.body.id || '');
   if (!id) return { list: [] };
   const path = normalizePath(id);
+  // 模特页：取该模特的视频列表当选集（集 URL 为视频详情页，play 时现取 m3u8）
+  if (/\/model\/[a-z0-9-]+/i.test(path)) {
+    const html = await fetchHtml(path, 'list');
+    if (!html) return { list: [] };
+    const vids = parseList(html);
+    if (!vids.length) return { list: [] };
+    const $ = cheerio.load(html);
+    const mname = $('h1').first().text().trim()
+      || $('meta[property="og:title"]').attr('content')
+      || path.split('/').pop()
+      || '模特';
+    const mpic = proxyCover($('meta[property="og:image"]').attr('content') || '');
+    const eps = vids.map((v) => {
+      const vurl = /^https?:\/\//.test(v.vod_id) ? v.vod_id : PRIMARY + (v.vod_id.startsWith('/') ? v.vod_id : '/' + v.vod_id);
+      return (v.vod_name || vurl) + '$' + vurl;
+    }).join('#');
+    return { list: [{ vod_id: id, vod_name: mname, vod_pic: mpic, vod_play_from: 'Pornhub', vod_play_url: eps }] };
+  }
   let lastPlayUrl = '';
   let lastName = '';
   let lastPic = '';
@@ -599,7 +652,7 @@ async function detail(e) {
       || $('h1').first().text().trim()
       || $('title').text().trim()
       || '';
-    lastPic = $('meta[property="og:image"]').attr('content') || '';
+    lastPic = proxyCover($('meta[property="og:image"]').attr('content') || '');
     lastPlayUrl = playUrl;
     const topUrl = playUrl.split('#')[0].split('$').pop() || '';
     const verdict = topUrl ? await verifyLive(topUrl) : 'dead';
@@ -615,15 +668,22 @@ async function detail(e) {
 async function play(e) {
   const id = String(e.body.id || '');
   let url = '';
+  let pageUrl = '';
   if (id.includes('$')) {
     // 选集串（单集或整串）：取第一集，详情已按清晰度降序排，第一集即最高清晰度
     url = (id.split('#')[0].split('$').pop() || '');
   } else if (/^https?:\/\//.test(id)) {
     url = id;
   }
-  if (!url && id) {
+  // 模特选集的集 URL 是视频详情页（view_video.php），不是直链：不能直接播，
+  // 记下它、清空 url，落到下面的 vod_id 分支现取详情拿 m3u8（m3u8 直链才直接播）
+  if (url && /view_video\.php/i.test(url) && !/\.m3u8/i.test(url)) {
+    pageUrl = url;
+    url = '';
+  }
+  if (!url && (pageUrl || id)) {
     // App 若直接传了 vod_id（/view_video.php?viewkey=...），现取详情拿最高清晰度
-    const html = await fetchHtml(normalizePath(id), 'detail');
+    const html = await fetchHtml(normalizePath(pageUrl || id), 'detail');
     if (html) {
       const eps = buildEpisodes(extractMediaDefs(html));
       if (eps) {
