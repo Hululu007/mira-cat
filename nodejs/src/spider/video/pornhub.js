@@ -434,13 +434,16 @@ const CATEGORIES = [
 ];
 
 // 热门模特（2026-11-26 用户令重做：分类下默认显示 Comatozze，
-// 子分类为 15 张模特小卡片，点卡片显示对应模特本人的内容，从新到旧）。
+// 子分类为 16 张模特小卡片，点卡片显示对应模特本人的内容，从新到旧）。
 // 模特页均为 /model/<slug>（实测 200 且有自己的视频分区）。
-// nana_taipei 与 fantasy babe 的模特页无视频分区（找不到本人内容），
-// 按用户授权改由 Sweetie Fox（30 条）、Luna Okko（32 条）替补。
+// nana_taipei 的正确 slug 是 nana_taipei（下划线）：/model/nana-taipei
+// （连字符）是空页，/model/nana_taipei 才是本人页，30 条；
+// fantasy babe 的模特页无视频分区，按用户授权由 Sweetie Fox（30 条）、
+// Luna Okko（32 条）替补。
 const HOT_MODELS = [
   { slug: 'comatozze', name: 'Comatozze' },
   { slug: 'candy-love', name: 'candy love' },
+  { slug: 'nana_taipei', name: 'nana taipei' },
   { slug: 'sweetie-fox', name: 'Sweetie Fox' },
   { slug: 'shinaryen', name: 'shinaryen' },
   { slug: 'anastangel', name: 'anastangel' },
@@ -673,8 +676,12 @@ async function category(e) {
     if (!HOT_MODELS.some((m) => m.slug === model)) model = 'comatozze';
     const html = await fetchHtml('/model/' + model, 'list');
     const list = parseModelList(html);
-    // 模特页无翻页链接，只有一页内容
-    return { page: 1, pagecount: 1, list, filter: [] };
+    // 模特页无翻页链接，只有一页内容。
+    // 注意：category 回包里不要带 filter 字段——筛选卡片只由 home() 下发，
+    // App 点卡片后靠 home() 的 filter 续显；上一版回 filter: [] 等于
+    // 告诉 App“本分类无筛选”，卡片一点就消失且不再回来（5LXTV 同款做法：
+    // category 只回 page/pagecount/list，不带 filter）。
+    return { page: 1, pagecount: 1, list };
   }
   const html = await fetchHtml(categoryPath(id, page), 'list');
   let list = html ? parseList(html) : [];
@@ -682,7 +689,7 @@ async function category(e) {
     // HTML 取不到（newest 在设备侧空的根因未明），回落 webmasters JSON API
     list = await fetchApiList(id, page);
   }
-  return { page, pagecount: list.length < 20 ? page : page + 1, list, filter: [] };
+  return { page, pagecount: list.length < 20 ? page : page + 1, list };
 }
 
 // 验最高清晰度 master.m3u8 是否存活：'live' | 'dead' | 'unknown'（网络不通）
