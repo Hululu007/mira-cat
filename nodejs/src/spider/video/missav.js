@@ -259,15 +259,10 @@ async function detail(reqIn) {
   for (const t of tracks) {
     const label = t.res.replace('p', 'P');
     // 用户 2026-11-26 令：直连几乎全部不能播，合成一条、和以前一样。
-<<<<<<< Updated upstream
-    // 只留 missav-hls Worker 中转这一条（直链已删）；档位名不带“·中转”。
-    eps.push(label + '$' + detailUrl + '@@' + toWorker(t.url));
-=======
     // 每档位只留一条：surrit（fans）走 missav-hls 中转；
     // 非 surrit（live）走直链（手机能直达 live 的视频 host）。
     // 档位名不带“·中转”。
     eps.push(label + '$' + detailUrl + '@@' + playUrlFor(t.url));
->>>>>>> Stashed changes
   }
   const vod = {
     vod_id: detailUrl,
