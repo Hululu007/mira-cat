@@ -200,13 +200,14 @@ function toWorker(url) {
   return MISSAV_HLS + '/m3u8?u=' + encodeURIComponent(url);
 }
 
-// 播放地址：surrit host（fans 的片）走 missav-hls 中转；
-// 非 surrit host（live 的片，手机浏览器能直播、说明手机能直达该 host）
-// 走直链——missav-hls 白名单只认 surrit，包 live 的地址会回 403。
+// 播放地址：统一走 missav-hls 中转（用户 2026-11-26 08:13 令：
+// “live 的你也还是走中转吧，我手机开着 vpn 测的，fans 也是开着 vpn
+// 测的！直连大概率不行”——用户在手机浏览器上测 live/fans 都是开着
+// VPN 的，直连大概率不行，所以 live 的片也走中转，不走直链）。
+// 注意：missav-hls 白名单只认 surrit，live 的视频 host 须先加进白名单
+// 才能走通（见 Worker 源码）；未加之前 live 线会回 403。
 function playUrlFor(url) {
-  const u = String(url || '');
-  if (/^https:\/\/(c\.)?surrit\.mrstcdn\.store\//i.test(u) || /^https:\/\/surrit\.com\//i.test(u)) return toWorker(u);
-  return u;
+  return toWorker(String(url || ''));
 }
 
 // 从详情页地址反推其站 host（供播放 Referer/Origin 用）。
