@@ -433,16 +433,17 @@ const CATEGORIES = [
   { type_id: 'c105', type_name: '60帧' },
 ];
 
-// 热门模特（2026-11-26 用户令重做：分类下默认显示 Comatozze，
-// 子分类为 16 张模特小卡片，点卡片显示对应模特本人的内容，从新到旧）。
+// 热门模特（2026-11-26 用户令：删 luna okko；加 11 个，blondessa 放第 3 位）。
 // 模特页均为 /model/<slug>（实测 200 且有自己的视频分区）。
-// nana_taipei 的正确 slug 是 nana_taipei（下划线）：/model/nana-taipei
-// （连字符）是空页，/model/nana_taipei 才是本人页，30 条；
-// fantasy babe 的模特页无视频分区，按用户授权由 Sweetie Fox（30 条）、
-// Luna Okko（32 条）替补。
+// foxy lovers 的正确 slug 是 foxy_lovers（下划线）；assmazingX/AissNET 的
+// slug 全小写（assmazingx/aissnet）；wow love 与 kitty 复查有视频（首查 0 条
+// 是取页瞬时异常，复查分区内各 24 条）。
+// badcutegirl 的模特页是空的（200 但 0 条视频，本人页无内容），按用户早前
+// “找不到自行添加”的授权，由 sugary-kitty（34 条）替补。
 const HOT_MODELS = [
   { slug: 'comatozze', name: 'Comatozze' },
   { slug: 'candy-love', name: 'candy love' },
+  { slug: 'blondessa', name: 'blondessa' },
   { slug: 'nana_taipei', name: 'nana taipei' },
   { slug: 'sweetie-fox', name: 'Sweetie Fox' },
   { slug: 'shinaryen', name: 'shinaryen' },
@@ -451,12 +452,21 @@ const HOT_MODELS = [
   { slug: 'mia-malkova', name: 'mia malkova' },
   { slug: 'mini-diva', name: 'mini diva' },
   { slug: 'savannah-bond', name: 'Savannah Bond' },
-  { slug: 'luna-okko', name: 'Luna Okko' },
   { slug: 'ailish', name: 'Ailish' },
   { slug: 'behind-layla', name: 'behind layla' },
   { slug: 'misty-queen', name: 'misty queen' },
   { slug: 'alicia-delicia', name: 'alicia delicia' },
   { slug: 'martinpaola', name: 'MartinPaola' },
+  { slug: 'julie-jess', name: 'julie jess' },
+  { slug: 'foxy_lovers', name: 'foxy lovers' },
+  { slug: 'assmazingx', name: 'assmazingX' },
+  { slug: 'layla-ray', name: 'layla ray' },
+  { slug: 'aissnet', name: 'AissNET' },
+  { slug: 'sweet-amateur-dreams', name: 'sweet amateur dreams' },
+  { slug: 'sugary-kitty', name: 'sugary kitty' },
+  { slug: 'wow-love', name: 'wow love' },
+  { slug: 'kitty', name: 'kitty' },
+  { slug: 'bbwthaixxx', name: 'bbwthaixxx' },
 ];
 
 function categoryPath(id, page) {
