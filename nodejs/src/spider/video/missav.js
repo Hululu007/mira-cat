@@ -1,27 +1,19 @@
 // MissAV — 全新重写（2026-11-26 用户令：旧版彻底删除，不依照旧版，
 // 按 missav.fans 现站从头写。目标：修好封面、修好播放）。
-//
-// 源站：https://missav.fans（中文 /cn/）。以下结构均为 2026-11-26
-// 对真站页实测确认：
-//   分类 URL = HOST + '/' + id（如 /dm561/cn/uncensored-leak），翻页 ?page=N。
-//   列表卡片 .thumbnail：a[href]=详情页，.text-secondary=标题，
-//     img.w-full 的 data-src=封面图（.jpg），.left-1=备注，.right-1=时长。
-//     注意卡片里另有 <video data-src=preview.mp4>，封面只取 img 的 data-src。
-//   封面 host：站方在 fourhoi.mrstcdn.store 与 d.surrit.mrstcdn.store 间混用，
-//     d.surrit 设备侧打不开，同一张封面在 fourhoi 上有同一份（同路径 cover-t.jpg，
-//     实测 200 真图）-> 封面统一改写 fourhoi。这正是“有的有封面、往下拉又没”的根因。
-//   详情：og:title / og:image（cover-n.jpg，同样改写 fourhoi）/ og:description；
-//     视频地址在 packed JS（eval(function(p,a,c,k,e,d)）里，解出
-//     surrit.mrstcdn.store 的 m3u8，按真实档位出线（1080p/720p/480p…，不出“自动”）。
-//   播放：每档位两条线——c.surrit 直链（设备可达）+ missav-hls Worker 中转（基域）。
-//   搜索：/cn/search/<关键词>（路径式，?page= 翻页）。
-//   HTML 走 missav-fetch Worker（设备/VM 直连 missav.fans 会被 CF 拦）。
-// 字幕：共享字幕芯（迅雷 > 迅雷看看 > SubtitleCat），只挂有番号条目。
+// 2026-11-26 08:00 用户令：改走 missav.live 为主、missav.fans 回落。
+// 用户真机确认 live 能播 SNOS-524、且 live 与 fans 不是同一个视频服务器
+// （fans 上 SNOS-524 的 surrit 文件已删、live 上文件还在）。
+// 服务器侧（VM/Worker/代理）拉 live 全被 CF 拦，只有用户手机浏览器能进，
+// 所以蜘蛛先由 App 直连 req 试 live，取不到再回落 fans（Worker+直连）。
+// 视频地址：live 的 m3u8 若不是 surrit host，走直链（手机浏览器能播、
+// 说明手机能直达 live 的视频 host）；fans 的 surrit 地址仍走 missav-hls 中转。
+// 源站：https://missav.live 为主、https://missav.fans 回落（中文 /cn/）。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
 
 const KEY = 'py_missav';
 const NAME = 'MissAV';
+const HOST_LIVE = 'https://missav.live';
 const HOST = 'https://missav.fans';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const MISSAV_FETCH = 'https://missav-fetch.li768435813.workers.dev';
@@ -66,12 +58,13 @@ function cleanText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
 }
 
-function absUrl(u) {
+function absUrl(u, base) {
   u = String(u || '').trim();
   if (!u) return '';
   if (/^https?:\/\//i.test(u)) return u;
   if (u.startsWith('//')) return 'https:' + u;
-  return HOST + (u.startsWith('/') ? u : '/' + u);
+  const b = base || HOST;
+  return b + (u.startsWith('/') ? u : '/' + u);
 }
 
 // 封面改写：d.surrit.mrstcdn.store 设备侧打不开，同一张封面在
@@ -83,25 +76,47 @@ function fixCover(u) {
   return u.replace(/^https:\/\/d\.surrit\.mrstcdn\.store\//i, 'https://fourhoi.mrstcdn.store/');
 }
 
-// HTML 抓取：走 missav-fetch Worker（绕 CF 拦截），失败回落直连。
-async function getHtml(url) {
+// 取页：先由 App 直连 req 试 missav.live（用户手机浏览器能进 live），
+// 取不到再回落 missav.fans（先走 missav-fetch Worker、再直连）。
+// 只认真 HTML（含 .thumbnail 或 og: 或 packed eval 的）；CF 验证页
+// （含 Just a moment... / Attention Required）与空串都算失败、继续下一腿。
+// 返回 { html, host }，host 是实际出页的那个站，供详情/播放定 Referer。
+function isRealHtml(t) {
+  if (!t || typeof t !== 'string') return false;
+  if (t.includes('Just a moment...')) return false;
+  if (t.includes('Attention Required')) return false;
+  if (t.length < 1000) return false;
+  return true;
+}
+
+async function fetchPage(path) {
   const headers = { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9' };
+  const p = String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || '');
+  // ① live 直连（App req）
   try {
-    const r = await req.get(MISSAV_FETCH + '/?u=' + encodeURIComponent(url), { headers, timeout: 20000 });
+    const r = await req.get(HOST_LIVE + p, { headers, timeout: 20000 });
     const t = typeof r.data === 'string' ? r.data : '';
-    if (t && !t.includes('Just a moment...')) return t;
+    if (isRealHtml(t)) return { html: t, host: HOST_LIVE };
   } catch (e) {}
+  // ② fans 经 missav-fetch Worker
   try {
-    const r = await req.get(url, { headers, timeout: 20000 });
-    return typeof r.data === 'string' ? r.data : '';
-  } catch (e) {
-    return '';
-  }
+    const r = await req.get(MISSAV_FETCH + '/?u=' + encodeURIComponent(HOST + p), { headers, timeout: 20000 });
+    const t = typeof r.data === 'string' ? r.data : '';
+    if (isRealHtml(t)) return { html: t, host: HOST };
+  } catch (e) {}
+  // ③ fans 直连
+  try {
+    const r = await req.get(HOST + p, { headers, timeout: 20000 });
+    const t = typeof r.data === 'string' ? r.data : '';
+    if (isRealHtml(t)) return { html: t, host: HOST };
+  } catch (e) {}
+  return { html: '', host: '' };
 }
 
 // 列表解析：.thumbnail 卡片。封面只取 img.w-full 的 data-src（.jpg），
 // 卡片里另有 <video data-src=preview.mp4>，绝不能当封面。
-function parseCards(html) {
+// host 是实际出页的站（live 或 fans），相对链接按它补全。
+function parseCards(html, host) {
   const cards = [];
   if (!html || html.includes('Just a moment...')) return cards;
   const $ = cheerio.load(html);
@@ -110,11 +125,11 @@ function parseCards(html) {
     const href = el.find('a').first().attr('href') || el.find('.text-secondary').attr('href') || '';
     const title = cleanText(el.find('.text-secondary').text());
     if (!href || !title) return;
-    const cover = fixCover(absUrl(el.find('img.w-full').attr('data-src') || el.find('img').attr('data-src')));
+    const cover = fixCover(absUrl(el.find('img.w-full').attr('data-src') || el.find('img').attr('data-src'), host));
     const remarks = cleanText(el.find('.left-1').text());
     const duration = cleanText(el.find('.right-1').text());
     cards.push({
-      vod_id: absUrl(href),
+      vod_id: absUrl(href, host),
       vod_name: title,
       vod_pic: cover,
       vod_remarks: [remarks, duration].filter(Boolean).join(' '),
@@ -175,7 +190,7 @@ function extractTracks(html) {
   return out;
 }
 
-// 基域 surrit -> c.surrit 子域直链（设备可达）。
+// 基域 surrit -> c.surrit 子域直链（设备可达）。现已不用（合线后只留中转），保留备用。
 function toDirect(url) {
   return String(url || '').replace(/^https:\/\/surrit\.mrstcdn\.store\//i, 'https://c.surrit.mrstcdn.store/');
 }
@@ -183,6 +198,22 @@ function toDirect(url) {
 // 基域 surrit -> missav-hls Worker 中转。
 function toWorker(url) {
   return MISSAV_HLS + '/m3u8?u=' + encodeURIComponent(url);
+}
+
+// 播放地址：surrit host（fans 的片）走 missav-hls 中转；
+// 非 surrit host（live 的片，手机浏览器能直播、说明手机能直达该 host）
+// 走直链——missav-hls 白名单只认 surrit，包 live 的地址会回 403。
+function playUrlFor(url) {
+  const u = String(url || '');
+  if (/^https:\/\/(c\.)?surrit\.mrstcdn\.store\//i.test(u) || /^https:\/\/surrit\.com\//i.test(u)) return toWorker(u);
+  return u;
+}
+
+// 从详情页地址反推其站 host（供播放 Referer/Origin 用）。
+function hostOfDetailUrl(durl) {
+  const d = String(durl || '');
+  if (d.indexOf(HOST_LIVE) === 0) return HOST_LIVE;
+  return HOST;
 }
 
 async function init() {
@@ -198,9 +229,9 @@ async function category(reqIn) {
   const id = String(body.id || '').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   if (!id) return { page, pagecount: page, limit: 12, total: 0, list: [] };
-  const url = HOST + '/' + id.replace(/^\/+/, '') + (page > 1 ? '?page=' + page : '');
-  const html = await getHtml(url);
-  const list = parseCards(html);
+  const path = '/' + id.replace(/^\/+/, '') + (page > 1 ? '?page=' + page : '');
+  const { html, host } = await fetchPage(path);
+  const list = parseCards(html, host || HOST);
   const pagecount = list.length ? parsePagecount(html, page) : page;
   return { page, pagecount, limit: list.length || 12, total: pagecount * 12, list };
 }
@@ -210,18 +241,33 @@ async function detail(reqIn) {
   const id = String(Array.isArray(body.id) ? body.id[0] : body.id || '').trim();
   if (!id) return { list: [] };
   const detailUrl = absUrl(id);
-  const html = await getHtml(detailUrl);
+  // 从详情地址取 path，fetchPage 先试 live、再回落 fans。
+  let path = detailUrl;
+  const hp = detailUrl.indexOf('://');
+  if (hp >= 0) {
+    const slash = detailUrl.indexOf('/', hp + 3);
+    path = slash >= 0 ? detailUrl.slice(slash) : '/';
+  }
+  const { html, host } = await fetchPage(path);
+  const pageHost = host || hostOfDetailUrl(detailUrl);
   const $ = cheerio.load(html || '');
   const name = cleanText($('meta[property="og:title"]').attr('content')) || cleanText($('title').text());
-  const cover = fixCover(absUrl($('meta[property="og:image"]').attr('content')));
+  const cover = fixCover(absUrl($('meta[property="og:image"]').attr('content'), pageHost));
   const content = cleanText($('meta[property="og:description"]').attr('content'));
   const tracks = extractTracks(html);
   const eps = [];
   for (const t of tracks) {
     const label = t.res.replace('p', 'P');
     // 用户 2026-11-26 令：直连几乎全部不能播，合成一条、和以前一样。
+<<<<<<< Updated upstream
     // 只留 missav-hls Worker 中转这一条（直链已删）；档位名不带“·中转”。
     eps.push(label + '$' + detailUrl + '@@' + toWorker(t.url));
+=======
+    // 每档位只留一条：surrit（fans）走 missav-hls 中转；
+    // 非 surrit（live）走直链（手机能直达 live 的视频 host）。
+    // 档位名不带“·中转”。
+    eps.push(label + '$' + detailUrl + '@@' + playUrlFor(t.url));
+>>>>>>> Stashed changes
   }
   const vod = {
     vod_id: detailUrl,
@@ -265,13 +311,15 @@ async function play(reqIn) {
   // 只有登记片名含可抽番号才查字幕。
   const regTitle = subNameCache.get(url) || '';
   const subs = subExtractCode(regTitle) ? await subSearchAll(url).catch(() => []) : [];
+  // Referer/Origin 按详情页的站（live 或 fans）定，视频 host 与之对应。
+  const refHost = hostOfDetailUrl(durl);
   const result = {
     parse: 0,
     url,
     header: {
       'User-Agent': UA,
-      'Referer': durl || HOST + '/',
-      'Origin': HOST,
+      'Referer': durl || refHost + '/',
+      'Origin': refHost,
     },
   };
   if (subs && subs.length) result.subs = subs;
@@ -283,9 +331,9 @@ async function search(reqIn) {
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const wd = String(body.wd || '').trim();
   if (!wd) return { page, pagecount: page, limit: 12, total: 0, list: [] };
-  const url = HOST + '/cn/search/' + encodeURIComponent(wd) + (page > 1 ? '?page=' + page : '');
-  const html = await getHtml(url);
-  const list = parseCards(html);
+  const path = '/cn/search/' + encodeURIComponent(wd) + (page > 1 ? '?page=' + page : '');
+  const { html, host } = await fetchPage(path);
+  const list = parseCards(html, host || HOST);
   const pagecount = list.length ? parsePagecount(html, page) : page;
   return { page, pagecount, limit: list.length || 12, total: pagecount * 12, list };
 }
