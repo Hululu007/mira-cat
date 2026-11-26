@@ -433,14 +433,27 @@ const CATEGORIES = [
   { type_id: 'c105', type_name: '60帧' },
 ];
 
-// 热门模特（2026-11-26 用户令：放列表第一位，必须有 Comatozze、candy love）
-// 模特页均为 /model/<slug>（实测 200 且有视频）；头像走 ei.phncdn.com，同样过 Worker 代理。
-// 点模特进详情：detail 识别 /model/ 路径，取该模特的视频列表当选集。
+// 热门模特（2026-11-26 用户令重做：分类下默认显示 Comatozze，
+// 子分类为 15 张模特小卡片，点卡片显示对应模特本人的内容，从新到旧）。
+// 模特页均为 /model/<slug>（实测 200 且有自己的视频分区）。
+// nana_taipei 与 fantasy babe 的模特页无视频分区（找不到本人内容），
+// 按用户授权改由 Sweetie Fox（30 条）、Luna Okko（32 条）替补。
 const HOT_MODELS = [
-  { slug: 'comatozze', name: 'Comatozze', pic: 'https://ei.phncdn.com/pics/users/0024/5807/0141/avatar95302765/(m=ewILGCjadOf)(mh=n7tIeIoHniVFwhIe)200x200.jpg' },
-  { slug: 'candy-love', name: 'candy love', pic: 'https://ei.phncdn.com/pics/users/723/631/591/avatar1583837616/(m=ewILGCjadOf)(mh=Q6WMtzphnpbtDqca)200x200.jpg' },
-  { slug: 'sweetie-fox', name: 'Sweetie Fox', pic: 'https://ei.phncdn.com/(m=ewILGCjadOf)(mh=59qrk8LnBE3Z9kTL)43ca43da-b27e-42f2-b237-40c5c13261b1.jpg' },
-  { slug: 'luna-okko', name: 'Luna Okko', pic: 'https://ei.phncdn.com/(m=bLWsSeKlbyaT)(mh=NBdZQmk08L2jXYNt)3afe1458-bed9-4395-893e-2ee8d4bbe70f.jpg' },
+  { slug: 'comatozze', name: 'Comatozze' },
+  { slug: 'candy-love', name: 'candy love' },
+  { slug: 'sweetie-fox', name: 'Sweetie Fox' },
+  { slug: 'shinaryen', name: 'shinaryen' },
+  { slug: 'anastangel', name: 'anastangel' },
+  { slug: 'diana-rider', name: 'diana rider' },
+  { slug: 'mia-malkova', name: 'mia malkova' },
+  { slug: 'mini-diva', name: 'mini diva' },
+  { slug: 'savannah-bond', name: 'Savannah Bond' },
+  { slug: 'luna-okko', name: 'Luna Okko' },
+  { slug: 'ailish', name: 'Ailish' },
+  { slug: 'behind-layla', name: 'behind layla' },
+  { slug: 'misty-queen', name: 'misty queen' },
+  { slug: 'alicia-delicia', name: 'alicia delicia' },
+  { slug: 'martinpaola', name: 'MartinPaola' },
 ];
 
 function categoryPath(id, page) {
@@ -505,6 +518,17 @@ function parseList(html) {
     }
   });
   return list;
+}
+
+// 模特页只取本人视频分区之后的 videoBox，
+// 顶部导航下拉里的 4 条非本人视频会被误抓，必须排除。
+// 这就是上一版“点开模特后几乎都不是对应模特内容”的根因。
+// 分区标题有两种：创作者是 "<名字>'s 视频"，职业女优是 "<名字>上传的视频"。
+function parseModelList(html) {
+  if (!html) return [];
+  var idx = html.search(/['’]s (视频|Videos)|上传的视频/);
+  var section = idx >= 0 ? html.slice(idx) : html;
+  return parseList(section);
 }
 
 function qualityOf(def, url) {
@@ -580,26 +604,84 @@ function extractMediaDefs(html) {
   return urls;
 }
 
+// webmasters JSON API 兜底（newest 在设备侧 HTML 取不到时的第二条路）：
+// REX 1.1.14 已证实该 API 可靠；ordering 映射与 REX 一致。
+function apiOrdering(cat) {
+  if (cat === 'cm') return 'newest';
+  if (cat === 'mv' || cat === 'ht') return 'mostviewed';
+  if (cat === 'tr') return 'toprated';
+  if (cat === 'lg') return 'longest';
+  return '';
+}
+
+async function fetchApiList(cat, page) {
+  var u = 'https://www.pornhub.com/webmasters/search?search=&page=' + page;
+  var ord = apiOrdering(cat);
+  if (ord) u += '&ordering=' + ord;
+  var catM = /^c(\d+)$/.exec(cat || '');
+  if (catM) u += '&category=' + catM[1];
+  var urls = [u, WORKER + '/?u=' + encodeURIComponent(u)];
+  for (var i = 0; i < urls.length; i++) {
+    try {
+      var r = await req.get(urls[i], { headers: { 'User-Agent': UA }, timeout: 15000, responseType: 'text', transformResponse: [(d) => d] });
+      var raw = typeof r.data === 'string' ? r.data : JSON.stringify(r.data || '');
+      var j;
+      try { j = JSON.parse(raw); } catch (e2) { continue; }
+      if (j && Array.isArray(j.videos) && j.videos.length) {
+        var out = [];
+        for (var k = 0; k < j.videos.length; k++) {
+          var v = j.videos[k] || {};
+          var link = String(v.url || '');
+          var title = clean(v.title || '');
+          if (!link || !title) continue;
+          out.push({
+            vod_id: link,
+            vod_name: title,
+            vod_pic: proxyCover(String(v.default_thumb || '')),
+            vod_remarks: v.views ? String(v.views) + '次观看' : '',
+            vod_duration: String(v.duration || ''),
+          });
+        }
+        if (out.length) return out;
+      }
+    } catch (e3) { /* 换下一个 */ }
+  }
+  return [];
+}
+
 async function home(e) {
-  return { class: CATEGORIES };
+  return {
+    class: CATEGORIES,
+    filters: {
+      hm: [{ key: 'model', name: '模特', value: HOT_MODELS.map((m) => ({ n: m.name, v: m.slug })) }],
+    },
+  };
 }
 
 async function category(e) {
   const id = String(e.body.id || 'sy');
   let page = parseInt(e.body.page, 10) || 1;
   if (page < 1) page = 1;
-  // 热门模特：固定模特列表（不翻页），点模特进详情看该模特的全部视频
+  // 热门模特：默认显示 Comatozze，子分类小卡片切模特。
+  // 列表就是该模特本人的视频（从新到旧，模特页默认排序），
+  // 点视频进正常详情播，不再走“模特当选集”的旧路。
   if (id === 'hm') {
-    const list = HOT_MODELS.map((m) => ({
-      vod_id: '/model/' + m.slug,
-      vod_name: m.name,
-      vod_pic: proxyCover(m.pic),
-      vod_remarks: '模特',
-    }));
+    const flt = (e.body && (e.body.filters || e.body.extend)) || {};
+    let model = flt.model;
+    if (model && typeof model === 'object') model = model.value || model.v || '';
+    model = t(model);
+    if (!HOT_MODELS.some((m) => m.slug === model)) model = 'comatozze';
+    const html = await fetchHtml('/model/' + model, 'list');
+    const list = parseModelList(html);
+    // 模特页无翻页链接，只有一页内容
     return { page: 1, pagecount: 1, list, filter: [] };
   }
   const html = await fetchHtml(categoryPath(id, page), 'list');
-  const list = html ? parseList(html) : [];
+  let list = html ? parseList(html) : [];
+  if (!list.length) {
+    // HTML 取不到（newest 在设备侧空的根因未明），回落 webmasters JSON API
+    list = await fetchApiList(id, page);
+  }
   return { page, pagecount: list.length < 20 ? page : page + 1, list, filter: [] };
 }
 
@@ -621,10 +703,11 @@ async function detail(e) {
   if (!id) return { list: [] };
   const path = normalizePath(id);
   // 模特页：取该模特的视频列表当选集（集 URL 为视频详情页，play 时现取 m3u8）
+  // （新版分类已改为小卡片列表，此分支只作旧入口兜底；同样只取本人分区）
   if (/\/model\/[a-z0-9-]+/i.test(path)) {
     const html = await fetchHtml(path, 'list');
     if (!html) return { list: [] };
-    const vids = parseList(html);
+    const vids = parseModelList(html);
     if (!vids.length) return { list: [] };
     const $ = cheerio.load(html);
     const mname = $('h1').first().text().trim()
