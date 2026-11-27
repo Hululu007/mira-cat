@@ -542,76 +542,6 @@ async function postAjaxPlayer(origin, filmId, episode, pt, pk, cookie) {
   return '';
 }
 
-// ===== 诊断探活（临时，2026-11-28 用户令推诊断版）=====
-// 查手机上 play 卡在哪一步：详情页取不取得到、有没有拿到会话 Cookie、
-// 有没有令牌/filmId、ajax 回什么。结果由 detail() 写进首行线路名。
-// 探活用自己现取的令牌，不动 play 的令牌；查完就删（下一版去掉）。
-async function diagAjax(origin, filmId, episode, pt, pk, cookie) {
-  const body = 'episode=' + encodeURIComponent(episode) + '&filmId=' + encodeURIComponent(filmId) + '&pt=' + encodeURIComponent(pt);
-  const headers = {
-    'User-Agent': UA,
-    'Referer': origin + '/',
-    'Origin': origin,
-    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'X-Requested-With': 'XMLHttpRequest',
-  };
-  if (cookie) headers['Cookie'] = cookie;
-  try {
-    const r = await req.post(origin + '/ajax/player', body, { headers, timeout: 8000, validateStatus: () => true });
-    if (!r || r.status !== 200) return { embed: '', err: 'HTTP' + (r ? r.status : '?') };
-    let j = null;
-    try { j = (typeof r.data === 'string') ? JSON.parse(r.data) : r.data; }
-    catch (e) { return { embed: '', err: '非JSON' }; }
-    if (j && j.error) return { embed: '', err: String(j.error).slice(0, 20) };
-    const em = embedFromAjaxJson(j, pk);
-    if (em) return { embed: em, err: 'OK' };
-    return { embed: '', err: '无embed' };
-  } catch (e) {
-    return { embed: '', err: '网络错' };
-  }
-}
-
-async function diagProbe(durl) {
-  try {
-    // 直连四腿：req/fetch × 两域名（v1 只试了原域名 req 一腿，回「页取不到」；
-    // 本版逐腿试，定性到底是哪条腿通、还是直连全死）。
-    const hosts = hostOrder(durl);
-    const path = pathOf(durl);
-    let okHtml = '', okHow = '', okCookie = '';
-    for (const h of hosts) {
-      const tag = h.replace('https://', '');
-      try {
-        const r = await req.get(h + path, { headers: pageHeaders(h + '/'), timeout: 4000 });
-        if (r && r.status === 200 && typeof r.data === 'string' && !isBlockedPage(r.data)) {
-          okHtml = r.data; okHow = 'req.' + tag; okCookie = cookieOf(r.headers); break;
-        }
-      } catch (e) { /* 下一腿 */ }
-      const txt = await timedFetchText(h + path, pageHeaders(h + '/'), 4000);
-      if (txt && !isBlockedPage(txt)) { okHtml = txt; okHow = 'fetch.' + tag; break; }
-    }
-    if (!okHtml) return '直连全不通';
-    const { pt, pk } = tokensOf(okHtml);
-    const { filmId, episodes } = extractPlayerInfo(okHtml);
-    const ck = okCookie ? 'Cookie有' : 'Cookie无';
-    const tk = (pt && pk) ? '令牌有' : '令牌无';
-    const fi = filmId ? 'filmId有' : 'filmId无';
-    const ln = episodes.length ? ('线路' + episodes.length) : '线路无';
-    let aj = 'ajax未试';
-    if (pt && filmId && episodes.length) {
-      const m = okHow.match(/sextb\.(net|cc)/);
-      const origin = m ? ('https://sextb.' + m[1]) : '';
-      if (origin) {
-        const r = await diagAjax(origin, filmId, episodes[0].episode, pt, pk, okCookie);
-        aj = r.embed ? 'ajax通' : ('ajax:' + r.err);
-      }
-    }
-    return okHow + ' ' + ck + ' ' + tk + ' ' + fi + ' ' + ln + ' ' + aj;
-  } catch (e) {
-    return '探活异常';
-  }
-}
-
 // v12（2026-11-23）：设备侧 ajax 为主（见上注）；Worker /ajax 仅作回落。
 async function ajaxEmbed(durl, epName) {
   let origin = '';
@@ -679,11 +609,6 @@ async function detail(reqIn) {
   if (!id) return { list: [] };
   const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
 
-  // 诊断探活（临时）：与取详情页并行跑，25 秒封顶；结果写进首行线路名。
-  const diagP = Promise.race([
-    diagProbe(durl),
-    new Promise((res) => setTimeout(() => res('探活超时'), 25000)),
-  ]).catch(() => '探活异常');
   const html = await getHtml(durl);
   if (!html) return { list: [] };
 
@@ -705,16 +630,14 @@ async function detail(reqIn) {
     if (ogm) pic = ogm[1];
   }
 
-  const diag = String(await diagP || '').replace(/[$#]/g, ' ');
-  const diagLine = `诊断勿点 ${diag}$${durl}@DIAG`;
   const vod = {
     vod_id: durl,
     vod_name: name || durl,
     vod_pic: fixUrl(pic),
     vod_remarks: '',
-    vod_content: name + '\n[诊断] ' + diag,
+    vod_content: name,
     vod_play_from: 'SexTB',
-    vod_play_url: diagLine + '#' + lineEpisodes(html, durl),
+    vod_play_url: lineEpisodes(html, durl),
   };
   subRegister(id, vod);
   return { list: [vod] };
@@ -842,8 +765,6 @@ async function play(reqIn) {
   let hint = '';
   const hm = id.match(/@([A-Za-z0-9]+)$/);
   if (hm) { hint = hm[1].toUpperCase(); id = id.slice(0, -hm[0].length); }
-  // 诊断行（临时）：点它不做任何事、不烧令牌，直接回空。
-  if (hint === 'DIAG') return { parse: 0, url: '' };
   const subsP = subSearchAll(subNormKey(id)).catch(() => []);
   if (/\.m3u8(\?|$)/i.test(id)) {
     return subAttach({ parse: 0, url: id, header: { 'User-Agent': UA } }, subsP);
