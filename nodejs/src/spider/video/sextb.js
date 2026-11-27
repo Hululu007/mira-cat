@@ -574,23 +574,39 @@ async function diagAjax(origin, filmId, episode, pt, pk, cookie) {
 
 async function diagProbe(durl) {
   try {
-    const det = await fetchDetailDirect(durl);
-    if (!det.html) return '页取不到';
-    const { pt, pk } = tokensOf(det.html);
-    const { filmId, episodes } = extractPlayerInfo(det.html);
-    const ck = det.cookie ? 'Cookie有' : 'Cookie无';
+    // 直连四腿：req/fetch × 两域名（v1 只试了原域名 req 一腿，回「页取不到」；
+    // 本版逐腿试，定性到底是哪条腿通、还是直连全死）。
+    const hosts = hostOrder(durl);
+    const path = pathOf(durl);
+    let okHtml = '', okHow = '', okCookie = '';
+    for (const h of hosts) {
+      const tag = h.replace('https://', '');
+      try {
+        const r = await req.get(h + path, { headers: pageHeaders(h + '/'), timeout: 4000 });
+        if (r && r.status === 200 && typeof r.data === 'string' && !isBlockedPage(r.data)) {
+          okHtml = r.data; okHow = 'req.' + tag; okCookie = cookieOf(r.headers); break;
+        }
+      } catch (e) { /* 下一腿 */ }
+      const txt = await timedFetchText(h + path, pageHeaders(h + '/'), 4000);
+      if (txt && !isBlockedPage(txt)) { okHtml = txt; okHow = 'fetch.' + tag; break; }
+    }
+    if (!okHtml) return '直连全不通';
+    const { pt, pk } = tokensOf(okHtml);
+    const { filmId, episodes } = extractPlayerInfo(okHtml);
+    const ck = okCookie ? 'Cookie有' : 'Cookie无';
     const tk = (pt && pk) ? '令牌有' : '令牌无';
     const fi = filmId ? 'filmId有' : 'filmId无';
     const ln = episodes.length ? ('线路' + episodes.length) : '线路无';
     let aj = 'ajax未试';
     if (pt && filmId && episodes.length) {
-      let origin = '';
-      try { origin = new URL(durl).origin; } catch (e) { origin = ''; }
-      if (!origin) return '页OK ' + ck + ' ' + tk + ' ' + fi + ' ' + ln + ' ' + aj;
-      const r = await diagAjax(origin, filmId, episodes[0].episode, pt, pk, det.cookie);
-      aj = r.embed ? 'ajax通' : ('ajax:' + r.err);
+      const m = okHow.match(/sextb\.(net|cc)/);
+      const origin = m ? ('https://sextb.' + m[1]) : '';
+      if (origin) {
+        const r = await diagAjax(origin, filmId, episodes[0].episode, pt, pk, okCookie);
+        aj = r.embed ? 'ajax通' : ('ajax:' + r.err);
+      }
     }
-    return '页OK ' + ck + ' ' + tk + ' ' + fi + ' ' + ln + ' ' + aj;
+    return okHow + ' ' + ck + ' ' + tk + ' ' + fi + ' ' + ln + ' ' + aj;
   } catch (e) {
     return '探活异常';
   }
@@ -663,10 +679,10 @@ async function detail(reqIn) {
   if (!id) return { list: [] };
   const durl = /^https?:\/\//.test(id) ? id : fixUrl(id);
 
-  // 诊断探活（临时）：与取详情页并行跑，15 秒封顶；结果写进首行线路名。
+  // 诊断探活（临时）：与取详情页并行跑，25 秒封顶；结果写进首行线路名。
   const diagP = Promise.race([
     diagProbe(durl),
-    new Promise((res) => setTimeout(() => res('探活超时'), 15000)),
+    new Promise((res) => setTimeout(() => res('探活超时'), 25000)),
   ]).catch(() => '探活异常');
   const html = await getHtml(durl);
   if (!html) return { list: [] };

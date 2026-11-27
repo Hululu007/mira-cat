@@ -7,13 +7,17 @@
 // 所以蜘蛛先由 App 直连 req 试 live，取不到再回落 fans（Worker+直连）。
 // 视频地址：live 的 m3u8 若不是 surrit host，走直链（手机浏览器能播、
 // 说明手机能直达 live 的视频 host）；fans 的 surrit 地址仍走 missav-hls 中转。
-// 源站：https://missav.live 为主、https://missav.fans 回落（中文 /cn/）。
+// 源站：https://missav.live 为主、https://missav.media 其次、https://missav.fans 最后备用（中文 /cn/）。
+// 2026-11-28 用户令：fans 降为备用。实测：.media 是真站（VM 直连 200 真页），
+// 但三站片源同 UUID（同文件），删片在三站上全死、活片在三站上全活，
+// 换域名救不回删片；.media 的意义是多一个取页入口（fans 挂了/被拦时仍能取页）。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
 
 const KEY = 'py_missav';
 const NAME = 'MissAV';
 const HOST_LIVE = 'https://missav.live';
+const HOST_MEDIA = 'https://missav.media';
 const HOST = 'https://missav.fans';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 const MISSAV_FETCH = 'https://missav-fetch.li768435813.workers.dev';
@@ -77,7 +81,8 @@ function fixCover(u) {
 }
 
 // 取页：先由 App 直连 req 试 missav.live（用户手机浏览器能进 live），
-// 取不到再回落 missav.fans（先走 missav-fetch Worker、再直连）。
+// 再试 missav.media（直连、取不到走 missav-fetch Worker），
+// 最后回落 missav.fans（先走 missav-fetch Worker、再直连）。fans 为最后备用。
 // 只认真 HTML（含 .thumbnail 或 og: 或 packed eval 的）；CF 验证页
 // （含 Just a moment... / Attention Required）与空串都算失败、继续下一腿。
 // 返回 { html, host }，host 是实际出页的那个站，供详情/播放定 Referer。
@@ -89,8 +94,8 @@ function isRealHtml(t) {
   return true;
 }
 
-// 取一站的页：live 只直连；fans 先走 missav-fetch Worker、再直连。
-// 只认真 HTML；CF 验证页/空串都算失败。
+// 取一站的页：live 只直连；media 直连、取不到走 missav-fetch Worker；
+// fans 先走 missav-fetch Worker、再直连。只认真 HTML；CF 验证页/空串都算失败。
 async function fetchSide(host, path) {
   const headers = { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9' };
   const p = String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || '');
@@ -99,6 +104,19 @@ async function fetchSide(host, path) {
       const r = await req.get(HOST_LIVE + p, { headers, timeout: 20000 });
       const t = typeof r.data === 'string' ? r.data : '';
       if (isRealHtml(t)) return { html: t, host: HOST_LIVE };
+    } catch (e) {}
+    return { html: '', host: '' };
+  }
+  if (host === HOST_MEDIA) {
+    try {
+      const r = await req.get(HOST_MEDIA + p, { headers, timeout: 20000 });
+      const t = typeof r.data === 'string' ? r.data : '';
+      if (isRealHtml(t)) return { html: t, host: HOST_MEDIA };
+    } catch (e) {}
+    try {
+      const r = await req.get(MISSAV_FETCH + '/?u=' + encodeURIComponent(HOST_MEDIA + p), { headers, timeout: 20000 });
+      const t = typeof r.data === 'string' ? r.data : '';
+      if (isRealHtml(t)) return { html: t, host: HOST_MEDIA };
     } catch (e) {}
     return { html: '', host: '' };
   }
@@ -119,6 +137,8 @@ async function fetchSide(host, path) {
 async function fetchPage(path) {
   const live = await fetchSide(HOST_LIVE, path);
   if (live.html) return live;
+  const media = await fetchSide(HOST_MEDIA, path);
+  if (media.html) return media;
   return fetchSide(HOST, path);
 }
 
@@ -258,6 +278,7 @@ async function probeTrackAlive(url) {
 function hostOfDetailUrl(durl) {
   const d = String(durl || '');
   if (d.indexOf(HOST_LIVE) === 0) return HOST_LIVE;
+  if (d.indexOf(HOST_MEDIA) === 0) return HOST_MEDIA;
   return HOST;
 }
 
@@ -300,9 +321,10 @@ async function detail(reqIn) {
   // 实测 fans 的 c.surrit/surrit 上不少片源文件已被站方下架——播单经 Worker
   // 回 302 自跳（同 UUID 的 seek 图也 403），详情照常出线、点播必死；
   // live 与 fans 不是同一套视频服务器，同一部片可能一边已删、一边还在。
-  // 所以先探本页（master 优先，只有 ~1KB；无 master 则探首档），死就换
-  // 另一站重取详情再探，只出探活通过的那边；两边都死则保留原页（尽力而为）。
-  // 档位仍合成一条、不改名；探活走的正是播放器将要走的同一条 Worker 链。
+  // 所以先探本页（master 优先，只有 ~1KB；无 master 则探首档），死就按
+  // live → media → fans 的顺序换站重取详情再探，只出探活通过的那边；
+  // 三站都死则保留原页（尽力而为）。档位仍合成一条、不改名；
+  // 探活走的正是播放器将要走的同一条 Worker 链。
   const probeOf = (h) => {
     const t = extractTracks(h);
     const m = extractMaster(h);
@@ -312,15 +334,18 @@ async function detail(reqIn) {
   let tracks = firstProbe.tracks;
   let alive = firstProbe.probeUrl ? await probeTrackAlive(firstProbe.probeUrl) : false;
   if (!alive) {
-    const otherHost = (first.host === HOST_LIVE) ? HOST : HOST_LIVE;
-    const other = await fetchSide(otherHost, path);
-    if (other.html) {
+    const order = [HOST_LIVE, HOST_MEDIA, HOST];
+    for (const otherHost of order) {
+      if (otherHost === first.host) continue;
+      const other = await fetchSide(otherHost, path);
+      if (!other.html) continue;
       const op = probeOf(other.html);
       const oAlive = op.probeUrl ? await probeTrackAlive(op.probeUrl) : false;
       if (oAlive) {
         pageHtml = other.html;
         pageHost = otherHost;
         tracks = op.tracks;
+        break;
       }
     }
   }
