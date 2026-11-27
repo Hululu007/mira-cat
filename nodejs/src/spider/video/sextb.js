@@ -401,7 +401,9 @@ function extractPlayerInfo(html) {
     const inner = clean(m[1]);
     const nm = (inner.match(/[A-Z0-9]{2,}/) || [])[0] || '';
     if (!nm || nm === 'VIP') continue;
-    episodes.push({ filmId: sm[1], episode: dm[1], name: nm });
+    // 注意：data-source 是线路/宿主的编号，不是 filmId（v12 前误标为 filmId，
+    // 导致 ajax 把它当 filmId 发、站方直接拒掉，全线路转圈；filmId 只能取页面的 filmId）。
+    episodes.push({ source: sm[1], episode: dm[1], name: nm });
   }
   return { filmId, episodes };
 }
@@ -561,12 +563,13 @@ async function ajaxEmbed(durl, epName) {
     }
     if (!ep) ep = episodes[0];
     if (!ep) return '';
-    // 主：设备侧 POST
-    const em = await postAjaxPlayer(origin, ep.filmId || filmId, ep.episode, pt, pk, cookie);
+    // 主：设备侧 POST。filmId 必须是页面级的视频 id（extractPlayerInfo 返回的 filmId），
+    // 绝不能是按钮的 data-source（那是线路编号；发错站方直接拒，见 extractPlayerInfo 注）。
+    const em = await postAjaxPlayer(origin, filmId, ep.episode, pt, pk, cookie);
     if (em) return em;
     // 回落：Worker /ajax（站方 403 封 CF，基本已死，留作兜底）
     const u = SEXTB_WORKER + '/ajax?o=' + encodeURIComponent(origin)
-      + '&filmId=' + encodeURIComponent(ep.filmId || filmId)
+      + '&filmId=' + encodeURIComponent(filmId)
       + '&episode=' + encodeURIComponent(ep.episode)
       + '&pt=' + encodeURIComponent(pt) + '&pk=' + encodeURIComponent(pk);
     try {
