@@ -1,13 +1,10 @@
-// MissAV — 全新重写（2026-11-26 用户令：旧版彻底删除，不依照旧版，
-// 按 missav.fans 现站从头写。目标：修好封面、修好播放）。
-// 2026-11-26 08:00 用户令：改走 missav.live 为主、missav.fans 回落。
-// 用户真机确认 live 能播 SNOS-524、且 live 与 fans 不是同一个视频服务器
-// （fans 上 SNOS-524 的 surrit 文件已删、live 上文件还在）。
-// 服务器侧（VM/Worker/代理）拉 live 全被 CF 拦，只有用户手机浏览器能进，
-// 所以蜘蛛先由 App 直连 req 试 live，取不到再回落 fans（Worker+直连）。
-// 视频地址：live 的 m3u8 若不是 surrit host，走直链（手机浏览器能播、
-// 说明手机能直达 live 的视频 host）；fans 的 surrit 地址仍走 missav-hls 中转。
-// 源站：https://missav.live 为主、https://missav.fans 回落（中文 /cn/）。
+// MissAV — 重写（2026-11-28 用户令：旧版删了，按 missav.fans 从头写）。
+// 以 missav.fans 为主站（VM 直连 200，站方现站结构与 live 一致）。
+// 封面：不再改写到 fourhoi——fourhoi 是残缺镜像，新封面全 404，
+// “有的出、有的不出”的根因。封面走站方原地址 d.surrit 直链。
+// 取页：fans 直连 → fans 经 missav-fetch Worker → live 直连（fans 删片的回落）。
+// 播放：详情 packed JS 解出分档 m3u8，统一走 missav-hls 中转（BBTU-123 真机已验）。
+// 源站：https://missav.fans 为主、https://missav.live 回落（中文 /cn/）。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
 
@@ -67,19 +64,20 @@ function absUrl(u, base) {
   return b + (u.startsWith('/') ? u : '/' + u);
 }
 
-// 封面改写：d.surrit.mrstcdn.store 设备侧打不开，同一张封面在
-// fourhoi.mrstcdn.store 上有同一份（同路径，实测 200 真图）。
-// 只改写封面 host，视频地址不动。
+// 封面：统一回站方原地址 d.surrit。
+// 实测：站方有的列表页（/cn/new）封面就是 d.surrit，有的列表页
+// （/dm509/cn/release）封面是 fourhoi；fourhoi 是残缺镜像，
+// 新封面全 404，“有的出、有的不出”的根因。所以 fourhoi 一律改回 d.surrit，
+// 已是 d.surrit 的不动。
 function fixCover(u) {
   u = String(u || '').trim();
   if (!u) return '';
-  return u.replace(/^https:\/\/d\.surrit\.mrstcdn\.store\//i, 'https://fourhoi.mrstcdn.store/');
+  return u.replace(/^https:\/\/fourhoi\.mrstcdn\.store\//i, 'https://d.surrit.mrstcdn.store/');
 }
 
-// 取页：先由 App 直连 req 试 missav.live（用户手机浏览器能进 live），
-// 取不到再回落 missav.fans（先走 missav-fetch Worker、再直连）。
-// 只认真 HTML（含 .thumbnail 或 og: 或 packed eval 的）；CF 验证页
-// （含 Just a moment... / Attention Required）与空串都算失败、继续下一腿。
+// 取页：以 missav.fans 为主（先直连、再走 missav-fetch Worker），
+// fans 取不到再回落 missav.live 直连（fans 删片、live 还在的回落，
+// 如 SNOS-524）。只认真 HTML；CF 验证页与空串都算失败、继续下一腿。
 // 返回 { html, host }，host 是实际出页的那个站，供详情/播放定 Referer。
 function isRealHtml(t) {
   if (!t || typeof t !== 'string') return false;
@@ -92,11 +90,11 @@ function isRealHtml(t) {
 async function fetchPage(path) {
   const headers = { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9' };
   const p = String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || '');
-  // ① live 直连（App req）
+  // ① fans 直连
   try {
-    const r = await req.get(HOST_LIVE + p, { headers, timeout: 20000 });
+    const r = await req.get(HOST + p, { headers, timeout: 20000 });
     const t = typeof r.data === 'string' ? r.data : '';
-    if (isRealHtml(t)) return { html: t, host: HOST_LIVE };
+    if (isRealHtml(t)) return { html: t, host: HOST };
   } catch (e) {}
   // ② fans 经 missav-fetch Worker
   try {
@@ -104,11 +102,11 @@ async function fetchPage(path) {
     const t = typeof r.data === 'string' ? r.data : '';
     if (isRealHtml(t)) return { html: t, host: HOST };
   } catch (e) {}
-  // ③ fans 直连
+  // ③ live 直连（回落）
   try {
-    const r = await req.get(HOST + p, { headers, timeout: 20000 });
+    const r = await req.get(HOST_LIVE + p, { headers, timeout: 20000 });
     const t = typeof r.data === 'string' ? r.data : '';
-    if (isRealHtml(t)) return { html: t, host: HOST };
+    if (isRealHtml(t)) return { html: t, host: HOST_LIVE };
   } catch (e) {}
   return { html: '', host: '' };
 }
