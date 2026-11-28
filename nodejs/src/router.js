@@ -121,7 +121,6 @@ import popjav from './spider/video/popjav.js';
 import tinyav from './spider/video/tinyav.js';
 import javxxx from './spider/video/py_javxxx.js';
 import javdock from './spider/video/py_javdock.js';
-import airav from './spider/video/airav.js';
 
 const spiders = [
     missav,
@@ -145,7 +144,6 @@ const spiders = [
     a91porn,
     dycg66,
     hl818,
-    airav,
     animesex,
     anysex,
     asian,
