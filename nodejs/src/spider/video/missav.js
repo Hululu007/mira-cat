@@ -89,37 +89,28 @@ function isRealHtml(t) {
   return true;
 }
 
-// 取一站的页：live 只直连；fans 先走 missav-fetch Worker、再直连。
-// 只认真 HTML；CF 验证页/空串都算失败。
-async function fetchSide(host, path) {
+async function fetchPage(path) {
   const headers = { 'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9' };
   const p = String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || '');
-  if (host === HOST_LIVE) {
-    try {
-      const r = await req.get(HOST_LIVE + p, { headers, timeout: 20000 });
-      const t = typeof r.data === 'string' ? r.data : '';
-      if (isRealHtml(t)) return { html: t, host: HOST_LIVE };
-    } catch (e) {}
-    return { html: '', host: '' };
-  }
-  // fans：先走 missav-fetch Worker、再直连
+  // ① live 直连（App req）
+  try {
+    const r = await req.get(HOST_LIVE + p, { headers, timeout: 20000 });
+    const t = typeof r.data === 'string' ? r.data : '';
+    if (isRealHtml(t)) return { html: t, host: HOST_LIVE };
+  } catch (e) {}
+  // ② fans 经 missav-fetch Worker
   try {
     const r = await req.get(MISSAV_FETCH + '/?u=' + encodeURIComponent(HOST + p), { headers, timeout: 20000 });
     const t = typeof r.data === 'string' ? r.data : '';
     if (isRealHtml(t)) return { html: t, host: HOST };
   } catch (e) {}
+  // ③ fans 直连
   try {
     const r = await req.get(HOST + p, { headers, timeout: 20000 });
     const t = typeof r.data === 'string' ? r.data : '';
     if (isRealHtml(t)) return { html: t, host: HOST };
   } catch (e) {}
   return { html: '', host: '' };
-}
-
-async function fetchPage(path) {
-  const live = await fetchSide(HOST_LIVE, path);
-  if (live.html) return live;
-  return fetchSide(HOST, path);
 }
 
 // 列表解析：.thumbnail 卡片。封面只取 img.w-full 的 data-src（.jpg），
@@ -199,15 +190,6 @@ function extractTracks(html) {
   return out;
 }
 
-// 从详情页 packed JS 解出 master playlist 地址（探活用：只有 ~1KB，
-// 与分档同属一个视频 UUID，同生同死，探它就够了）。
-function extractMaster(html) {
-  const up = unpackPacked(html || '');
-  if (!up) return '';
-  const m = up.match(/https?:\/\/[^\s'"<>]+\/playlist\.m3u8/);
-  return m ? m[0] : '';
-}
-
 // 基域 surrit -> c.surrit 子域直链（设备可达）。现已不用（合线后只留中转），保留备用。
 function toDirect(url) {
   return String(url || '').replace(/^https:\/\/surrit\.mrstcdn\.store\//i, 'https://c.surrit.mrstcdn.store/');
@@ -226,32 +208,6 @@ function toWorker(url) {
 // 才能走通（见 Worker 源码）；未加之前 live 线会回 403。
 function playUrlFor(url) {
   return toWorker(String(url || ''));
-}
-
-// 探活：经 missav-hls 取一次播单，看是不是真能播。
-// 活 = Worker 回 200/206 且正文是 #EXTM3U；302（删片自跳）/403/超时/异常都算死。
-// 只探 master（~1KB）或首档，分档与 master 同属一个视频 UUID，同生同死。
-// 注意：探活走的正是播放器将要走的同一条 Worker 链，探活结论与播放一致。
-// maxRedirects: 0 让 302 直接返回、不跟随自跳循环；validateStatus 全收，
-// 状态码由本函数自己判（不用它判 302 会被当异常、还白白跟随 5 跳）。
-async function probeTrackAlive(url) {
-  if (!url) return false;
-  try {
-    const r = await req.get(toWorker(url), {
-      headers: { 'User-Agent': UA, 'Accept': '*/*' },
-      timeout: 8000,
-      responseType: 'text',
-      transformResponse: [(d) => d],
-      validateStatus: () => true,
-      maxRedirects: 0,
-    });
-    const status = r.status || 0;
-    if (status !== 200 && status !== 206) return false;
-    const body = typeof r.data === 'string' ? r.data : '';
-    return body.includes('#EXTM3U');
-  } catch (e) {
-    return false;
-  }
 }
 
 // 从详情页地址反推其站 host（供播放 Referer/Origin 用）。
@@ -293,41 +249,13 @@ async function detail(reqIn) {
     const slash = detailUrl.indexOf('/', hp + 3);
     path = slash >= 0 ? detailUrl.slice(slash) : '/';
   }
-  const first = await fetchPage(path);
-  let pageHtml = first.html;
-  let pageHost = first.host || hostOfDetailUrl(detailUrl);
-  // 探活 + 双站回落（2026-11-27 修“好多内容不能播”）：
-  // 实测 fans 的 c.surrit/surrit 上不少片源文件已被站方下架——播单经 Worker
-  // 回 302 自跳（同 UUID 的 seek 图也 403），详情照常出线、点播必死；
-  // live 与 fans 不是同一套视频服务器，同一部片可能一边已删、一边还在。
-  // 所以先探本页（master 优先，只有 ~1KB；无 master 则探首档），死就换
-  // 另一站重取详情再探，只出探活通过的那边；两边都死则保留原页（尽力而为）。
-  // 档位仍合成一条、不改名；探活走的正是播放器将要走的同一条 Worker 链。
-  const probeOf = (h) => {
-    const t = extractTracks(h);
-    const m = extractMaster(h);
-    return { tracks: t, probeUrl: m || (t[0] && t[0].url) || '' };
-  };
-  let firstProbe = probeOf(pageHtml);
-  let tracks = firstProbe.tracks;
-  let alive = firstProbe.probeUrl ? await probeTrackAlive(firstProbe.probeUrl) : false;
-  if (!alive) {
-    const otherHost = (first.host === HOST_LIVE) ? HOST : HOST_LIVE;
-    const other = await fetchSide(otherHost, path);
-    if (other.html) {
-      const op = probeOf(other.html);
-      const oAlive = op.probeUrl ? await probeTrackAlive(op.probeUrl) : false;
-      if (oAlive) {
-        pageHtml = other.html;
-        pageHost = otherHost;
-        tracks = op.tracks;
-      }
-    }
-  }
-  const $ = cheerio.load(pageHtml || '');
+  const { html, host } = await fetchPage(path);
+  const pageHost = host || hostOfDetailUrl(detailUrl);
+  const $ = cheerio.load(html || '');
   const name = cleanText($('meta[property="og:title"]').attr('content')) || cleanText($('title').text());
   const cover = fixCover(absUrl($('meta[property="og:image"]').attr('content'), pageHost));
   const content = cleanText($('meta[property="og:description"]').attr('content'));
+  const tracks = extractTracks(html);
   const eps = [];
   for (const t of tracks) {
     const label = t.res.replace('p', 'P');
