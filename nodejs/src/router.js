@@ -114,6 +114,13 @@ import openload from './spider/video/py_openload.js';
 import javtubs from './spider/video/py_javtubs.js';
 import javlust from './spider/video/py_javlust.js';
 import javdo from './spider/video/py_javdo.js';
+import avbebe from './spider/video/avbebe.js';
+import baihubi from './spider/video/baihubi.js';
+import ininav from './spider/video/ininav.js';
+import javshujin from './spider/video/javshujin.js';
+import podjav from './spider/video/podjav.js';
+import popjav from './spider/video/popjav.js';
+import tinyav from './spider/video/tinyav.js';
 
 const spiders = [
     missav,
@@ -144,9 +151,11 @@ const spiders = [
     asmrba,
     asmrhoney,
     av77,
+    avbebe,
     avdb,
     avjoy,
     avporn,
+    baihubi,
     hyjx0817,
     beeg,
     bigbuttshub,
@@ -186,6 +195,7 @@ const spiders = [
     javplayer,
     javportals,
     javrate,
+    javshujin,
     javtiful,
     jinguo,
     juheduanju,
@@ -206,6 +216,8 @@ const spiders = [
     pandalive,
     perverzija,
     pimpbunny,
+    podjav,
+    popjav,
     porncgw,
     pornhub,
     ppp,
@@ -219,6 +231,7 @@ const spiders = [
     stripchat,
     supjav,
     taiav,
+    tinyav,
     tojav,
     topjav,
     ultra,
@@ -230,6 +243,7 @@ const spiders = [
     xxxfollow,
     yeguo,
     yesporn,
+    ininav,
     youzidj,
 ];
 const spiderPrefix = '/spider'; // API 路由前缀
