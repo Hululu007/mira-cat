@@ -8,7 +8,9 @@
 // master 按 RESOLUTION 分档出线（1080p/720p/480p/360p，有几档出几档，绝不编造）。
 // 变体直链直接交给播放器（本站无自家 Worker；/ved/ 线的分片可能为 .image 伪装，
 // 若某档播不了请反馈）；master 解不出时省略该集，绝不输出嵌页地址懒解析。
-// 有番号接字幕芯。分类：reducing-mosaic（减码/LTX）必须保留；标签作筛选卡片。
+// 有番号接字幕芯。分类：reducing-mosaic（减码/LTX）必须保留；顶级分类 10 个
+// （导航 3 个 + 最新 + 6 个高频标签归档）；每分类挂 3 张筛选卡片：标签 36、厂商 10、女优 6，
+// 全部是站方真实存在的归档页（2026-11-28 逐页验过 200，每页 20 条）。
 // 注意：VM 直连 x.videplay.us 无响应（curl 52/000），嵌页解析链未在 VM 验通，
 // 同型流程已在 py_javcc.js（javcc.me）2026-11-07 实测通过，须真机定性。
 import req from '../../util/req.js';
@@ -19,12 +21,20 @@ const NAME = 'Javshujin';
 const HOST = 'https://javshujin.com';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
 
-// 顶级分类：站方导航仅 3 个（2026-11-28 实测）+ 最新
+// 顶级分类：站方导航仅 3 个（2026-11-28 实测）+ 最新；
+// 其余 6 个是站方真实存在的标签归档页（/tag/{slug}/，逐个验过 200 且每页 20 条），
+// 按近 90 篇文章里出现频次取前 6，不编造。厂商/女优归档同为真实页，作筛选卡片。
 const CLASSES = [
   { type_id: 'latest', type_name: '最新' },
   { type_id: 'category/censored', type_name: '有碼' },
   { type_id: 'category/english-subtitle', type_name: '英字' },
   { type_id: 'category/reducing-mosaic', type_name: '減碼' },
+  { type_id: 'tag/masturbation', type_name: '自慰' },
+  { type_id: 'tag/creampie', type_name: '中出' },
+  { type_id: 'tag/big-tits', type_name: '巨乳' },
+  { type_id: 'tag/married-woman', type_name: '人妻' },
+  { type_id: 'tag/mature-woman', type_name: '熟女' },
+  { type_id: 'tag/cuckold', type_name: '出軌' },
 ];
 
 // 标签筛选卡片（站方原生标签，文章 class / 标签页实测存在；
@@ -48,10 +58,56 @@ const TAG_FILTER = [
   { n: '姐妹', v: 'sister' },
   { n: '情趣用品', v: 'sex-toys' },
   { n: '主觀', v: 'subjectivity' },
+  { n: '中出', v: 'creampie' },
+  { n: '熟女', v: 'mature-woman' },
+  { n: '出軌', v: 'cuckold' },
+  { n: '顏射', v: 'facials' },
+  { n: '口交', v: 'blowjob' },
+  { n: '女上位', v: 'cowgirl' },
+  { n: '美臀', v: 'beautiful-butt' },
+  { n: '女大學生', v: 'female-college-student' },
+  { n: '潮吹', v: 'squirting' },
+  { n: '護士', v: 'nurse' },
+  { n: '絲襪', v: 'pantyhose' },
+  { n: '紀錄片', v: 'documentary' },
+  { n: '劇情', v: 'drama' },
+  { n: '美少女', v: 'beautiful-girl' },
+  { n: '秘書', v: 'secretary' },
+  { n: '女上司', v: 'female-boss' },
+  { n: '其他戀物', v: 'other-fetishes' },
+  { n: '硬核', v: 'hardcore' },
+];
+// 厂商筛选卡片（站方 /studio/{slug}/ 归档，2026-11-28 逐个验过 200 且每页 20 条，
+// 按近 90 篇文章里出现频次取前 10；显示名用站方英文品牌名）
+const STUDIO_FILTER = [
+  { n: 'Attackers', v: 'attackers' },
+  { n: 'IdeaPocket', v: 'idea-pocket' },
+  { n: 'Fitch', v: 'fitch' },
+  { n: 'Venus', v: 'venus' },
+  { n: 'Moodyz', v: 'moodyz' },
+  { n: 'Madonna', v: 'madonna' },
+  { n: 'Center Village', v: 'center-village' },
+  { n: 'Go Go Zu', v: 'go-go-zu' },
+  { n: 'Wanz Factory', v: 'wanz-factory' },
+  { n: 'Prestige', v: 'prestige' },
+];
+// 女优筛选卡片（站方 /actor/{slug}/ 归档，2026-11-28 逐个验过 200 且每页 20 条，
+// 按近 90 篇文章里出现频次取前 6；显示名用站方罗马音）
+const ACTOR_FILTER = [
+  { n: 'Izuki Yukimura', v: 'izuki-yukimura' },
+  { n: 'Remu Suzumori', v: 'remu-suzumori' },
+  { n: 'Megumi Maki', v: 'megumi-maki' },
+  { n: 'Yumi Nijimura', v: 'yumi-nijimura' },
+  { n: 'Sayuri Hayama', v: 'sayuri-hayama' },
+  { n: 'Ao Ebisaki', v: 'ao-ebisaki' },
 ];
 const FILTERS = {};
 for (const c of CLASSES) {
-  FILTERS[c.type_id] = [{ key: 'tag', name: '标签', value: TAG_FILTER }];
+  FILTERS[c.type_id] = [
+    { key: 'tag', name: '标签', value: TAG_FILTER },
+    { key: 'studio', name: '厂商', value: STUDIO_FILTER },
+    { key: 'actor', name: '女优', value: ACTOR_FILTER },
+  ];
 }
 
 const embedCache = new Map(); // variantUrl -> embedUrl（play 时作 Referer）
@@ -428,10 +484,14 @@ async function category(reqIn) {
   const id = String(body.id || 'latest').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const extend = body.filters || body.extend || {};
-  // 标签筛选卡片：选中的标签地址优先，未选走顶级分类
+  // 筛选卡片：选中的标签/厂商/女优地址优先，未选走顶级分类
   let base;
   if (extend.tag && String(extend.tag).trim()) {
     base = '/tag/' + String(extend.tag).trim();
+  } else if (extend.studio && String(extend.studio).trim()) {
+    base = '/studio/' + String(extend.studio).trim();
+  } else if (extend.actor && String(extend.actor).trim()) {
+    base = '/actor/' + String(extend.actor).trim();
   } else if (id === 'latest') {
     base = '/';
   } else {

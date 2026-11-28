@@ -1,8 +1,18 @@
 // TinyAV — https://tinyavideo.com
-// Drupal 站：列表 .video-thumbnail-container 卡片，视频 /video/{id}，
-// 详情页 window.m3u8List（多集）或 JSON-LD contentUrl（单集）给直链 m3u8。
+// Drupal 站：列表 .video-thumbnail-container 卡片（AI 短劇用豎版
+// .video-thumbnail-container2，舊選擇器漏它導致 AI 分類 0 條），
+// 视频 /video/{id}，详情页 window.m3u8List（多集）或 JSON-LD contentUrl（单集）给直链 m3u8。
 // m3u8 为单档位媒体播单（无多清晰度，不编造档位）。
-// 分类：8 大内容类 + 中文字幕；每类以“排序”筛选卡片呈现（不平铺）。
+// 分类：8 大内容类 + 中文字幕 + 精選片單；每类以“排序”筛选卡片呈现（不平铺），
+// 精選片單以“片單”筛选卡片呈现（/special 本身是片单索引、0 视频卡）。
+// 2026-11-28 实测：① 站方边缘会 RST axios 的 TLS 握手（ECONNRESET），
+// 全局 fetch（undici）可通 200，故 fetchHtml 先走 fetch、失败再回落 req；
+// ② 韓國片 m3u8 全在 bf3/bf4.qrtuv.com，該 host 對一切客戶端回 403
+// （8/8 詳情抽查，curl/axios/fetch、帶 Referer/Cookie/http 皆 403，
+// 連 host 根也 403；站方自家播放器同樣報「來源失效」），屬上游文件 host 已死，
+// 詳情仍照實交出頁面給的真 m3u8、不編造替代地址；
+// ③ 其餘分類 m3u8 host 皆活（日本 t36.cdn2020.com、亞洲 t27.cdn2020.com、
+// 歐美 t0.97img.com、AI 98jpm3u8.vip，抽查均 200 真 VOD）。
 // 無碼流出（uncensored-leak）为 LTX 九档中的一档，已列为顶级分类。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
@@ -23,6 +33,7 @@ const CLASSES = [
   { type_id: 'korean', type_name: '韓國' },
   { type_id: 'western', type_name: '歐美' },
   { type_id: 'chinese-subtitles', type_name: '中文字幕' },
+  { type_id: 'special', type_name: '精選片單' },
 ];
 
 // 每类 7 档排序（站方每类皆有 hot/monthly-hot/new/release/today-hot/weekly-hot/yearly-hot）
@@ -36,10 +47,34 @@ const SORTS = [
   { n: '總觀看數', v: 'hot' },
 ];
 
+// 精選片單（/special 下 14 個真實片單頁，2026-11-28 站內核對；
+// 每頁皆為視頻列表、12 卡/頁、Drupal ?page 分頁；
+// /special 本身只是索引、0 視頻卡，故預設進第一個片單）。
+const PLAYLISTS = [
+  { n: 'FANZA 2025 TOP20', v: 'special/fanza/2025-top20' },
+  { n: 'JAV 動漫改編', v: 'special/anime-adaptation' },
+  { n: '華語 AV 影視改編', v: 'special/mandarin-media-adaptation' },
+  { n: '中指通 2026-09', v: 'special/fingermaster/2026-09' },
+  { n: '中指通 2026-08', v: 'special/fingermaster/2026-08' },
+  { n: '中指通 2026-07', v: 'special/fingermaster/2026-07' },
+  { n: '中指通 2026-06', v: 'special/fingermaster/2026-06' },
+  { n: '中指通 2026-05', v: 'special/fingermaster/2026-05' },
+  { n: '中指通 2026-04', v: 'special/fingermaster/2026-04' },
+  { n: '中指通 2026-03', v: 'special/fingermaster/2026-03' },
+  { n: '中指通 2026-02', v: 'special/fingermaster/2026-02' },
+  { n: '中指通 2026-01', v: 'special/fingermaster/2026-01' },
+  { n: '中指通 2025-12', v: 'special/fingermaster/2025-12' },
+  { n: '中指通 2025-11', v: 'special/fingermaster/2025-11' },
+];
+
 function buildFilters() {
   const f = {};
   for (const c of CLASSES) {
     if (c.type_id === 'chinese-subtitles') continue;
+    if (c.type_id === 'special') {
+      f.special = [{ key: 'playlist', name: '片單', value: PLAYLISTS.map((p) => ({ n: p.n, v: p.v })) }];
+      continue;
+    }
     f[c.type_id] = [{
       key: 'sort', name: '排序',
       value: SORTS.map((s) => ({ n: s.n, v: c.type_id + '/' + s.v })),
@@ -63,9 +98,27 @@ function absUrl(u, base) {
 
 async function fetchHtml(path) {
   const url = /^https?:\/\//i.test(path) ? path : HOST + (String(path || '').startsWith('/') ? String(path || '') : '/' + String(path || ''));
+  const headers = { 'User-Agent': UA, 'Accept': 'text/html,*/*', 'Accept-Language': 'zh-Hant,zh;q=0.9' };
+  // 站方邊緣 RST axios 的 TLS 握手（ECONNRESET，全分類 0 條），全局 fetch 可通：
+  // 先走 fetch，失敗再回落 req（7mmtv/av01 同款守衛寫法，設備無 fetch 時走舊路）。
+  if (typeof fetch === 'function') {
+    try {
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), 20000);
+      try {
+        const r = await fetch(url, { headers, signal: ctl.signal, redirect: 'follow' });
+        if (r.status === 200) {
+          const t = await r.text();
+          if (t && t.length >= 1000) return t;
+        }
+      } finally {
+        clearTimeout(to);
+      }
+    } catch (e) { /* 落 req */ }
+  }
   try {
     const r = await req.get(url, {
-      headers: { 'User-Agent': UA, 'Accept': 'text/html,*/*', 'Accept-Language': 'zh-Hant,zh;q=0.9' },
+      headers,
       timeout: 20000,
       responseType: 'text',
       transformResponse: [(d) => d],
@@ -80,14 +133,15 @@ async function fetchHtml(path) {
   }
 }
 
-// 列表解析：.video-thumbnail-container 卡片。封面取 img src（.webp），
+// 列表解析：.video-thumbnail-container 卡片，AI 短劇用豎版
+// .video-thumbnail-container2（舊選擇器漏它，AI 分類 0 條）。封面取 img src（.webp），
 // 标题取 .videotitle a 文本（无则取 img alt），备注取观看数。
 function parseCards(html) {
   const cards = [];
   if (!html) return cards;
   const $ = cheerio.load(html);
   const seen = new Set();
-  $('.video-thumbnail-container').each((_, el) => {
+  $('.video-thumbnail-container, .video-thumbnail-container2').each((_, el) => {
     const $el = $(el);
     const a = $el.find('a[href^="/video/"]').first();
     const href = (a.attr('href') || '').trim();
@@ -141,10 +195,14 @@ async function category(reqIn) {
   const tid = String(body.id || 'japanese').trim();
   const page = Math.max(1, parseInt(body.page, 10) || 1);
   const extend = body.filters || body.extend || {};
-  // 筛选卡片值即完整路径（如 japanese/hot）；未选默认该类 new。
+  // 筛选卡片值即完整路径（如 japanese/hot、special/fanza/2025-top20）；
+  // 未选默认该类 new；精選片單未选默认第一个片單（/special 本身 0 卡）。
   let eff = tid;
   const sort = String(extend.sort || '').trim();
-  if (sort && /^[a-z0-9-]+\/(new|release|today-hot|weekly-hot|monthly-hot|yearly-hot|hot)$/.test(sort)) {
+  const playlist = String(extend.playlist || '').trim();
+  if (tid === 'special') {
+    eff = /^special\/[a-z0-9][a-z0-9\-\/]*$/.test(playlist) ? playlist : PLAYLISTS[0].v;
+  } else if (sort && /^[a-z0-9-]+\/(new|release|today-hot|weekly-hot|monthly-hot|yearly-hot|hot)$/.test(sort)) {
     eff = sort;
   } else if (tid !== 'chinese-subtitles') {
     eff = tid + '/new';

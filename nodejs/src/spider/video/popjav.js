@@ -1,16 +1,30 @@
 // POPJAV — https://popjav.in/
-// WordPress 站：详情页内联 Dean Edwards packer 解出 3 路嵌页
+// WordPress 站：详情页内联 Dean Edwards packer 解出嵌页
 // （vsembed / minochinos / streamtape），蜘蛛在详情时把嵌页解析成真地址。
 // 2026-11-28 VM 实测：首页 200；详情 cawb075 解包出
 // vsembed.com/rc7iw、minochinos.com/v/70xwh0lvdnof、streamtape.com/e/0Wk3Y9jwK4UDxP；
-// streamtape 嵌页 200 含 get_video 直链（IP 绑定、约 28h 有效）；
-// minochinos 嵌页解包出 VidHide 系 hls2/hls3（hls2 带 asn 令牌、hls3 无令牌）；
-// vsembed 是 SPA（JS  bundle 动态取流），静态解析不到，跳过。
-// 分类：censored / uncensored / amature / fc2ppv + tags 标签（筛选卡片，
+// minochinos 嵌页 301 跳 callistanise.com（VidHide 系域名轮换），解包出
+// hls2（带 asn 令牌）/ hls3（无令牌）；vsembed 是 SPA（JS bundle 动态取流），
+// 静态解析不到，跳过。
+// 720p 实测结论（2026-11-28，三部片）：hls2 master.m3u8 只含一个档位
+// 1920x1080（cawb075、fc2ppv-5014920 均 200 取回、单条 STREAM-INF；
+// adn808 一次 502 一次超时，属 CDN 抖动），站方嵌页里根本没有 720p，
+// 蜘蛛按 master 有几档出几档，不编造 720p。
+// streamtape 已死（2026-11-28，三部片 cawb075 / adn808 / fc2ppv-5014920）：
+// /e/ 嵌页仍 200 且含 get_video 链接，但 /v/ 页一律 404 “Video not found! /
+// deleted by the creator!”，get_video 直 curl 回 (52) Empty reply from server；
+// 文件是站方删了，不是缺 Referer/头能修的，故整条线去掉，只留 minochinos。
+// 分类：censored / uncensored / amature / fc2ppv / vr / popularity / trend
+// + studios（制作商筛选卡片，12 家实测均 200 且 36 卡）+ tags 标签（筛选卡片，
 // 含 モザイク除去/無修正流出/javplayer-モザイク破壊 三个 LTX 相关标签）；
+// models / series 是几千条的字母索引页、不是视频列表，不做分类；
+// playlist 是用户自建收藏页，无公共片单，不做分类。
+// popularity / trend 是固定 TOP100 榜单：/page/2/、/page/50/、/page/99999/
+// 回的都是同一 100 条（p1 与 p50 交集 100/100），无分页链接，
+// pagecount=1 是对的，不要“修”成大页数。
 // 搜索 /?s=。封面 pics.dmm.co.jp 直链。
-// 播放：详情时解析嵌页出真地址（streamtape 直链 mp4、minochinos 按 master
-// 档位出 m3u8）；有几档出几档，解析失败的线路直接省略、不留空集。
+// 播放：详情时解析嵌页出真地址（minochinos 按 master 档位出 m3u8）；
+// 有几档出几档，解析失败的线路直接省略、不留空集。
 // 字幕：片名含番号（cawb075/adn808 等）才接字幕芯，无番号不接。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
@@ -20,12 +34,17 @@ const NAME = 'POPJAV';
 const HOST = 'https://popjav.in';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-// 顶级分类：四个主分区 + 标签（标签走筛选卡片，不平铺）
+// 顶级分类：四个主分区 + VR + 人气/趋势 + 制作商 + 标签
+// （制作商、标签走筛选卡片，不平铺；vr/popularity/trend 均实测为视频列表页）
 const CLASSES = [
   { type_id: 'censored', type_name: '有碼' },
   { type_id: 'uncensored', type_name: '無碼' },
   { type_id: 'amature', type_name: '素人' },
   { type_id: 'fc2ppv', type_name: 'FC2' },
+  { type_id: 'vr', type_name: 'VR' },
+  { type_id: 'popularity', type_name: '人气' },
+  { type_id: 'trend', type_name: '趋势' },
+  { type_id: 'studios', type_name: '制作商' },
   { type_id: 'tags', type_name: '标签' },
 ];
 
@@ -64,6 +83,24 @@ const TAG_FILTER = [
   { n: '无码流出', v: 'tags/%e7%84%a1%e4%bf%ae%e6%ad%a3%e6%b5%81%e5%87%ba' },
 ];
 const TAG_DEFAULT = 'tags/%e3%83%a2%e3%82%b6%e3%82%a4%e3%82%af%e9%99%a4%e5%8e%bb';
+
+// 制作商筛选卡片（/studios/ 索引页取的知名厂牌，2026-11-28 逐个实测：
+// 子页均 200 且 36 卡，翻页 /studios/<slug>/page/2/ 同样 200；v 为相对路径）
+const STUDIO_FILTER = [
+  { n: 'S1', v: 'studios/s1-no-1-style' },
+  { n: 'MOODYZ', v: 'studios/%e3%83%a0%e3%83%bc%e3%83%87%e3%82%a3%e3%83%bc%e3%82%ba' },
+  { n: 'Madonna', v: 'studios/%e3%83%9e%e3%83%89%e3%83%b3%e3%83%8a' },
+  { n: 'SOD', v: 'studios/sod%e3%82%af%e3%83%aa%e3%82%a8%e3%82%a4%e3%83%88' },
+  { n: 'PRESTIGE', v: 'studios/%e3%83%97%e3%83%ac%e3%82%b9%e3%83%86%e3%83%bc%e3%82%b8' },
+  { n: 'IdeaPocket', v: 'studios/%e3%82%a2%e3%82%a4%e3%83%87%e3%82%a2%e3%83%9d%e3%82%b1%e3%83%83%e3%83%88' },
+  { n: 'Attackers', v: 'studios/%e3%82%a2%e3%82%bf%e3%83%83%e3%82%ab%e3%83%bc%e3%82%ba' },
+  { n: 'kawaii', v: 'studios/kawaii' },
+  { n: 'FALENO', v: 'studios/faleno' },
+  { n: 'OPPAI', v: 'studios/oppai' },
+  { n: '本中', v: 'studios/%e6%9c%ac%e4%b8%ad' },
+  { n: 'Fitch', v: 'studios/fitch' },
+];
+const STUDIO_DEFAULT = 'studios/s1-no-1-style';
 
 function cleanText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
@@ -184,15 +221,6 @@ function extractEmbeds(html) {
   return out;
 }
 
-// streamtape 嵌页 -> 直链 mp4：嵌页含 get_video?id=&expires=&ip=&token=。
-async function resolveStreamtape(embedUrl) {
-  const html = await fetchHtml(embedUrl, 12000);
-  if (!html) return '';
-  const m = html.match(/get_video\?id=[^"'&\s]+&expires=\d+&ip=[^"'&\s]+&token=[^"'&\s]+/);
-  if (!m) return '';
-  return 'https://streamtape.com/' + m[0];
-}
-
 // minochinos（VidHide 系）嵌页 -> m3u8：解包取 links.hls2（真 m3u8，
 // asn 令牌绑取页 IP——蜘蛛在设备上取页，与播放器同 IP）优先，hls3 兜底。
 async function resolveMinochinos(embedUrl) {
@@ -240,10 +268,9 @@ function hostOf(u) {
 // 解析失败返回空数组，该线路直接省略）。
 async function resolveEmbed(embedUrl) {
   const host = hostOf(embedUrl);
-  if (/streamtape\.com/i.test(host)) {
-    const u = await resolveStreamtape(embedUrl);
-    return u ? [{ label: 'Streamtape', url: u }] : [];
-  }
+  // streamtape 已删线：三部片 /v/ 页均 404 “Video not found / deleted by
+  // the creator”，文件在源站已删、修不回来，直接去掉、不留播不了的线。
+  if (/streamtape\.com/i.test(host)) return [];
   if (/minochinos\.com/i.test(host)) {
     const u = await resolveMinochinos(embedUrl);
     if (!u) return [];
@@ -269,6 +296,7 @@ async function home() {
   return {
     class: CLASSES,
     filters: {
+      studios: [{ key: 'studio', name: '制作商', value: STUDIO_FILTER }],
       tags: [{ key: 'tag', name: '标签', value: TAG_FILTER }],
     },
   };
@@ -283,6 +311,11 @@ async function category(reqIn) {
   if (tid === 'tags') {
     const tag = String(extend.tag || '');
     tid = (tag && tag.startsWith('tags/')) ? tag : TAG_DEFAULT;
+  }
+  // 制作商维：选中卡片取卡片地址，未选默认 STUDIO_DEFAULT。
+  if (tid === 'studios') {
+    const st = String(extend.studio || '');
+    tid = (st && st.startsWith('studios/')) ? st : STUDIO_DEFAULT;
   }
   const path = '/' + tid.replace(/^\/+/, '').replace(/\/+$/, '');
   const url = page > 1 ? HOST + path + '/page/' + page + '/' : HOST + path + '/';

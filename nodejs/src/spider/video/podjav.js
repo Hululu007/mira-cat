@@ -6,6 +6,8 @@
 // /jav/page/2/ 200（30 卡）；搜索 /?s=RM 200（30 卡）。
 // 分类：/jav/ 全部 + /genre/<slug>/ 题材（/genre/ 页实测 60 个，筛选卡片）；
 // 無碼 genre/uncensored 单列（本站无 -RM/LTX 专属分类，-RM 只在标题里）。
+// 演员：/cast/ 页实测 24 人（按片量降序），筛选卡片；单人页无翻页
+// （/page/2/ 404），parseCards 通用（Kitano Mina 19 卡、Meguri 12 卡实测）。
 // 播放：详情取 master.m3u8、按 RESOLUTION 出档位（有几档出几档，不编造）；
 // master 取不到时直接回 master 地址本身（播单可播，播放器自选档）。
 // 字幕：片名含番号（DLDSS-587 等）才接字幕芯，无番号不接。
@@ -17,11 +19,12 @@ const NAME = 'PODJAV';
 const HOST = 'https://en.podjav.tv';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-// 顶级分类：全部 + 無碼 + 题材（题材走筛选卡片，不平铺）
+// 顶级分类：全部 + 無碼 + 题材 + 演员（题材/演员走筛选卡片，不平铺）
 const CLASSES = [
   { type_id: 'jav', type_name: '全部' },
   { type_id: 'genre/uncensored', type_name: '無碼' },
   { type_id: 'genre', type_name: '题材' },
+  { type_id: 'cast', type_name: '演员' },
 ];
 
 // 题材筛选卡片（/genre/ 页实测，60 个；v 为相对路径）
@@ -88,6 +91,35 @@ const GENRE_FILTER = [
   { n: '少妇', v: 'genre/young-wife' },
 ];
 const GENRE_DEFAULT = 'genre/big-tits';
+
+// 演员筛选卡片（/cast/ 页实测，24 人，按站内片量降序；v 为相对路径）
+const CAST_FILTER = [
+  { n: 'Kitano Mina', v: 'cast/kitano-mina' },
+  { n: 'Oda Mako', v: 'cast/oda-mako' },
+  { n: 'Satsuki Nao', v: 'cast/satsuki-nao' },
+  { n: 'Isshiki Momoko', v: 'cast/isshiki-momoko' },
+  { n: 'Tsuji Honoka', v: 'cast/tsuji-honoka' },
+  { n: 'Yoshine Yuria', v: 'cast/yoshine-yuria' },
+  { n: 'Kamiki Rei', v: 'cast/kamiki-rei' },
+  { n: 'Meguri', v: 'cast/meguri' },
+  { n: 'Saegusa Chitose', v: 'cast/saegusa-chitose' },
+  { n: 'Oshikawa Yuuri', v: 'cast/oshikawa-yuuri' },
+  { n: 'Lioka Kanako', v: 'cast/lioka-kanako' },
+  { n: 'Ayumi Ryou', v: 'cast/ayumi-ryou' },
+  { n: 'Mary Tachibana', v: 'cast/mary-tachibana' },
+  { n: 'Hatano Yui', v: 'cast/hatano-yui' },
+  { n: 'Haruna Hana', v: 'cast/haruna-hana' },
+  { n: 'Tsukada Shiori', v: 'cast/tsukada-shiori' },
+  { n: 'Miu Shiramine', v: 'cast/miu-shiramine' },
+  { n: 'Satsuki Mei', v: 'cast/satsuki-mei' },
+  { n: 'Kazama Yumi', v: 'cast/kazama-yumi' },
+  { n: 'Washio Mei', v: 'cast/washio-mei' },
+  { n: 'Tomoda Maki', v: 'cast/tomoda-maki' },
+  { n: 'Kusakabe Kana', v: 'cast/kusakabe-kana' },
+  { n: 'Honjou Suzu', v: 'cast/honjou-suzu' },
+  { n: 'Nanami Tina', v: 'cast/nanami-tina' },
+];
+const CAST_DEFAULT = 'cast/kitano-mina';
 
 function cleanText(s) {
   return String(s || '').replace(/\s+/g, ' ').trim();
@@ -224,6 +256,7 @@ async function home() {
     class: CLASSES,
     filters: {
       genre: [{ key: 'sub', name: '题材', value: GENRE_FILTER }],
+      cast: [{ key: 'sub', name: '演员', value: CAST_FILTER }],
     },
   };
 }
@@ -234,9 +267,13 @@ async function category(reqIn) {
   let tid = String(body.id || 'jav').trim();
   const extend = body.filters || body.extend || {};
   // 题材维：选中卡片取卡片地址，未选默认 GENRE_DEFAULT。
+  // 演员维：同理，选中卡片取卡片地址，未选默认 CAST_DEFAULT。
   if (tid === 'genre') {
     const sub = String(extend.sub || '');
     tid = (sub && sub.startsWith('genre/')) ? sub : GENRE_DEFAULT;
+  } else if (tid === 'cast') {
+    const sub = String(extend.sub || '');
+    tid = (sub && sub.startsWith('cast/')) ? sub : CAST_DEFAULT;
   }
   const path = '/' + tid.replace(/^\/+/, '').replace(/\/+$/, '');
   const url = page > 1 ? HOST + path + '/page/' + page + '/' : HOST + path + '/';

@@ -444,6 +444,7 @@ const HOT_MODELS = [
   { slug: 'comatozze', name: 'Comatozze' },
   { slug: 'candy-love', name: 'candy love' },
   { slug: 'blondessa', name: 'blondessa' },
+  { slug: 'nini_divine', name: 'nini divine' },
   { slug: 'nana_taipei', name: 'nana taipei' },
   { slug: 'sweetie-fox', name: 'Sweetie Fox' },
   { slug: 'shinaryen', name: 'shinaryen' },

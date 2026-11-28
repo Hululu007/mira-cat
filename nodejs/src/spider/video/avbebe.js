@@ -1,11 +1,18 @@
-// Avbebe — avbebe.com（H動畫/成人動畫/里番，WordPress JNews）
+// Avbebe — avbebe.com（H動畫/成人動畫/里番 + 華語AV/高清中字/高清素人，WordPress JNews）
 // 结构：分类 /archives/category/{slug}/，分页 /page/N/；列表为 JNews 文章块
-// （标题 h3.jeg_post_title、封面 img data-src）；详情页 FV Player 的
-// "sources":[{"src":"https://52cute.com/acg/{postId}/{nn}/video.m3u8"}]，
-// 每 nn 一集（多集番按集出线，单集只出一线）；m3u8 为单码率 VOD，
-// 须带 Referer（avbebe.com）才回 200，否则 403；分片为相对路径，播放器按
-// m3u8 地址解析。搜索 /?s=<词>。本站为动画、无番号，不接字幕芯。
-// 分類：馬賽克破解（LTX 相关）必须保留；華語AV/高清素人 的子分类做筛选卡片。
+// （标题 h3.jeg_post_title、封面 img data-src）；详情页两路播放器：
+// ① 动漫类走 FV Player：data-item 里 "sources":[{"src":"https://52cute.com/acg/...m3u8"}]
+//    （/acg/watch/{id}/playlist.m3u8 或 /acg/watch/{id}-{q}/video.m3u8 或 /acg/{id}/{nn}/video.m3u8）；
+// ② 非动漫类（華語AV/高清中字/高清素人/馬賽克破解/華語成人AI 等）走嵌页 iframe：
+//    <iframe src="https://play.52cute.com/e/{code}">，嵌页 <source> 给
+//    https://pb.52cute.com/v/{code}/{ts}/{token}/index.m3u8（带时间戳 token，详情现取现用）。
+// ③ 綜合AV（JAV/中文字幕）走 AIOVG：详情页 <source type="application/x-mpegurl"
+//    src="https://t33.cdn2020.com/video/m3u8/.../index.m3u8">（JSON-LD contentUrl 同条）。
+// m3u8 均为单档位媒体播单（站方只给一档，无多清晰度变体，-720/-1080 试过全 404，
+// 播单里无 EXT-X-STREAM-INF），不编造档位；须带 Referer（avbebe.com）才回 200，
+// 否则 403；分片为相对路径，播放器按 m3u8 地址解析。搜索 /?s=<词>。
+// 本站为动画、无番号，不接字幕芯。分類：馬賽克破解（LTX 相关）必须保留；
+// 成人漫畫已删（它是漫画 234P 图片，不是视频）；子分类做筛选卡片。
 import req from '../../util/req.js';
 import * as cheerio from 'cheerio';
 
@@ -14,30 +21,59 @@ const NAME = 'Avbebe';
 const HOST = 'https://avbebe.com';
 const UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
-// 顶级分类（slug 为站方 URL 编码后的形态，2026-11-28 实测）
+// 顶级分类（slug 为站方 URL 编码后的形态，2026-11-28 实测；
+// 成人漫畫已删——它是漫画（234P 图片），不是视频；
+// 新增 綜合AV、華語成人AI，均为站方真实顶级分类，WP API 核实有内容）
 const CLASSES = [
   { type_id: 'new', type_name: '新番' },
   { type_id: 'h%e5%8b%95%e7%95%ab%e5%bd%b1%e7%89%87', type_name: '動畫卡通' },
   { type_id: '3d%e5%8b%95%e7%95%ab', type_name: '3D動畫' },
   { type_id: '%e6%b3%a1%e9%ba%b5%e7%95%aa', type_name: '泡麵番' },
-  { type_id: '%e6%88%90%e4%ba%bah%e6%bc%ab%e7%95%ab', type_name: '成人漫畫' },
   { type_id: '%e8%8f%af%e8%aa%9eav', type_name: '華語AV' },
   { type_id: '%e9%a6%ac%e8%b3%bd%e5%85%8b%e7%a0%b4%e8%a7%a3', type_name: '馬賽克破解' },
   { type_id: '%e9%ab%98%e6%b8%85%e4%b8%ad%e5%ad%97', type_name: '高清中字' },
   { type_id: '%e9%ab%98%e6%b8%85%e7%b4%a0%e4%ba%ba', type_name: '高清素人' },
+  { type_id: '%e7%b6%9c%e5%90%88av', type_name: '綜合AV' },
+  { type_id: '%e8%8f%af%e8%aa%9e%e6%88%90%e4%ba%baai', type_name: '華語成人AI' },
 ];
 
-// 子分类做筛选卡片（不平铺）：華語AV 下两子分类、高清素人 下一子分类
+// 子分类做筛选卡片（不平铺）：各顶级分类下的真实子分类，WP API 核实
 const FILTERS = {
+  'h%e5%8b%95%e7%95%ab%e5%bd%b1%e7%89%87': [
+    { key: 'sub', name: '子分类', value: [
+      { n: '中文字幕', v: 'h%e5%8b%95%e7%95%ab%e5%bd%b1%e7%89%87/%e4%b8%ad%e6%96%87%e5%ad%97%e5%b9%95' },
+    ] },
+  ],
+  '3d%e5%8b%95%e7%95%ab': [
+    { key: 'sub', name: '子分类', value: [
+      { n: '同人動畫', v: '3d%e5%8b%95%e7%95%ab/%e5%90%8c%e4%ba%ba%e5%8b%95%e7%95%ab' },
+      { n: 'Motion Anime', v: '3d%e5%8b%95%e7%95%ab/motion-anime' },
+      { n: 'MMD', v: '3d%e5%8b%95%e7%95%ab/mmd' },
+    ] },
+  ],
   '%e8%8f%af%e8%aa%9eav': [
     { key: 'sub', name: '子分类', value: [
       { n: '華語AV-片商', v: '%e8%8f%af%e8%aa%9eav/%e8%8f%af%e8%aa%9eav-%e7%89%87%e5%95%86' },
       { n: '華語AV-素人', v: '%e8%8f%af%e8%aa%9eav/%e8%8f%af%e8%aa%9eav-%e7%b4%a0%e4%ba%ba' },
+      { n: '華語AV-探花', v: '%e8%8f%af%e8%aa%9eav/%e8%8f%af%e8%aa%9eav-%e6%8e%a2%e8%8a%b1' },
+      { n: '華語AV-雙十', v: '%e8%8f%af%e8%aa%9eav/%e8%8f%af%e8%aa%9eav-%e9%9b%99%e5%8d%81' },
     ] },
   ],
   '%e9%ab%98%e6%b8%85%e7%b4%a0%e4%ba%ba': [
     { key: 'sub', name: '子分类', value: [
       { n: '絕美逸品', v: '%e9%ab%98%e6%b8%85%e7%b4%a0%e4%ba%ba/%e7%b5%95%e7%be%8e%e9%80%b8%e5%93%81' },
+    ] },
+  ],
+  '%e7%b6%9c%e5%90%88av': [
+    { key: 'sub', name: '子分类', value: [
+      { n: '綜合AV-JAV', v: '%e7%b6%9c%e5%90%88av/%e7%b6%9c%e5%90%88av-jav' },
+      { n: '綜合AV-中文字幕', v: '%e7%b6%9c%e5%90%88av/%e7%b6%9c%e5%90%88av-%e4%b8%ad%e6%96%87%e5%ad%97%e5%b9%95' },
+    ] },
+  ],
+  '%e8%8f%af%e8%aa%9e%e6%88%90%e4%ba%baai': [
+    { key: 'sub', name: '子分类', value: [
+      { n: '華語成人AI-短劇', v: '%e8%8f%af%e8%aa%9e%e6%88%90%e4%ba%baai/%e8%8f%af%e8%aa%9e%e6%88%90%e4%ba%baai-%e7%9f%ad%e5%8a%87' },
+      { n: '華語成人AI-長劇', v: '%e8%8f%af%e8%aa%9e%e6%88%90%e4%ba%baai/%e8%8f%af%e8%aa%9e%e6%88%90%e4%ba%baai-%e9%95%b7%e5%8a%87' },
     ] },
   ],
 };
@@ -133,6 +169,48 @@ function extractSources(html) {
   return out;
 }
 
+// 嵌页 iframe：非动漫分类（華語AV/高清中字/高清素人/馬賽克破解/華語成人AI 等）
+// 不用 FV Player，详情页直接嵌 <iframe src="https://play.52cute.com/e/{code}">，
+// 嵌页里 <source src="https://pb.52cute.com/v/{code}/{ts}/{token}/index.m3u8">。
+// 嵌页地址带时间戳 token（约 1 天过期），详情时现取现用，不缓存。
+function extractEmbeds(html) {
+  const out = [];
+  const seen = new Set();
+  const re = /<iframe[^>]+src="(https?:\/\/play\.52cute\.com\/e\/[^"]+)"[^>]*>/g;
+  let m;
+  while ((m = re.exec(String(html || ''))) !== null) {
+    const u = m[1];
+    // 廣告 iframe（whitetrafsa）不在 play.52cute.com，已被正则排除
+    if (!seen.has(u)) { seen.add(u); out.push(u); }
+  }
+  return out;
+}
+
+// AIOVG 播放器（綜合AV JAV/中文字幕）：详情页直接嵌
+// <video-js><source type="application/x-mpegurl" src="https://t33.cdn2020.com/video/m3u8/.../index.m3u8">
+// （JSON-LD 的 contentUrl 也是同一条）。FV 的 data-item 里没有它，须另取。
+function extractAiovg(html) {
+  const out = [];
+  const seen = new Set();
+  const re = /<source[^>]*type="application\/x-mpegurl"[^>]*src="(https?:\/\/[^"]+?\.m3u8)"[^>]*>/gi;
+  let m;
+  while ((m = re.exec(String(html || ''))) !== null) {
+    const u = m[1];
+    if (!/^https?:\/\//i.test(u) || seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out;
+}
+
+async function resolveEmbed(embedUrl) {
+  const html = await getText(embedUrl, { 'Referer': HOST + '/' });
+  if (!html) return '';
+  const m = html.match(/<source[^>]+src="(https?:\/\/[^"]+?\.m3u8)"/i)
+    || html.match(/"src"\s*:\s*"(https?:\/\/[^"]+?\.m3u8)"/i);
+  return m ? m[1] : '';
+}
+
 async function init() {
   return {};
 }
@@ -168,12 +246,25 @@ async function detail(reqIn) {
   let name = cleanText($('meta[property="og:title"]').attr('content'))
     || cleanText($('title').text()).replace(/\s*[–-]\s*Avbebe.*$/i, '').trim();
   const pic = absUrl($('meta[property="og:image"]').attr('content')) || '';
+  // 三路播放源：动漫类走 FV Player（data-item 里 m3u8），非动漫类走嵌页 iframe，
+  // 綜合AV 走 AIOVG（<source type="application/x-mpegurl">）。一页只用其中一路
+  // （实测无混用），但代码三路都取、合并出线，互不干扰。
   const srcs = extractSources(html);
+  const embeds = extractEmbeds(html);
+  const embedUrls = embeds.length
+    ? await Promise.all(embeds.map((u) => resolveEmbed(u)))
+    : [];
+  const aiovgUrls = extractAiovg(html);
+  const urls = [];
+  for (const s of srcs) urls.push({ nn: s.nn, url: s.url });
+  for (const u of embedUrls) if (u) urls.push({ nn: '', url: u });
+  for (const u of aiovgUrls) urls.push({ nn: '', url: u });
   const eps = [];
-  for (let i = 0; i < srcs.length; i++) {
-    const s = srcs[i];
-    const label = srcs.length > 1 ? ('第' + (parseInt(s.nn, 10) || (i + 1)) + '集') : '正片';
-    eps.push(label + '$' + s.url);
+  for (let i = 0; i < urls.length; i++) {
+    const u = urls[i];
+    // 单集出“正片”，多集按集号（FV 自带 nn，嵌页按页面顺序）
+    const label = urls.length > 1 ? ('第' + (parseInt(u.nn, 10) || (i + 1)) + '集') : '正片';
+    eps.push(label + '$' + u.url);
   }
   const vod = {
     vod_id: durl,
